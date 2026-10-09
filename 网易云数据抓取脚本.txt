@@ -1,0 +1,1489 @@
+// ==UserScript==
+// @name         网易云达人创作者中心 - 全部播客数据导出 v1.0.5 性能优化版
+// @namespace    fyf.music163.ncreator.export
+// @version      1.0.5
+// @description  基于网易云创作者中心真实 worksdata 接口响应，批量抓取全部播客总览、近7天/近30天逐日原值及各指标周期合计。
+// @match        https://music.163.com/st/ncreator/data-center/podcast*
+// @match        https://*.music.163.com/st/ncreator/data-center/podcast*
+// @run-at       document-start
+// @grant        unsafeWindow
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  const VERSION = "1.0.5";
+  const PANEL_ID = "__wy_all_podcast_export_v105__";
+  const STORAGE_KEY = "__wy_all_podcast_export_state_v100__";
+  const RESULT_PREFIX = "__wy_all_podcast_export_result_v105__:";
+  const MAX_RETRY = 2;
+  const CAPTURE_TIMEOUT_MS = 12000;
+  const PAGE = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+
+  const ENDPOINT_PAGE = /\/weapi\/expert\/worksdata\/works\/pageget/i;
+  const ENDPOINT_USER = /\/weapi\/expert\/worksdata\/user\/get/i;
+
+  const runtime = {
+    pageResponses: [],
+    userResponses: [],
+    albumList: null,
+    currentDetail: null,
+    currentResult: null,
+    panel: null,
+    ui: {},
+    runningCycle: false,
+    hookCount: 0,
+    lastMessage: "等待页面接口返回",
+    lastError: "",
+  };
+
+  let state = loadState();
+
+  // ============================================================
+  // 基础工具
+  // ============================================================
+
+  function nowIso() {
+    return new Date().toISOString();
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function clean(value) {
+    return String(value == null ? "" : value)
+      .replace(/\u00a0/g, " ")
+      .replace(/\r/g, "")
+      .replace(/[ \t]+/g, " ")
+      .trim();
+  }
+
+  function normalizeTitle(value) {
+    return clean(value)
+      .replace(/[.。…\u2026·•]/g, "")
+      .replace(/[|｜]/g, "")
+      .replace(/[【】\[\]《》<>〈〉「」『』()（）{}“”"'‘’：:，,、；;！!？?＿_\-—–~～]/g, "")
+      .replace(/\s+/g, "")
+      .toLowerCase()
+      .trim();
+  }
+
+  function sameTitle(a, b) {
+    const x = normalizeTitle(a);
+    const y = normalizeTitle(b);
+    if (!x || !y) return false;
+    if (x === y) return true;
+    const short = x.length <= y.length ? x : y;
+    const long = x.length > y.length ? x : y;
+    return short.length >= 8 && long.startsWith(short);
+  }
+
+  function getPodcastId() {
+    try {
+      return String(new URL(location.href).searchParams.get("podcast") || "");
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function makeDefaultState() {
+    return {
+      version: VERSION,
+      active: false,
+      paused: false,
+      startedAt: "",
+      updatedAt: "",
+      index: 0,
+      albums: [],
+      resultIds: [],
+      results: [], // 仅用于兼容旧版迁移；新版本不再把大结果塞进主状态
+      failures: [],
+      attempts: {},
+    };
+  }
+
+  function sanitizeState(raw) {
+    const base = makeDefaultState();
+    if (!raw || typeof raw !== "object") return base;
+
+    return {
+      ...base,
+      ...raw,
+      version: VERSION,
+      albums: Array.isArray(raw.albums) ? raw.albums : [],
+      resultIds: Array.isArray(raw.resultIds)
+        ? Array.from(new Set(raw.resultIds.map((x) => String(x)).filter(Boolean)))
+        : [],
+      results: Array.isArray(raw.results) ? raw.results : [],
+      failures: Array.isArray(raw.failures) ? raw.failures : [],
+      attempts: raw.attempts && typeof raw.attempts === "object" ? raw.attempts : {},
+      index: Math.max(0, Number(raw.index || 0)),
+      active: Boolean(raw.active),
+      paused: Boolean(raw.paused),
+    };
+  }
+
+  function resultStorageKey(id) {
+    return RESULT_PREFIX + String(id || "");
+  }
+
+  function persistSlimStateDirect(s) {
+    const payload = {
+      ...s,
+      results: [],
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+  }
+
+  function migrateLegacyResults(s) {
+    const legacy = Array.isArray(s.results) ? s.results : [];
+    if (!legacy.length) return s;
+
+    for (const result of legacy) {
+      const id = String(result && result.podcastId || "");
+      if (!id) continue;
+
+      try {
+        localStorage.setItem(resultStorageKey(id), JSON.stringify(result));
+        if (!s.resultIds.includes(id)) s.resultIds.push(id);
+      } catch (_) {
+        // 迁移失败时暂时保留旧结果，避免数据丢失。
+        return s;
+      }
+    }
+
+    s.results = [];
+
+    try {
+      persistSlimStateDirect(s);
+    } catch (_) {}
+
+    return s;
+  }
+
+  function loadState() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      const parsed = sanitizeState(raw ? JSON.parse(raw) : null);
+      return migrateLegacyResults(parsed);
+    } catch (_) {
+      return makeDefaultState();
+    }
+  }
+
+  function saveState() {
+    state.updatedAt = nowIso();
+    try {
+      // 主状态只保存进度、专辑列表和结果ID。
+      // 近7/30天的大块明细按专辑分片保存，避免每抓一本都重新 stringify 全部历史结果。
+      persistSlimStateDirect(state);
+      return true;
+    } catch (error) {
+      runtime.lastError = `保存进度失败：${error.message}`;
+      render();
+      return false;
+    }
+  }
+
+  function clearResultShards() {
+    try {
+      const keys = [];
+      for (let i = 0; i < localStorage.length; i += 1) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith(RESULT_PREFIX)) keys.push(key);
+      }
+      for (const key of keys) localStorage.removeItem(key);
+    } catch (_) {}
+  }
+
+  function clearState() {
+    clearResultShards();
+    state = makeDefaultState();
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch (_) {}
+    runtime.currentResult = null;
+    runtime.lastError = "";
+    runtime.lastMessage = "已清空抓取进度";
+    render();
+  }
+
+  function saveResultShard(result) {
+    const id = String(result && result.podcastId || "");
+    if (!id) return false;
+
+    try {
+      localStorage.setItem(resultStorageKey(id), JSON.stringify(result));
+      if (!state.resultIds.includes(id)) state.resultIds.push(id);
+      return true;
+    } catch (error) {
+      runtime.lastError = `保存“${clean(result && result.podcastName)}”结果失败：${error.message}`;
+      return false;
+    }
+  }
+
+  function loadResultShard(id) {
+    try {
+      const raw = localStorage.getItem(resultStorageKey(id));
+      return raw ? JSON.parse(raw) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function loadAllResults() {
+    const resultMap = new Map();
+
+    // 新版分片结果
+    for (const id of state.resultIds || []) {
+      const result = loadResultShard(id);
+      if (result && result.podcastId != null) {
+        resultMap.set(String(result.podcastId), result);
+      }
+    }
+
+    // 兼容极少数尚未成功迁移的旧版内嵌结果
+    for (const result of Array.isArray(state.results) ? state.results : []) {
+      const id = String(result && result.podcastId || "");
+      if (id) resultMap.set(id, result);
+    }
+
+    return Array.from(resultMap.values());
+  }
+
+  function getResultCount() {
+    const ids = new Set((state.resultIds || []).map(String));
+    for (const result of Array.isArray(state.results) ? state.results : []) {
+      const id = String(result && result.podcastId || "");
+      if (id) ids.add(id);
+    }
+    return ids.size;
+  }
+
+  function upsertResult(result) {
+    return saveResultShard(result);
+  }
+
+  function removeFailure(id) {
+    id = String(id || "");
+    state.failures = state.failures.filter((x) => String(x.podcastId) !== id);
+  }
+
+  function addFailure(album, reason) {
+    const id = String(album && album.id || "");
+    removeFailure(id);
+    state.failures.push({
+      podcastId: id,
+      podcastName: clean(album && album.name),
+      reason: clean(reason || "未知错误"),
+      failedAt: nowIso(),
+    });
+  }
+
+  function getCurrentAlbum() {
+    const id = getPodcastId();
+    const list = runtime.albumList || state.albums || [];
+    return list.find((x) => String(x.id) === id) || null;
+  }
+
+  function setMessage(message, isError) {
+    runtime.lastMessage = clean(message);
+    if (isError) runtime.lastError = clean(message);
+    else runtime.lastError = "";
+    render();
+  }
+
+  // ============================================================
+  // 网络 Hook：只读取页面真实接口响应
+  // ============================================================
+
+  function isTargetUrl(url) {
+    return ENDPOINT_PAGE.test(String(url || "")) || ENDPOINT_USER.test(String(url || ""));
+  }
+
+  function safeParseJson(text) {
+    try {
+      return JSON.parse(String(text || ""));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function handleApiResponse(url, payload) {
+    if (!payload || payload.code !== 200 || payload.data == null) return;
+
+    if (ENDPOINT_PAGE.test(url)) {
+      runtime.pageResponses.push({
+        at: Date.now(),
+        url: String(url || ""),
+        data: payload.data,
+      });
+      if (runtime.pageResponses.length > 30) runtime.pageResponses.shift();
+      classifyPageResponses();
+    }
+
+    if (ENDPOINT_USER.test(url)) {
+      runtime.userResponses.push({
+        at: Date.now(),
+        url: String(url || ""),
+        data: payload.data,
+      });
+      if (runtime.userResponses.length > 30) runtime.userResponses.shift();
+    }
+
+    tryBuildCurrentResult();
+    render();
+  }
+
+  function installHooksOnWindow(w) {
+    if (!w) return;
+
+    // XHR
+    try {
+      const XHR = w.XMLHttpRequest;
+      const proto = XHR && XHR.prototype;
+
+      if (proto && !proto.open.__WY_EXPORT_V105__) {
+        const rawOpen = proto.open;
+        const rawSend = proto.send;
+
+        function openWrapped(method, url) {
+          this.__wyExportMeta = {
+            method: String(method || "GET").toUpperCase(),
+            url: String(url || ""),
+          };
+          return rawOpen.apply(this, arguments);
+        }
+
+        function sendWrapped(body) {
+          const xhr = this;
+          const meta = xhr.__wyExportMeta || { method: "POST", url: "" };
+          const target = isTargetUrl(meta.url);
+
+          if (target) {
+            xhr.addEventListener("loadend", function () {
+              try {
+                let text = "";
+                if (!xhr.responseType || xhr.responseType === "text") {
+                  text = xhr.responseText || "";
+                } else if (xhr.responseType === "json") {
+                  text = JSON.stringify(xhr.response);
+                }
+                const parsed = safeParseJson(text);
+                if (parsed) handleApiResponse(meta.url, parsed);
+              } catch (error) {
+                console.warn("[网易云全部播客导出] XHR读取失败", error);
+              }
+            }, { once: true });
+          }
+
+          return rawSend.apply(this, arguments);
+        }
+
+        Object.defineProperty(openWrapped, "__WY_EXPORT_V105__", { value: true });
+        Object.defineProperty(sendWrapped, "__WY_EXPORT_V105__", { value: true });
+
+        proto.open = openWrapped;
+        proto.send = sendWrapped;
+        runtime.hookCount += 1;
+      }
+    } catch (error) {
+      console.warn("[网易云全部播客导出] XHR Hook失败", error);
+    }
+
+    // fetch
+    try {
+      const rawFetch = w.fetch;
+
+      if (typeof rawFetch === "function" && !rawFetch.__WY_EXPORT_V105__) {
+        async function fetchWrapped(input, init) {
+          let url = "";
+          try {
+            url =
+              typeof input === "string" || input instanceof URL
+                ? String(input)
+                : (input && input.url) || "";
+          } catch (_) {}
+
+          const response = await rawFetch.apply(this, arguments);
+
+          if (isTargetUrl(url)) {
+            try {
+              const clone = response.clone();
+              const parsed = safeParseJson(await clone.text());
+              if (parsed) handleApiResponse(url, parsed);
+            } catch (error) {
+              console.warn("[网易云全部播客导出] fetch读取失败", error);
+            }
+          }
+
+          return response;
+        }
+
+        Object.defineProperty(fetchWrapped, "__WY_EXPORT_V105__", { value: true });
+        w.fetch = fetchWrapped;
+        runtime.hookCount += 1;
+      }
+    } catch (error) {
+      console.warn("[网易云全部播客导出] fetch Hook失败", error);
+    }
+  }
+
+  function installHooksEverywhere() {
+    installHooksOnWindow(PAGE);
+    installHooksOnWindow(window);
+
+    try {
+      for (let i = 0; i < window.frames.length; i += 1) {
+        try {
+          installHooksOnWindow(window.frames[i]);
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
+  // 必须尽可能早安装，避免漏掉首屏 worksdata 请求。
+  installHooksEverywhere();
+  setTimeout(installHooksEverywhere, 1200);
+  setTimeout(installHooksEverywhere, 3200);
+  // 低频兜底即可，避免每 500ms 反复扫描页面/iframe。
+  setInterval(installHooksEverywhere, 5000);
+
+  // ============================================================
+  // 识别播客列表、当前播客单集数、当前 user/get
+  // ============================================================
+
+  function isAlbumListResponse(data) {
+    if (!data || !data.page || !Array.isArray(data.records) || !data.records.length) {
+      return false;
+    }
+
+    const records = data.records;
+    const nullRelated = records.filter((item) => {
+      const meta = item && item.worksMetaInfo;
+      return meta && (meta.relatedResource == null || meta.relatedResource === "");
+    }).length;
+
+    // 探针实测：播客列表是 size=1000、relatedResource 为空。
+    return Number(data.page.size || 0) >= 100 && nullRelated / records.length >= 0.8;
+  }
+
+  function parseAlbumList(data) {
+    const result = [];
+
+    for (const item of Array.isArray(data && data.records) ? data.records : []) {
+      const meta = item && item.worksMetaInfo || {};
+      const id = String(item && item.worksId || "");
+      const name = clean(meta.worksTitle);
+
+      if (!id || !name) continue;
+
+      result.push({
+        id,
+        name,
+        cover: clean(meta.worksCover),
+        pubTime: meta.pubTime == null ? null : meta.pubTime,
+        listPlayNum: item.playNum == null ? null : item.playNum,
+        listCollectNum: item.collectNum == null ? null : item.collectNum,
+        listLikedNum: item.likedNum == null ? null : item.likedNum,
+        listCommentNum: item.commentNum == null ? null : item.commentNum,
+        listShareNum: item.shareNum == null ? null : item.shareNum,
+      });
+    }
+
+    return result;
+  }
+
+  function classifyPageResponses() {
+    // 1) 找全部播客列表
+    if (!runtime.albumList || !runtime.albumList.length) {
+      for (const record of runtime.pageResponses) {
+        if (!isAlbumListResponse(record.data)) continue;
+        const list = parseAlbumList(record.data);
+        if (list.length) {
+          runtime.albumList = list;
+
+          if (!state.albums.length) {
+            state.albums = list;
+            saveState();
+          }
+
+          runtime.lastMessage = `已识别播客列表：${list.length} 个`;
+          break;
+        }
+      }
+    }
+
+    // 2) 找当前播客单集列表：relatedResource 全部指向当前播客。
+    const currentId = getPodcastId();
+    const currentAlbum =
+      (runtime.albumList || state.albums || []).find((x) => String(x.id) === currentId) || null;
+
+    let best = null;
+
+    for (const record of runtime.pageResponses) {
+      const data = record.data;
+      if (!data || !data.page || !Array.isArray(data.records)) continue;
+      if (isAlbumListResponse(data)) continue;
+
+      const related = data.records
+        .map((item) => clean(item && item.worksMetaInfo && item.worksMetaInfo.relatedResource))
+        .filter(Boolean);
+
+      const unique = Array.from(new Set(related.map(normalizeTitle).filter(Boolean)));
+
+      let score = -1;
+
+      if (currentAlbum && related.length) {
+        const matched = related.filter((name) => sameTitle(name, currentAlbum.name)).length;
+        if (matched === related.length) score = 10000 + matched;
+        else if (matched / related.length >= 0.8) score = 8000 + matched;
+      } else if (related.length && unique.length === 1) {
+        score = 5000 + related.length;
+      }
+
+      // 空播客兜底：recordCount=0 时没有 relatedResource。
+      if (
+        Number(data.page.recordCount) === 0 &&
+        currentAlbum &&
+        Number(data.page.size || 0) <= 20
+      ) {
+        score = Math.max(score, 1000);
+      }
+
+      if (score >= 0 && (!best || score > best.score)) {
+        best = { score, data };
+      }
+    }
+
+    if (best) {
+      runtime.currentDetail = {
+        episodeCount: Number(best.data.page.recordCount || 0),
+        pageSize: Number(best.data.page.size || 0),
+      };
+    }
+  }
+
+  function trendHasValue(data, key) {
+    const list = data && Array.isArray(data[key]) ? data[key] : [];
+    return list.some((x) => x && x.num != null);
+  }
+
+  function chooseUserResponse(expertType, episodeCount, album) {
+    const candidates = runtime.userResponses
+      .map((x) => x.data)
+      .filter((d) =>
+        d &&
+        Number(d.expertType) === Number(expertType) &&
+        Number(d.publishNum) === Number(episodeCount)
+      );
+
+    if (!candidates.length) return null;
+
+    if (expertType === 3) {
+      const preferred = candidates.filter((d) =>
+        d.playNum != null ||
+        d.likedNum != null ||
+        trendHasValue(d, "playCountTrendList") ||
+        trendHasValue(d, "likeCountTrendList")
+      );
+      return (preferred.length ? preferred : candidates).slice(-1)[0];
+    }
+
+    if (expertType === 4) {
+      // 如果恰好有播客等于“账号播客数”而发生 publishNum 冲突，
+      // 优先用播客列表中的收藏总数做二次匹配。
+      if (album && album.listCollectNum != null) {
+        const exact = candidates.filter((d) =>
+          d.collectNum != null && Number(d.collectNum) === Number(album.listCollectNum)
+        );
+        if (exact.length) return exact.slice(-1)[0];
+      }
+
+      const preferred = candidates.filter((d) =>
+        d.collectNum != null || trendHasValue(d, "collectCountTrendList")
+      );
+      return (preferred.length ? preferred : candidates).slice(-1)[0];
+    }
+
+    return candidates.slice(-1)[0];
+  }
+
+  function toDateMap(list) {
+    const map = new Map();
+    for (const item of Array.isArray(list) ? list : []) {
+      const date = clean(item && item.date);
+      if (!date) continue;
+      map.set(date, item && item.num != null ? item.num : null);
+    }
+    return map;
+  }
+
+  function pickMetricValue(primaryMap, fallbackMap, date) {
+    if (primaryMap.has(date) && primaryMap.get(date) != null) {
+      return primaryMap.get(date);
+    }
+    if (fallbackMap.has(date) && fallbackMap.get(date) != null) {
+      return fallbackMap.get(date);
+    }
+
+    // 如果接口明确返回 null，保持空白；绝不擅自补 0。
+    if (primaryMap.has(date) || fallbackMap.has(date)) return null;
+    return null;
+  }
+
+  function buildTrendRows(type3, type4) {
+    const maps = {
+      play3: toDateMap(type3 && type3.playCountTrendList),
+      play4: toDateMap(type4 && type4.playCountTrendList),
+      collect3: toDateMap(type3 && type3.collectCountTrendList),
+      collect4: toDateMap(type4 && type4.collectCountTrendList),
+      like3: toDateMap(type3 && type3.likeCountTrendList),
+      like4: toDateMap(type4 && type4.likeCountTrendList),
+      comment3: toDateMap(type3 && type3.commentCountTrendList),
+      comment4: toDateMap(type4 && type4.commentCountTrendList),
+      share3: toDateMap(type3 && type3.shareCountTrendList),
+      share4: toDateMap(type4 && type4.shareCountTrendList),
+    };
+
+    const dates = new Set();
+    Object.values(maps).forEach((map) => {
+      for (const date of map.keys()) dates.add(date);
+    });
+
+    return Array.from(dates)
+      .sort()
+      .map((date) => ({
+        date,
+        // 实测：expertType=3 提供播放/点赞/评论/分享；
+        // expertType=4 提供收藏。只做字段合并，不做求和。
+        playNum: pickMetricValue(maps.play3, maps.play4, date),
+        collectNum: pickMetricValue(maps.collect4, maps.collect3, date),
+        likedNum: pickMetricValue(maps.like3, maps.like4, date),
+        commentNum: pickMetricValue(maps.comment3, maps.comment4, date),
+        shareNum: pickMetricValue(maps.share3, maps.share4, date),
+      }));
+  }
+
+  function firstNonNull() {
+    for (let i = 0; i < arguments.length; i += 1) {
+      const value = arguments[i];
+      if (value != null) return value;
+    }
+    return null;
+  }
+
+  function tryBuildCurrentResult() {
+    classifyPageResponses();
+
+    const podcastId = getPodcastId();
+    const album = getCurrentAlbum();
+    const detail = runtime.currentDetail;
+
+    if (!podcastId || !detail) return null;
+
+    const episodeCount = detail.episodeCount;
+    const type3 = chooseUserResponse(3, episodeCount, album);
+    const type4 = chooseUserResponse(4, episodeCount, album);
+
+    if (!type3) return null;
+
+    const allRows = buildTrendRows(type3, type4);
+    const near30 = allRows.slice(-30);
+    const near7 = near30.slice(-7);
+
+    const result = {
+      podcastId,
+      podcastName: clean(album && album.name) || inferCurrentTitleFromDetail() || `播客_${podcastId}`,
+      capturedAt: nowIso(),
+      updateTimeRaw: firstNonNull(type3.updateTime, type4 && type4.updateTime),
+      overview: {
+        totalEpisodes: firstNonNull(type3.publishNum, episodeCount),
+        totalPlay: firstNonNull(type3.playNum, album && album.listPlayNum),
+        totalCollect: firstNonNull(type4 && type4.collectNum, type3.collectNum, album && album.listCollectNum),
+        totalLike: firstNonNull(type3.likedNum, album && album.listLikedNum),
+        totalComment: firstNonNull(type3.commentNum, album && album.listCommentNum),
+        totalShare: firstNonNull(type3.shareNum, album && album.listShareNum),
+      },
+      near7,
+      near30,
+      source: {
+        pagegetEpisodeCount: episodeCount,
+        expertType3: Boolean(type3),
+        expertType4: Boolean(type4),
+      },
+    };
+
+    runtime.currentResult = result;
+    runtime.lastMessage =
+      `当前已识别：${result.podcastName}｜总单集 ${result.overview.totalEpisodes ?? "-"}｜近7天 ${near7.length} 条｜近30天 ${near30.length} 条`;
+
+    return result;
+  }
+
+  function inferCurrentTitleFromDetail() {
+    for (const record of runtime.pageResponses.slice().reverse()) {
+      const data = record.data;
+      if (!data || !Array.isArray(data.records)) continue;
+
+      const names = data.records
+        .map((item) => clean(item && item.worksMetaInfo && item.worksMetaInfo.relatedResource))
+        .filter(Boolean);
+
+      if (!names.length) continue;
+      const normalized = Array.from(new Set(names.map(normalizeTitle)));
+      if (normalized.length === 1) return names[0];
+    }
+    return "";
+  }
+
+  function getCurrentWaitStatus() {
+    classifyPageResponses();
+
+    const detail = runtime.currentDetail;
+    if (!detail) return "等待当前播客单集信息";
+
+    const album = getCurrentAlbum();
+    const episodeCount = detail.episodeCount;
+    const type3 = chooseUserResponse(3, episodeCount, album);
+    const type4 = chooseUserResponse(4, episodeCount, album);
+
+    const waiting = [];
+    if (!type3) waiting.push("播放/点赞/评论/分享接口");
+    if (!type4) waiting.push("收藏接口");
+
+    return waiting.length
+      ? `等待${waiting.join("、")}`
+      : "核心接口已齐全";
+  }
+
+  async function waitForCurrentResult(timeoutMs) {
+    const start = Date.now();
+    let lastWaitStatus = "";
+
+    while (Date.now() - start < timeoutMs) {
+      const result = tryBuildCurrentResult();
+
+      // 收藏需要 expertType=4；正常页面会一起返回。
+      // 如果已经拿到 type3 + type4，立即完成。
+      if (result && result.source.expertType3 && result.source.expertType4) {
+        if (lastWaitStatus !== "核心接口已齐全") {
+          runtime.lastMessage = "核心接口已齐全，正在写入结果";
+          render();
+        }
+        return result;
+      }
+
+      const waitStatus = getCurrentWaitStatus();
+      if (waitStatus !== lastWaitStatus) {
+        lastWaitStatus = waitStatus;
+        const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+        runtime.lastMessage = `${waitStatus}｜已等待 ${elapsed}s`;
+        render();
+      }
+
+      await sleep(300);
+    }
+
+    // 超时后仍允许返回 type3 结果；收藏保持接口可用的原值或空白。
+    return tryBuildCurrentResult();
+  }
+
+  // ============================================================
+  // 批量抓取：不用下拉框，按 podcast ID 逐页切换
+  // ============================================================
+
+  function buildPodcastUrl(id) {
+    const url = new URL(location.href);
+    url.pathname = "/st/ncreator/data-center/podcast";
+    url.searchParams.set("podcast", String(id));
+    return url.href;
+  }
+
+  function navigateToPodcast(id) {
+    const target = buildPodcastUrl(id);
+    runtime.lastMessage = `正在打开播客 ${id}`;
+    render();
+    location.replace(target);
+  }
+
+  async function ensureAlbumList() {
+    if (state.albums.length) return state.albums;
+
+    const start = Date.now();
+    while (Date.now() - start < 12000) {
+      classifyPageResponses();
+      if (runtime.albumList && runtime.albumList.length) {
+        state.albums = runtime.albumList;
+        saveState();
+        return state.albums;
+      }
+      await sleep(200);
+    }
+
+    throw new Error("没有抓到全部播客列表。请 Ctrl+F5 强制刷新后再点“开始全部抓取”。");
+  }
+
+  async function startFreshBatch() {
+    if (state.active && !state.paused) {
+      setMessage("批量抓取已经在运行");
+      return;
+    }
+
+    if (state.paused && state.albums.length) {
+      state.active = true;
+      state.paused = false;
+      saveState();
+      setMessage("继续批量抓取");
+      runBatchCycle();
+      return;
+    }
+
+    try {
+      const albums = await ensureAlbumList();
+
+      clearResultShards();
+      state = makeDefaultState();
+      state.albums = albums;
+      state.active = true;
+      state.paused = false;
+      state.startedAt = nowIso();
+      state.index = 0;
+      saveState();
+
+      setMessage(`开始抓取全部 ${albums.length} 个播客`);
+      runBatchCycle();
+    } catch (error) {
+      setMessage(error.message, true);
+    }
+  }
+
+  async function runBatchCycle() {
+    if (runtime.runningCycle) return;
+    if (!state.active || state.paused) return;
+
+    runtime.runningCycle = true;
+
+    try {
+      if (!state.albums.length) {
+        await ensureAlbumList();
+      }
+
+      if (state.index >= state.albums.length) {
+        state.active = false;
+        state.paused = false;
+        saveState();
+        setMessage(`全部完成：成功 ${getResultCount()}，失败 ${state.failures.length}`);
+        return;
+      }
+
+      const expected = state.albums[state.index];
+      const currentId = getPodcastId();
+
+      if (String(currentId) !== String(expected.id)) {
+        saveState();
+        navigateToPodcast(expected.id);
+        return;
+      }
+
+      setMessage(
+        `正在抓取 ${state.index + 1}/${state.albums.length}：${expected.name}`
+      );
+
+      const result = await waitForCurrentResult(CAPTURE_TIMEOUT_MS);
+
+      if (state.paused || !state.active) return;
+
+      if (result) {
+        if (!upsertResult(result)) {
+          throw new Error(runtime.lastError || "当前播客结果保存失败");
+        }
+        removeFailure(expected.id);
+        delete state.attempts[String(expected.id)];
+        state.index += 1;
+        saveState();
+
+        if (state.index >= state.albums.length) {
+          state.active = false;
+          saveState();
+          setMessage(`全部完成：成功 ${getResultCount()}，失败 ${state.failures.length}`);
+          return;
+        }
+
+        const next = state.albums[state.index];
+        setMessage(`已完成 ${result.podcastName}，准备下一本`);
+        await sleep(450);
+        navigateToPodcast(next.id);
+        return;
+      }
+
+      const id = String(expected.id);
+      const attempts = Number(state.attempts[id] || 0) + 1;
+      state.attempts[id] = attempts;
+      saveState();
+
+      if (attempts < MAX_RETRY) {
+        setMessage(`当前播客接口未完整返回，自动重试 ${attempts}/${MAX_RETRY - 1}`);
+        await sleep(500);
+        location.reload();
+        return;
+      }
+
+      addFailure(expected, "超过等待时间，未识别到当前播客 user/get 数据");
+      delete state.attempts[id];
+      state.index += 1;
+      saveState();
+
+      if (state.index < state.albums.length) {
+        const next = state.albums[state.index];
+        await sleep(450);
+        navigateToPodcast(next.id);
+      } else {
+        state.active = false;
+        saveState();
+        setMessage(`全部完成：成功 ${getResultCount()}，失败 ${state.failures.length}`);
+      }
+    } catch (error) {
+      setMessage(`批量抓取异常：${error.message}`, true);
+    } finally {
+      runtime.runningCycle = false;
+    }
+  }
+
+  function pauseBatch() {
+    if (!state.active && !state.paused) {
+      setMessage("当前没有正在运行的批量任务");
+      return;
+    }
+
+    state.paused = !state.paused;
+    state.active = true;
+    saveState();
+
+    if (state.paused) {
+      setMessage("已暂停，进度已保存");
+    } else {
+      setMessage("继续抓取");
+      runBatchCycle();
+    }
+  }
+
+  async function captureCurrentOnly() {
+    setMessage("正在读取当前播客真实接口数据…");
+
+    const result = await waitForCurrentResult(CAPTURE_TIMEOUT_MS);
+
+    if (!result) {
+      setMessage("当前播客没有识别成功。请 Ctrl+F5 刷新页面后再试。", true);
+      return;
+    }
+
+    runtime.currentResult = result;
+    setMessage(
+      `读取完成：${result.podcastName}｜总播放 ${result.overview.totalPlay ?? "-"}｜近7天 ${result.near7.length} 条｜近30天 ${result.near30.length} 条`
+    );
+  }
+
+  // ============================================================
+  // Excel
+  // ============================================================
+
+  async function ensureXlsx() {
+    if (PAGE.XLSX) return PAGE.XLSX;
+    if (window.XLSX) return window.XLSX;
+
+    return new Promise((resolve, reject) => {
+      const existing = document.getElementById("__wy_sheetjs_loader__");
+
+      if (existing) {
+        let tries = 0;
+        const timer = setInterval(() => {
+          tries += 1;
+          if (PAGE.XLSX || window.XLSX) {
+            clearInterval(timer);
+            resolve(PAGE.XLSX || window.XLSX);
+          } else if (tries > 50) {
+            clearInterval(timer);
+            reject(new Error("Excel组件加载超时"));
+          }
+        }, 100);
+        return;
+      }
+
+      const script = document.createElement("script");
+      script.id = "__wy_sheetjs_loader__";
+      script.src = "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js";
+      script.onload = () => {
+        const lib = PAGE.XLSX || window.XLSX;
+        if (lib) resolve(lib);
+        else reject(new Error("Excel组件加载后不可用"));
+      };
+      script.onerror = () => reject(new Error("Excel组件加载失败，请检查网络"));
+      (document.head || document.documentElement).appendChild(script);
+    });
+  }
+
+  function toExcelValue(value) {
+    return value == null ? "" : value;
+  }
+
+  function sortResultsByAlbumOrder(results) {
+    const order = new Map(state.albums.map((x, i) => [String(x.id), i]));
+    return results.slice().sort((a, b) => {
+      const ai = order.has(String(a.podcastId)) ? order.get(String(a.podcastId)) : Number.MAX_SAFE_INTEGER;
+      const bi = order.has(String(b.podcastId)) ? order.get(String(b.podcastId)) : Number.MAX_SAFE_INTEGER;
+      return ai - bi;
+    });
+  }
+
+  async function exportExcel() {
+    let results = loadAllResults();
+
+    if (!results.length && runtime.currentResult) {
+      results = [runtime.currentResult];
+    }
+
+    if (!results.length) {
+      setMessage("当前没有可导出的结果。先“抓取当前”或“开始全部抓取”。", true);
+      return;
+    }
+
+    try {
+      const XLSX = await ensureXlsx();
+      const sorted = sortResultsByAlbumOrder(results);
+      const wb = XLSX.utils.book_new();
+
+      function sumPeriodMetric(list, key) {
+        const values = (Array.isArray(list) ? list : [])
+          .map((item) => item && item[key])
+          .filter((value) => value != null && value !== "" && Number.isFinite(Number(value)))
+          .map(Number);
+
+        // 整个周期该指标如果接口全部为 null/空白，继续保持空白。
+        if (!values.length) return "";
+
+        return values.reduce((sum, value) => sum + value, 0);
+      }
+
+      const overviewRows = [
+        [
+          "播客名称",
+          "播客ID",
+          "总单集数",
+          "总播放数",
+          "总收藏数",
+          "总点赞数",
+          "总评论数",
+          "总分享数",
+          "近7天播放合计",
+          "近7天收藏合计",
+          "近7天点赞合计",
+          "近7天评论合计",
+          "近7天分享合计",
+          "近30天播放合计",
+          "近30天收藏合计",
+          "近30天点赞合计",
+          "近30天评论合计",
+          "近30天分享合计",
+        ],
+        ...sorted.map((r) => [
+          r.podcastName,
+          r.podcastId,
+          toExcelValue(r.overview && r.overview.totalEpisodes),
+          toExcelValue(r.overview && r.overview.totalPlay),
+          toExcelValue(r.overview && r.overview.totalCollect),
+          toExcelValue(r.overview && r.overview.totalLike),
+          toExcelValue(r.overview && r.overview.totalComment),
+          toExcelValue(r.overview && r.overview.totalShare),
+          sumPeriodMetric(r.near7, "playNum"),
+          sumPeriodMetric(r.near7, "collectNum"),
+          sumPeriodMetric(r.near7, "likedNum"),
+          sumPeriodMetric(r.near7, "commentNum"),
+          sumPeriodMetric(r.near7, "shareNum"),
+          sumPeriodMetric(r.near30, "playNum"),
+          sumPeriodMetric(r.near30, "collectNum"),
+          sumPeriodMetric(r.near30, "likedNum"),
+          sumPeriodMetric(r.near30, "commentNum"),
+          sumPeriodMetric(r.near30, "shareNum"),
+        ]),
+      ];
+
+      const wsOverview = XLSX.utils.aoa_to_sheet(overviewRows);
+      wsOverview["!cols"] = [
+        { wch: 46 }, { wch: 18 }, { wch: 12 },
+        { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 }, { wch: 15 },
+        { wch: 16 }, { wch: 16 }, { wch: 16 }, { wch: 16 }, { wch: 16 },
+        { wch: 17 }, { wch: 17 }, { wch: 17 }, { wch: 17 }, { wch: 17 },
+      ];
+      if (overviewRows.length > 1) {
+        wsOverview["!autofilter"] = { ref: `A1:R${overviewRows.length}` };
+      }
+      XLSX.utils.book_append_sheet(wb, wsOverview, "总览数据");
+
+      function buildPeriodRows(key) {
+        const rows = [
+          ["播客名称", "播客ID", "日期", "播放数", "收藏数", "点赞数", "评论数", "分享数"],
+        ];
+
+        for (const r of sorted) {
+          const list = Array.isArray(r[key]) ? r[key] : [];
+          if (!list.length) continue;
+
+          for (const item of list) {
+            rows.push([
+              r.podcastName,
+              r.podcastId,
+              item.date || "",
+              toExcelValue(item.playNum),
+              toExcelValue(item.collectNum),
+              toExcelValue(item.likedNum),
+              toExcelValue(item.commentNum),
+              toExcelValue(item.shareNum),
+            ]);
+          }
+
+          // 每本播客末尾增加一行“合计”。
+          // 合计在脚本内直接计算，写入 Excel 的是固定数值，不依赖任何单元格公式。
+          // 如果某项在整个周期内全部为空，则继续保持空白，不擅自显示 0。
+          rows.push([
+            r.podcastName,
+            r.podcastId,
+            "合计",
+            sumPeriodMetric(list, "playNum"),
+            sumPeriodMetric(list, "collectNum"),
+            sumPeriodMetric(list, "likedNum"),
+            sumPeriodMetric(list, "commentNum"),
+            sumPeriodMetric(list, "shareNum"),
+          ]);
+        }
+
+        return { rows };
+      }
+
+      // 把第一列中连续相同的播客名称纵向合并。
+      // 表头在第 1 行，所以从 rows[1] 开始统计。
+      function mergeSameAlbumNames(ws, rows) {
+        const merges = [];
+        let start = 1;
+
+        while (start < rows.length) {
+          const albumName = rows[start][0];
+          let end = start;
+
+          while (
+            end + 1 < rows.length &&
+            rows[end + 1][0] === albumName
+          ) {
+            end += 1;
+          }
+
+          if (end > start) {
+            merges.push({
+              s: { r: start, c: 0 },
+              e: { r: end, c: 0 },
+            });
+          }
+
+          start = end + 1;
+        }
+
+        if (merges.length) {
+          ws["!merges"] = merges;
+        }
+      }
+
+      const near7Built = buildPeriodRows("near7");
+      const near7Rows = near7Built.rows;
+      const ws7 = XLSX.utils.aoa_to_sheet(near7Rows);
+      ws7["!cols"] = [
+        { wch: 46 }, { wch: 18 }, { wch: 14 }, { wch: 14 },
+        { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 14 },
+      ];
+      if (near7Rows.length > 1) {
+        ws7["!autofilter"] = { ref: `A1:H${near7Rows.length}` };
+      }
+      mergeSameAlbumNames(ws7, near7Rows);
+      XLSX.utils.book_append_sheet(wb, ws7, "近7天");
+
+      const near30Built = buildPeriodRows("near30");
+      const near30Rows = near30Built.rows;
+      const ws30 = XLSX.utils.aoa_to_sheet(near30Rows);
+      ws30["!cols"] = [
+        { wch: 46 }, { wch: 18 }, { wch: 14 }, { wch: 14 },
+        { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 14 },
+      ];
+      if (near30Rows.length > 1) {
+        ws30["!autofilter"] = { ref: `A1:H${near30Rows.length}` };
+      }
+      mergeSameAlbumNames(ws30, near30Rows);
+      XLSX.utils.book_append_sheet(wb, ws30, "近30天");
+
+      if (state.failures.length) {
+        const failureRows = [
+          ["播客ID", "播客名称", "失败原因", "失败时间"],
+          ...state.failures.map((x) => [
+            x.podcastId || "",
+            x.podcastName || "",
+            x.reason || "",
+            x.failedAt || "",
+          ]),
+        ];
+        const wsFail = XLSX.utils.aoa_to_sheet(failureRows);
+        wsFail["!cols"] = [{ wch: 18 }, { wch: 46 }, { wch: 70 }, { wch: 24 }];
+        XLSX.utils.book_append_sheet(wb, wsFail, "失败项");
+      }
+
+      const stamp = new Date().toISOString().replace(/[:T]/g, "-").slice(0, 16);
+      const filename = results.length === 1
+        ? `网易云播客数据_${results[0].podcastId}_${stamp}.xlsx`
+        : `网易云全部播客数据_${stamp}.xlsx`;
+
+      XLSX.writeFile(wb, filename, { compression: true });
+      setMessage(`Excel 已导出：${filename}`);
+    } catch (error) {
+      setMessage(`Excel 导出失败：${error.message}`, true);
+    }
+  }
+
+  // ============================================================
+  // 面板
+  // ============================================================
+
+  function escapeHtml(value) {
+    return String(value == null ? "" : value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function ensurePanel() {
+    if (!document.body) return;
+
+    if (runtime.panel && runtime.panel.isConnected) {
+      return;
+    }
+
+    const stale = document.getElementById(PANEL_ID);
+    if (stale) {
+      runtime.panel = stale;
+      bindPanelRefs();
+      render();
+      return;
+    }
+
+    const panel = document.createElement("div");
+    panel.id = PANEL_ID;
+    panel.style.cssText = [
+      "position:fixed",
+      "right:16px",
+      "top:86px",
+      "z-index:2147483647",
+      "width:380px",
+      "box-sizing:border-box",
+      "padding:12px",
+      "border:2px solid #e60026",
+      "border-radius:10px",
+      "background:#1f1f1f",
+      "color:#eee",
+      "font:12px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",
+      "box-shadow:0 6px 24px rgba(0,0,0,.38)",
+    ].join(";");
+
+    panel.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;">
+        <strong style="font-size:14px;color:#ff6278;">网易云全部播客导出 v${VERSION}</strong>
+        <button data-role="min" style="width:28px;height:24px;padding:0;border:1px solid #555;border-radius:4px;background:#333;color:#fff;cursor:pointer;">－</button>
+      </div>
+
+      <div data-role="body">
+        <div data-role="current" style="color:#ddd;margin-bottom:5px;"></div>
+        <div data-role="count" style="color:#aaa;margin-bottom:7px;"></div>
+
+        <div style="height:8px;background:#3a3a3a;border-radius:999px;overflow:hidden;margin-bottom:5px;">
+          <div data-role="bar" style="height:100%;width:0%;background:#e60026;transition:width .2s;"></div>
+        </div>
+        <div data-role="progress" style="color:#bbb;margin-bottom:8px;"></div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:7px;">
+          <button data-role="start" style="padding:8px;border:0;border-radius:5px;background:#e60026;color:#fff;font-weight:700;cursor:pointer;">开始全部抓取</button>
+          <button data-role="currentBtn" style="padding:8px;border:0;border-radius:5px;background:#b90020;color:#fff;font-weight:700;cursor:pointer;">抓取当前</button>
+          <button data-role="pause" style="padding:8px;border:1px solid #666;border-radius:5px;background:#333;color:#fff;cursor:pointer;">暂停</button>
+          <button data-role="export" style="padding:8px;border:1px solid #777;border-radius:5px;background:#444;color:#fff;cursor:pointer;">导出 Excel</button>
+        </div>
+
+        <button data-role="clear" style="width:100%;padding:6px;border:1px solid #555;border-radius:5px;background:#292929;color:#bbb;cursor:pointer;margin-bottom:8px;">清空抓取进度</button>
+
+        <div data-role="status" style="padding:8px;border:1px solid #3d3d3d;border-radius:6px;background:#151515;max-height:105px;overflow:auto;white-space:pre-wrap;word-break:break-word;"></div>
+
+        <div style="margin-top:7px;color:#888;font-size:11px;">
+          性能优化版：结果按专辑分片保存；近7天/近30天合计由脚本直接计算为固定数值；不使用 Excel 公式。
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(panel);
+    runtime.panel = panel;
+    bindPanelRefs();
+
+    runtime.ui.min.addEventListener("click", () => {
+      const body = runtime.ui.body;
+      const hidden = body.style.display === "none";
+      body.style.display = hidden ? "block" : "none";
+      runtime.ui.min.textContent = hidden ? "－" : "＋";
+    });
+
+    runtime.ui.start.addEventListener("click", startFreshBatch);
+    runtime.ui.currentBtn.addEventListener("click", captureCurrentOnly);
+    runtime.ui.pause.addEventListener("click", pauseBatch);
+    runtime.ui.export.addEventListener("click", exportExcel);
+    runtime.ui.clear.addEventListener("click", () => {
+      if (state.active && !state.paused) {
+        const ok = window.confirm("当前抓取仍在运行，确定清空全部进度吗？");
+        if (!ok) return;
+      } else if (getResultCount() || state.failures.length) {
+        const ok = window.confirm("确定清空已抓结果和进度吗？");
+        if (!ok) return;
+      }
+      clearState();
+    });
+
+    render();
+  }
+
+  function bindPanelRefs() {
+    const p = runtime.panel;
+    runtime.ui = {
+      body: p.querySelector('[data-role="body"]'),
+      min: p.querySelector('[data-role="min"]'),
+      current: p.querySelector('[data-role="current"]'),
+      count: p.querySelector('[data-role="count"]'),
+      bar: p.querySelector('[data-role="bar"]'),
+      progress: p.querySelector('[data-role="progress"]'),
+      start: p.querySelector('[data-role="start"]'),
+      currentBtn: p.querySelector('[data-role="currentBtn"]'),
+      pause: p.querySelector('[data-role="pause"]'),
+      export: p.querySelector('[data-role="export"]'),
+      clear: p.querySelector('[data-role="clear"]'),
+      status: p.querySelector('[data-role="status"]'),
+    };
+  }
+
+  function setTextIfChanged(el, value) {
+    if (!el) return;
+    const text = String(value == null ? "" : value);
+    if (el.textContent !== text) el.textContent = text;
+  }
+
+  function render() {
+    if (!runtime.panel || !runtime.panel.isConnected || !runtime.ui.current) return;
+
+    const currentId = getPodcastId();
+    const album = getCurrentAlbum();
+    const total = state.albums.length || (runtime.albumList && runtime.albumList.length) || 0;
+    const done = getResultCount();
+    const fail = state.failures.length;
+    const index = Math.min(state.index, total);
+
+    const pct = total ? Math.max(0, Math.min(100, (index / total) * 100)) : 0;
+
+    setTextIfChanged(
+      runtime.ui.current,
+      `当前播客：${album ? album.name : "未识别"}（${currentId || "-"}）`
+    );
+
+    setTextIfChanged(
+      runtime.ui.count,
+      `列表 ${total || "-"}｜成功 ${done}｜失败 ${fail}｜Hook ${runtime.hookCount}`
+    );
+
+    const width = `${pct}%`;
+    if (runtime.ui.bar.style.width !== width) {
+      runtime.ui.bar.style.width = width;
+    }
+
+    setTextIfChanged(
+      runtime.ui.progress,
+      total
+        ? `进度 ${index}/${total}（${pct.toFixed(1)}%）`
+        : "等待识别全部播客列表"
+    );
+
+    setTextIfChanged(
+      runtime.ui.start,
+      state.paused
+        ? "继续全部抓取"
+        : state.active
+          ? "抓取运行中"
+          : (done ? "重新开始全部" : "开始全部抓取")
+    );
+
+    setTextIfChanged(runtime.ui.pause, state.paused ? "继续" : "暂停");
+    runtime.ui.pause.disabled = !state.active && !state.paused;
+
+    const result = runtime.currentResult;
+    let detail = runtime.lastError || runtime.lastMessage || "";
+
+    if (result) {
+      detail +=
+        `\n当前结果：总单集 ${result.overview.totalEpisodes ?? "-"}，` +
+        `总播放 ${result.overview.totalPlay ?? "-"}，` +
+        `总收藏 ${result.overview.totalCollect ?? "-"}，` +
+        `总点赞 ${result.overview.totalLike ?? "-"}，` +
+        `总评论 ${result.overview.totalComment ?? "-"}，` +
+        `总分享 ${result.overview.totalShare ?? "-"}。`;
+    }
+
+    setTextIfChanged(runtime.ui.status, detail);
+    const targetColor = runtime.lastError ? "#ff7b91" : "#ddd";
+    if (runtime.ui.status.style.color !== targetColor) {
+      runtime.ui.status.style.color = targetColor;
+    }
+  }
+
+  // ============================================================
+  // 启动
+  // ============================================================
+
+  function bootUi() {
+    ensurePanel();
+
+    // 不再监听整个页面 DOM。旧版全局 MutationObserver 会把面板自身的文字/进度变化也纳入监听，
+    // 网易云页面频繁重绘时容易形成高频回调。这里改成低频“面板存活检查”。
+    setInterval(() => {
+      if (!runtime.panel || !runtime.panel.isConnected) {
+        ensurePanel();
+      }
+    }, 2500);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", bootUi, { once: true });
+  } else {
+    bootUi();
+  }
+
+  // 页面接口可能比 DOMContentLoaded 更早完成，延迟分类一次。
+  setTimeout(() => {
+    classifyPageResponses();
+    tryBuildCurrentResult();
+    render();
+
+    if (state.active && !state.paused) {
+      runBatchCycle();
+    }
+  }, 900);
+
+  setTimeout(() => {
+    classifyPageResponses();
+    tryBuildCurrentResult();
+    render();
+
+    if (state.active && !state.paused) {
+      runBatchCycle();
+    }
+  }, 2200);
+
+  console.log("[网易云全部播客导出] v1.0.5 性能优化版已启动", location.href);
+})();

@@ -1,0 +1,1002 @@
+// ==UserScript==
+// @name         微信听书创作平台 - 全部专辑音频/订阅数据抓取器
+// @namespace    fyf.wxlisten.batch
+// @version      1.6.0
+// @description  从专辑列表接口直接获取全部专辑，再按 albumId 批量抓取音频数据与订阅数据；不抓单集数据。支持1/4/8/16任务并发、动态请求间隔60-600ms、-2014统一全局冷却10秒、逐指标断点续抓、失败重试、Excel导出；导出表已移除albumUid/来源/状态/完结状态列。
+// @match        https://x.at.qq.com/*
+// @grant        unsafeWindow
+// @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const PAGE = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+  const DB_NAME = 'fyf_wxlisten_batch_v1';
+  const DB_VERSION = 1;
+  const STORE = 'albums';
+  const RANGE = 1; // 探针已确认：0=近7日，1=近30日
+  const DASHBOARD_BASE = '/api/album/data/dashboard';
+  const LIST_API = '/api/podcast/list';
+  const DETAIL_API = '/api/podcast/detail';
+  // 平台会在请求过密时返回：{succ:0, errcode:-2014, errmsg:"请求频率过高"}
+  // v1.5 使用“动态发车间隔”：请求只限制启动节奏，不等待前一个请求返回。
+  // 例如并发8、间隔120ms：0ms发A、120ms发B、240ms发C……A没返回也不影响B/C继续出发。
+  // 稳定时自动逐步提速；一旦遇到 -2014，全局统一冷却10秒并明显降速。
+  const START_REQUEST_GAP_MS = 120;
+  const MIN_REQUEST_GAP_MS = 60;
+  const MAX_REQUEST_GAP_MS = 600; // 最慢限制为600ms，触发限频后也不会继续无限降速
+  const SPEEDUP_SUCCESS_THRESHOLD = 120; // 连续成功多少个API后尝试小幅提速
+  const SPEEDUP_MIN_QUIET_MS = 60000;    // 距离最近一次限频至少稳定1分钟才允许提速
+  const RATE_LIMIT_RESET_MS = 20 * 60 * 1000;
+  const RATE_LIMIT_COOLDOWN_MS = 10000; // 所有限频统一冷却10秒，不再递增到30/60/120秒
+  const SOFT_EMPTY_RETRIES = 3; // 真正缺少 data（且不是接口错误）时额外重试
+
+  const METRICS = {
+    listen: ['收听数', '点赞数', '评论数', '分享数'],
+    subscribe: ['总订阅', '净增数', '新增数', '取消数']
+  };
+
+  const runtime = {
+    albums: [],
+    running: false,
+    paused: false,
+    stopRequested: false,
+    concurrency: Number(localStorage.getItem('wxlisten_concurrency') || 1),
+    logs: [],
+    softEmptyStreak: 0,
+    rate: {
+      // 沿用v1.3的动态间隔键，升级到v1.4后保留已经学习到的请求间隔。
+      gapMs: Math.min(MAX_REQUEST_GAP_MS, Math.max(MIN_REQUEST_GAP_MS, Number(localStorage.getItem('wxlisten_adaptive_gap_v13') || START_REQUEST_GAP_MS))),
+      blockedUntil: 0,
+      strikes: 0,
+      lastRateLimitAt: 0,
+      successesSinceLimit: 0,
+      totalRateLimits: 0,
+      speedUps: 0
+    },
+    progress: { total: 0, done: 0, failed: 0, pending: 0, current: '' }
+  };
+
+  let dbPromise = null;
+  let panel = null;
+  let ui = {};
+
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  async function interruptibleSleep(ms) {
+    const end = Date.now() + Math.max(0, ms);
+    while (Date.now() < end) {
+      if (runtime.stopRequested) throw stoppedError();
+      await sleep(Math.min(500, end - Date.now()));
+    }
+  }
+
+  let nextRequestAt = 0;
+  async function waitRequestSlot(gapMs) {
+    // 全局只控制“请求何时出发”，不会等待前一个请求返回。
+    // 因此多个请求仍可同时处于在途状态，并发参数仍然有效。
+    while (true) {
+      await waitIfPaused();
+      const configured = Number(gapMs || runtime.rate.gapMs || START_REQUEST_GAP_MS);
+      const baseGap = Math.min(MAX_REQUEST_GAP_MS, Math.max(MIN_REQUEST_GAP_MS, configured));
+      const now = Date.now();
+      const slot = Math.max(now, nextRequestAt, runtime.rate.blockedUntil || 0);
+      // 小抖动避免所有请求形成完全固定周期；抖动很小，不明显影响速度。
+      const jitter = Math.floor(Math.random() * 16);
+      nextRequestAt = slot + baseGap + jitter;
+
+      const wait = slot - now;
+      if (wait <= 0) return;
+      await interruptibleSleep(wait);
+
+      // 等待过程中如果另一个 worker 触发了 -2014，blockedUntil 会被推后，
+      // 此 worker 必须按新的全局冷却时间重新排队。
+      if (Date.now() >= (runtime.rate.blockedUntil || 0)) return;
+    }
+  }
+
+  function makeApiError(message, code, json) {
+    const err = new Error(message);
+    err.apiCode = Number(code);
+    err.apiJson = json;
+    return err;
+  }
+
+  function inspectApiError(json) {
+    if (!json || typeof json !== 'object') return null;
+
+    const rootErrCode = Number(json.errCode);
+    if (Number.isFinite(rootErrCode) && rootErrCode !== 0) {
+      return makeApiError(`接口错误 errCode=${rootErrCode} ${json.errMsg || ''}`.trim(), rootErrCode, json);
+    }
+
+    // 微信听书 dashboard 的限频错误就在根节点，不在 data 里面。
+    if (typeof json.errcode !== 'undefined') {
+      const code = Number(json.errcode);
+      if (Number.isFinite(code) && code !== 0) {
+        const err = makeApiError(`接口错误 errcode=${code} ${json.errmsg || ''}`.trim(), code, json);
+        if (code === -2014 || /请求频率过高|频率过高|too\s*many/i.test(String(json.errmsg || ''))) {
+          err.name = 'RateLimitError';
+        }
+        return err;
+      }
+    }
+
+    if (json.data && typeof json.data.errcode !== 'undefined') {
+      const code = Number(json.data.errcode);
+      if (Number.isFinite(code) && code !== 0) {
+        const err = makeApiError(`数据错误 errcode=${code} ${json.data.errmsg || ''}`.trim(), code, json);
+        if (code === -2014 || /请求频率过高|频率过高|too\s*many/i.test(String(json.data.errmsg || ''))) {
+          err.name = 'RateLimitError';
+        }
+        return err;
+      }
+    }
+
+    return null;
+  }
+
+  function saveAdaptiveGap() {
+    localStorage.setItem('wxlisten_adaptive_gap_v13', String(runtime.rate.gapMs));
+  }
+
+  function registerRateLimit(err) {
+    const now = Date.now();
+    runtime.rate.totalRateLimits++;
+
+    // 同一波已经在路上的请求可能接连返回 -2014。第一次已经触发全局冷却后，
+    // 后续同波错误只计数，不重复把冷却时间无限叠加。
+    if ((runtime.rate.blockedUntil || 0) > now + 3000) {
+      render();
+      return;
+    }
+
+    if (!runtime.rate.lastRateLimitAt || now - runtime.rate.lastRateLimitAt > RATE_LIMIT_RESET_MS) {
+      runtime.rate.strikes = 0;
+    }
+    runtime.rate.strikes++;
+    runtime.rate.lastRateLimitAt = now;
+    runtime.rate.successesSinceLimit = 0;
+
+    const cooldownMs = RATE_LIMIT_COOLDOWN_MS;
+    runtime.rate.blockedUntil = now + cooldownMs;
+
+    // 限频后不要只加几十毫秒，要明显退避。
+    // 120ms -> 至少260ms；260ms -> 约455ms；继续触发时最多降到600ms，不会再变慢。
+    runtime.rate.gapMs = Math.min(
+      MAX_REQUEST_GAP_MS,
+      Math.max(260, Math.round(runtime.rate.gapMs * 1.75))
+    );
+    saveAdaptiveGap();
+
+    // 让已经预约但还没出发的请求全部重新在冷却结束后排队。
+    nextRequestAt = Math.max(nextRequestAt, runtime.rate.blockedUntil);
+
+    const raw = err && err.apiJson ? JSON.stringify(err.apiJson).slice(0, 220) : formatError(err);
+    log(`平台返回 -2014“请求频率过高”。全部请求冷却 ${Math.round(cooldownMs / 1000)} 秒；动态间隔降速到约 ${runtime.rate.gapMs}ms。${raw ? ` 返回：${raw}` : ''}`);
+  }
+
+  function registerSuccessfulRequest() {
+    runtime.rate.successesSinceLimit++;
+
+    const quietMs = runtime.rate.lastRateLimitAt ? Date.now() - runtime.rate.lastRateLimitAt : Number.POSITIVE_INFINITY;
+    if (runtime.rate.successesSinceLimit < SPEEDUP_SUCCESS_THRESHOLD || quietMs < SPEEDUP_MIN_QUIET_MS) {
+      return;
+    }
+
+    // 每一轮只小幅加速：大间隔时按约12%缩短，小间隔时每次最多缩短15ms。
+    // 这样会逐步试探平台阈值，而不是突然从500ms跳到100ms。
+    const current = runtime.rate.gapMs;
+    const step = Math.max(8, Math.min(40, Math.round(current * 0.12)));
+    const next = Math.max(MIN_REQUEST_GAP_MS, current - step);
+    runtime.rate.successesSinceLimit = 0;
+
+    if (next < current) {
+      runtime.rate.gapMs = next;
+      runtime.rate.speedUps++;
+      saveAdaptiveGap();
+      log(`连续 ${SPEEDUP_SUCCESS_THRESHOLD} 个API稳定成功，动态提速：请求启动间隔 ${current}ms → ${next}ms。`);
+    }
+
+    // 很久没有再限频后，逐步降低历史strike，让下一次偶发限频不必直接进入长冷却。
+    if (runtime.rate.strikes > 0 && quietMs > RATE_LIMIT_RESET_MS) {
+      runtime.rate.strikes = Math.max(0, runtime.rate.strikes - 1);
+    }
+  }
+
+  function log(message) {
+    const line = `[${new Date().toLocaleTimeString()}] ${message}`;
+    runtime.logs.push(line);
+    if (runtime.logs.length > 120) runtime.logs.shift();
+    console.log('[微信听书抓取]', message);
+    render();
+  }
+
+  function formatError(err) {
+    if (!err) return '未知错误';
+    if (typeof err === 'string') return err;
+    return err.message || String(err);
+  }
+
+  function openDB() {
+    if (dbPromise) return dbPromise;
+    dbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(STORE)) {
+          db.createObjectStore(STORE, { keyPath: 'key' });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    return dbPromise;
+  }
+
+  async function idbPut(value) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).put(value);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function idbGet(key) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readonly');
+      const req = tx.objectStore(STORE).get(String(key));
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function idbGetAll() {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readonly');
+      const req = tx.objectStore(STORE).getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function idbClear() {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function requestJSON(url, options = {}, config = {}) {
+    const retries = config.retries ?? 3;
+    const timeoutMs = config.timeoutMs ?? 30000;
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      const Controller = PAGE.AbortController || AbortController;
+      const controller = new Controller();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        await waitRequestSlot(config.gapMs);
+        const response = await PAGE.fetch.call(PAGE, url, {
+          ...options,
+          credentials: 'include',
+          cache: 'no-store',
+          signal: controller.signal
+        });
+
+        clearTimeout(timer);
+
+        if (!response.ok) {
+          const error = new Error(`HTTP ${response.status} ${response.statusText || ''}`.trim());
+          error.status = response.status;
+          if (response.status === 429) error.name = 'RateLimitError';
+          throw error;
+        }
+
+        const text = await response.text();
+        let json;
+        try {
+          json = JSON.parse(text);
+        } catch (_) {
+          throw new Error(`返回内容不是JSON：${text.slice(0, 160)}`);
+        }
+
+        const apiError = inspectApiError(json);
+        if (apiError) throw apiError;
+
+        registerSuccessfulRequest();
+        return json;
+      } catch (err) {
+        clearTimeout(timer);
+        if (err && err.name === 'StoppedError') throw err;
+
+        lastError = err;
+        const status = err && err.status;
+        const isRateLimit = (err && err.name === 'RateLimitError') || status === 429 || Number(err && err.apiCode) === -2014;
+
+        if (isRateLimit) {
+          registerRateLimit(err);
+          if (attempt >= retries) break;
+          // 不在当前 worker 里单独 sleep；所有 worker 都由 blockedUntil 统一阻塞。
+          continue;
+        }
+
+        const retryable = !status || status === 408 || status >= 500;
+        if (attempt >= retries || !retryable) break;
+
+        const delay = Math.min(8000, 800 * Math.pow(2, attempt)) + Math.floor(Math.random() * 350);
+        await interruptibleSleep(delay);
+      }
+    }
+
+    throw lastError || new Error('请求失败');
+  }
+
+  async function loadAlbumList() {
+    if (runtime.running) {
+      log('正在抓取中，不能重新读取专辑列表。');
+      return;
+    }
+
+    log('正在读取全部专辑列表，请稍候。该接口本身可能需要十几秒。');
+    try {
+      const json = await requestJSON(LIST_API, { method: 'POST' }, { retries: 2, timeoutMs: 90000 });
+      const raw = Array.isArray(json && json.podCasts) ? json.podCasts : [];
+
+      const seen = new Set();
+      runtime.albums = raw
+        .filter(item => item && item.albumId != null)
+        .filter(item => {
+          const key = String(item.albumId);
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        })
+        .map(item => ({
+          albumId: Number(item.albumId),
+          albumUid: item.albumUid || '',
+          title: item.title || '',
+          source: item.source || '',
+          state: item.state,
+          finished: item.finished,
+          categoryType: item.categoryType,
+          categoryTags: item.categoryTags || '',
+          createTime: item.createTime,
+          updateTime: item.updateTime,
+          latestTrackTime: item.latestTrackTime
+        }));
+
+      await refreshProgress();
+      log(`专辑列表读取成功：${runtime.albums.length} 本。`);
+    } catch (err) {
+      log(`读取专辑列表失败：${formatError(err)}`);
+    }
+  }
+
+  async function warmAlbum(album) {
+    if (!album || !album.albumUid) return;
+    try {
+      await requestJSON(DETAIL_API, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ albumUid: album.albumUid })
+      }, { retries: 1, timeoutMs: 25000 });
+    } catch (_) {
+      // 预热失败不直接中断，继续尝试 dashboard。
+    }
+  }
+
+  async function fetchDashboard(album, type, index) {
+    const qs = new URLSearchParams({
+      albumId: String(album.albumId),
+      type,
+      range: String(RANGE),
+      index: String(index)
+    });
+    const url = `${DASHBOARD_BASE}?${qs.toString()}`;
+    let lastRaw = '';
+
+    for (let softAttempt = 0; softAttempt <= SOFT_EMPTY_RETRIES; softAttempt++) {
+      const json = await requestJSON(url, { method: 'GET' }, {
+        retries: 5,
+        timeoutMs: 25000
+      });
+
+      if (json && json.data && typeof json.data === 'object') {
+        runtime.softEmptyStreak = 0;
+        return json.data;
+      }
+
+      // 全 0 的正常响应有完整 data；-2014 也已经在 requestJSON 中单独识别。
+      // 因此只有“真正没有 data 且没有接口错误”的异常响应才会走到这里。
+      try { lastRaw = JSON.stringify(json).slice(0, 600); } catch (_) { lastRaw = String(json); }
+      runtime.softEmptyStreak++;
+
+      if (softAttempt === 0) {
+        log(`异常空响应重试：${album.title || album.albumId} / ${type} / index=${index}`);
+      }
+
+      if (softAttempt === 1) {
+        await warmAlbum(album);
+      }
+
+      if (runtime.softEmptyStreak >= 5) {
+        runtime.softEmptyStreak = 0;
+        runtime.rate.blockedUntil = Math.max(runtime.rate.blockedUntil || 0, Date.now() + 10000);
+        log('连续出现真正的 dashboard 空响应，全局冷却 10 秒后继续。');
+      } else if (softAttempt < SOFT_EMPTY_RETRIES) {
+        const waits = [1500, 3000, 6000];
+        await interruptibleSleep(waits[Math.min(softAttempt, waits.length - 1)]);
+      }
+    }
+
+    throw new Error(`dashboard 空响应（不是全0）：${lastRaw || '无响应内容'}`);
+  }
+
+  function extractSeries(data) {
+    const detail = data && data.detail;
+    const chart = detail && detail.data;
+    const x = chart && Array.isArray(chart.x) ? chart.x : [];
+    const y = chart && Array.isArray(chart.y) ? chart.y : [];
+    return { x, y };
+  }
+
+  function summaryToObject(summary) {
+    const out = {};
+    for (const item of Array.isArray(summary) ? summary : []) {
+      if (item && item.title) out[item.title] = item.value;
+    }
+    return out;
+  }
+
+  function stoppedError() {
+    const err = new Error('任务已停止');
+    err.name = 'StoppedError';
+    return err;
+  }
+
+  async function waitIfPaused() {
+    while (runtime.paused && !runtime.stopRequested) {
+      await sleep(250);
+    }
+    if (runtime.stopRequested) throw stoppedError();
+  }
+
+  function metricAlreadySaved(container, index) {
+    const s = container && container[index];
+    return !!(s && Array.isArray(s.x) && Array.isArray(s.y));
+  }
+
+  async function scrapeOneAlbum(album) {
+    const existing = await idbGet(String(album.albumId));
+    const record = {
+      key: String(album.albumId),
+      ...album,
+      ...(existing || {}),
+      key: String(album.albumId),
+      albumId: album.albumId,
+      albumUid: album.albumUid,
+      title: album.title,
+      status: 'partial',
+      error: '',
+      listenSummary: existing?.listenSummary || {},
+      subscribeSummary: existing?.subscribeSummary || {},
+      listen: existing?.listen || {},
+      subscribe: existing?.subscribe || {},
+      capturedAt: new Date().toISOString()
+    };
+
+    // 每成功抓到一个指标就立刻写 IndexedDB。
+    // 这样即使第 8 个请求限流，前 7 个也不会丢，下次只补缺的指标。
+    await idbPut(record);
+
+    for (let index = 0; index < 4; index++) {
+      await waitIfPaused();
+      if (metricAlreadySaved(record.listen, index)) continue;
+
+      runtime.progress.current = `${album.title || album.albumId} / 音频 / ${METRICS.listen[index]}`;
+      render();
+      const data = await fetchDashboard(album, 'listen', index);
+      if (index === 0) record.listenSummary = summaryToObject(data.summary);
+      record.listen[index] = {
+        metric: METRICS.listen[index],
+        ...extractSeries(data)
+      };
+      record.status = 'partial';
+      record.capturedAt = new Date().toISOString();
+      await idbPut(record);
+    }
+
+    for (let index = 0; index < 4; index++) {
+      await waitIfPaused();
+      if (metricAlreadySaved(record.subscribe, index)) continue;
+
+      runtime.progress.current = `${album.title || album.albumId} / 订阅 / ${METRICS.subscribe[index]}`;
+      render();
+      const data = await fetchDashboard(album, 'subscribe', index);
+      if (index === 0) record.subscribeSummary = summaryToObject(data.summary);
+      record.subscribe[index] = {
+        metric: METRICS.subscribe[index],
+        ...extractSeries(data)
+      };
+      record.status = 'partial';
+      record.capturedAt = new Date().toISOString();
+      await idbPut(record);
+    }
+
+    record.status = 'done';
+    record.error = '';
+    record.capturedAt = new Date().toISOString();
+    await idbPut(record);
+    return record;
+  }
+
+  async function refreshProgress() {
+    const rows = await idbGetAll();
+    const map = new Map(rows.map(r => [String(r.key), r]));
+    const list = runtime.albums;
+    const done = list.filter(a => map.get(String(a.albumId))?.status === 'done').length;
+    const failed = list.filter(a => map.get(String(a.albumId))?.status === 'failed').length;
+    runtime.progress.total = list.length;
+    runtime.progress.done = done;
+    runtime.progress.failed = failed;
+    runtime.progress.pending = Math.max(0, list.length - done - failed);
+    render();
+  }
+
+  async function buildQueue(mode) {
+    const rows = await idbGetAll();
+    const map = new Map(rows.map(r => [String(r.key), r]));
+
+    if (mode === 'failed') {
+      return runtime.albums.filter(a => map.get(String(a.albumId))?.status === 'failed');
+    }
+
+    return runtime.albums.filter(a => map.get(String(a.albumId))?.status !== 'done');
+  }
+
+  async function startRun(mode = 'resume') {
+    if (runtime.running) {
+      if (runtime.paused) {
+        runtime.paused = false;
+        log('已继续抓取。');
+      }
+      return;
+    }
+
+    if (!runtime.albums.length) {
+      await loadAlbumList();
+      if (!runtime.albums.length) return;
+    }
+
+    const queue = await buildQueue(mode);
+    if (!queue.length) {
+      log(mode === 'failed' ? '没有失败专辑需要重试。' : '没有待抓专辑，当前任务已经完成。');
+      return;
+    }
+
+    runtime.running = true;
+    runtime.paused = false;
+    runtime.stopRequested = false;
+
+    let cursor = 0;
+    let sessionDone = 0;
+    let sessionFailed = 0;
+    const workerCount = Math.min(runtime.concurrency, queue.length);
+
+    log(`开始抓取：待处理 ${queue.length} 本，任务并发 ${workerCount}。每本仅请求音频/订阅 dashboard，不请求单集接口。`);
+    log(`动态限速已开启：任务并发 ${workerCount}，请求按约 ${runtime.rate.gapMs}ms 间隔依次出发，但不会等待前一个请求返回；稳定后自动提速，遇到 -2014 全局统一冷却10秒并降速。`);
+    log('判定规则：数值全为0仍算成功；平台 -2014 会触发全局冷却并自动降速，不会写成0，也不会立刻把专辑判失败。');
+
+    async function worker(workerNo) {
+      while (!runtime.stopRequested) {
+        await waitIfPaused();
+        const index = cursor++;
+        if (index >= queue.length) return;
+        const album = queue[index];
+
+        try {
+          const result = await scrapeOneAlbum(album);
+          await idbPut(result);
+          sessionDone++;
+          log(`成功 [${workerNo}] ${album.title || album.albumId}`);
+          await sleep(220);
+        } catch (err) {
+          if (err && err.name === 'StoppedError') return;
+
+          sessionFailed++;
+          const previous = await idbGet(String(album.albumId));
+          await idbPut({
+            key: String(album.albumId),
+            ...album,
+            ...(previous || {}),
+            key: String(album.albumId),
+            albumId: album.albumId,
+            albumUid: album.albumUid,
+            title: album.title,
+            status: 'failed',
+            error: formatError(err),
+            capturedAt: new Date().toISOString()
+          });
+          log(`失败 [${workerNo}] ${album.title || album.albumId}：${formatError(err)}（已抓到的指标已保留，下次只补缺项）`);
+        }
+
+        if ((sessionDone + sessionFailed) % 5 === 0) {
+          await refreshProgress();
+        }
+      }
+    }
+
+    try {
+      await Promise.all(Array.from({ length: workerCount }, (_, i) => worker(i + 1)));
+    } finally {
+      runtime.running = false;
+      runtime.paused = false;
+      runtime.progress.current = '';
+      await refreshProgress();
+      if (runtime.stopRequested) {
+        log(`任务已停止。本次成功 ${sessionDone}，失败 ${sessionFailed}。断点已保留。`);
+      } else {
+        log(`本轮完成。本次成功 ${sessionDone}，失败 ${sessionFailed}。`);
+      }
+      runtime.stopRequested = false;
+      render();
+    }
+  }
+
+  function pauseRun() {
+    if (!runtime.running) return log('当前没有正在运行的任务。');
+    runtime.paused = true;
+    log('已暂停派发后续请求；正在进行中的单个请求会先结束。');
+  }
+
+  function resumeRun() {
+    if (!runtime.running) return startRun('resume');
+    if (!runtime.paused) return;
+    runtime.paused = false;
+    log('已继续抓取。');
+  }
+
+  function stopRun() {
+    if (!runtime.running) return log('当前没有正在运行的任务。');
+    runtime.stopRequested = true;
+    runtime.paused = false;
+    log('已请求停止，当前请求结束后退出。断点不会删除。');
+  }
+
+  function sumLast(series, n) {
+    const y = series && Array.isArray(series.y) ? series.y : [];
+    return y.slice(-n).reduce((sum, value) => sum + (Number(value) || 0), 0);
+  }
+
+  function timestampToDate(ts) {
+    const num = Number(ts);
+    if (!Number.isFinite(num)) return '';
+    const d = new Date(num * 1000);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
+  function buildDailyRows(record, type) {
+    const metrics = type === 'listen' ? METRICS.listen : METRICS.subscribe;
+    const source = type === 'listen' ? record.listen : record.subscribe;
+    const byTs = new Map();
+
+    for (let index = 0; index < metrics.length; index++) {
+      const series = source && source[index];
+      const x = series && Array.isArray(series.x) ? series.x : [];
+      const y = series && Array.isArray(series.y) ? series.y : [];
+      for (let i = 0; i < x.length; i++) {
+        const ts = Number(x[i]);
+        if (!byTs.has(ts)) byTs.set(ts, {});
+        byTs.get(ts)[metrics[index]] = y[i];
+      }
+    }
+
+    return [...byTs.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([ts, values]) => ({
+        '专辑名称': record.title || '',
+        'albumId': record.albumId,
+        '日期': timestampToDate(ts),
+        ...values
+      }));
+  }
+
+  function setColumnWidths(ws, rows) {
+    if (!rows.length) return;
+    const headers = Object.keys(rows[0]);
+    ws['!cols'] = headers.map(key => {
+      let width = Math.max(10, String(key).length * 2 + 2);
+      for (const row of rows.slice(0, 300)) {
+        const value = row[key];
+        if (value == null) continue;
+        width = Math.max(width, Math.min(42, String(value).length * 1.6 + 2));
+      }
+      return { wch: Math.ceil(width) };
+    });
+  }
+
+  async function exportExcel() {
+    if (typeof XLSX === 'undefined') {
+      log('Excel组件未加载，请刷新页面后再试。');
+      return;
+    }
+
+    const records = await idbGetAll();
+    if (!records.length) {
+      log('当前没有可导出的抓取数据。');
+      return;
+    }
+
+    const listOrder = new Map(runtime.albums.map((a, i) => [String(a.albumId), i]));
+    records.sort((a, b) => (listOrder.get(String(a.albumId)) ?? 999999) - (listOrder.get(String(b.albumId)) ?? 999999));
+
+    const summaryRows = [];
+    const audioRows = [];
+    const subscribeRows = [];
+    const failedRows = [];
+
+    for (const r of records) {
+      if (r.status !== 'done') {
+        failedRows.push({
+          '专辑名称': r.title || '',
+          'albumId': r.albumId,
+          '失败原因': r.error || '',
+          '最后尝试时间': r.capturedAt || ''
+        });
+        continue;
+      }
+
+      summaryRows.push({
+        '专辑名称': r.title || '',
+        'albumId': r.albumId,
+        '分类': r.categoryTags || '',
+        '今日收听': r.listenSummary?.['今日收听'] ?? '',
+        '昨日收听': r.listenSummary?.['昨日收听'] ?? '',
+        '总收听': r.listenSummary?.['总收听'] ?? '',
+        '近7日收听合计': sumLast(r.listen?.[0], 7),
+        '近30日收听合计': sumLast(r.listen?.[0], 30),
+        '近7日点赞合计': sumLast(r.listen?.[1], 7),
+        '近30日点赞合计': sumLast(r.listen?.[1], 30),
+        '近7日评论合计': sumLast(r.listen?.[2], 7),
+        '近30日评论合计': sumLast(r.listen?.[2], 30),
+        '近7日分享合计': sumLast(r.listen?.[3], 7),
+        '近30日分享合计': sumLast(r.listen?.[3], 30),
+        '今日净增订阅': r.subscribeSummary?.['今日净增'] ?? '',
+        '昨日净增订阅': r.subscribeSummary?.['昨日净增'] ?? '',
+        '总订阅': r.subscribeSummary?.['总订阅'] ?? '',
+        '近7日净增合计': sumLast(r.subscribe?.[1], 7),
+        '近30日净增合计': sumLast(r.subscribe?.[1], 30),
+        '近7日新增合计': sumLast(r.subscribe?.[2], 7),
+        '近30日新增合计': sumLast(r.subscribe?.[2], 30),
+        '近7日取消合计': sumLast(r.subscribe?.[3], 7),
+        '近30日取消合计': sumLast(r.subscribe?.[3], 30),
+        '抓取时间': r.capturedAt || ''
+      });
+
+      audioRows.push(...buildDailyRows(r, 'listen'));
+      subscribeRows.push(...buildDailyRows(r, 'subscribe'));
+    }
+
+    const wb = XLSX.utils.book_new();
+
+    const sheets = [
+      ['专辑汇总', summaryRows],
+      ['音频30日', audioRows],
+      ['订阅30日', subscribeRows],
+      ['失败记录', failedRows]
+    ];
+
+    for (const [name, rows] of sheets) {
+      const safeRows = rows.length ? rows : [{ '说明': '暂无数据' }];
+      const ws = XLSX.utils.json_to_sheet(safeRows);
+      setColumnWidths(ws, safeRows);
+      XLSX.utils.book_append_sheet(wb, ws, name);
+    }
+
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+    XLSX.writeFile(wb, `微信听书_全部专辑_音频订阅_${stamp}.xlsx`);
+    log(`Excel已导出：成功专辑 ${summaryRows.length}，失败 ${failedRows.length}。`);
+  }
+
+  async function clearCheckpoint() {
+    if (runtime.running) return log('请先停止当前任务，再清空断点。');
+    if (!confirm('确定清空所有抓取结果和断点吗？此操作不可恢复。')) return;
+    await idbClear();
+    await refreshProgress();
+    log('断点和抓取结果已全部清空。');
+  }
+
+  function setConcurrency(value) {
+    const n = Number(value);
+    if (![1, 4, 8, 16].includes(n)) return;
+    runtime.concurrency = n;
+    localStorage.setItem('wxlisten_concurrency', String(n));
+    log(`任务并发设置为 ${n}。新的并发数会在下一轮任务生效；请求会按动态间隔错峰出发，但无需等待前一个请求返回。`);
+  }
+
+  function render() {
+    if (!panel) return;
+    const p = runtime.progress;
+    const total = p.total || runtime.albums.length || 0;
+    const finished = (p.done || 0) + (p.failed || 0);
+    const percent = total ? Math.min(100, Math.round(finished / total * 100)) : 0;
+
+    ui.albumCount.textContent = String(runtime.albums.length || 0);
+    ui.done.textContent = String(p.done || 0);
+    ui.failed.textContent = String(p.failed || 0);
+    ui.pending.textContent = String(p.pending || 0);
+    ui.current.textContent = p.current || (runtime.running ? '准备中...' : '-');
+    ui.progressBar.style.width = `${percent}%`;
+    ui.progressText.textContent = `${percent}%`;
+    const coolSec = Math.max(0, Math.ceil(((runtime.rate.blockedUntil || 0) - Date.now()) / 1000));
+    ui.status.textContent = runtime.running ? (runtime.paused ? '已暂停' : (coolSec > 0 ? '限频冷却' : '抓取中')) : '空闲';
+    if (ui.rate) {
+      ui.rate.textContent = coolSec > 0
+        ? `全局冷却 ${coolSec}s · 动态间隔≈${runtime.rate.gapMs}ms · -2014共${runtime.rate.totalRateLimits}次`
+        : `动态间隔≈${runtime.rate.gapMs}ms · 稳定${runtime.rate.successesSinceLimit}/${SPEEDUP_SUCCESS_THRESHOLD} · -2014共${runtime.rate.totalRateLimits}次`;
+    }
+    ui.log.textContent = runtime.logs.slice(-45).join('\n');
+
+    for (const btn of ui.concurrencyButtons) {
+      btn.classList.toggle('active', Number(btn.dataset.value) === runtime.concurrency);
+    }
+  }
+
+  function createUI() {
+    if (document.getElementById('fyf-wxlisten-batch')) return;
+
+    const style = document.createElement('style');
+    style.textContent = `
+      #fyf-wxlisten-batch {
+        position: fixed; right: 18px; top: 84px; z-index: 2147483647;
+        width: 470px; max-height: 78vh; overflow: hidden;
+        background: rgba(25,27,32,.97); color: #f5f6f8;
+        border: 1px solid rgba(255,255,255,.14); border-radius: 13px;
+        box-shadow: 0 14px 38px rgba(0,0,0,.36);
+        font: 13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
+      }
+      #fyf-wxlisten-batch * { box-sizing: border-box; }
+      .fyf-head { padding: 12px 14px 9px; border-bottom: 1px solid rgba(255,255,255,.1); }
+      .fyf-title { font-size: 16px; font-weight: 800; }
+      .fyf-sub { color: #aeb4bf; font-size: 12px; margin-top: 3px; }
+      .fyf-stats { display:grid; grid-template-columns: repeat(4,1fr); gap:7px; padding:10px 12px; }
+      .fyf-card { background:rgba(255,255,255,.065); border-radius:9px; padding:7px 8px; text-align:center; }
+      .fyf-card b { display:block; font-size:17px; margin-top:2px; }
+      .fyf-row { padding: 0 12px 9px; }
+      .fyf-line { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:8px; }
+      .fyf-line .label { color:#aeb4bf; min-width:50px; }
+      .fyf-btn {
+        border:0; border-radius:8px; padding:7px 10px; cursor:pointer;
+        background:#f3f4f6; color:#222831; font-weight:700;
+      }
+      .fyf-btn.primary { background:#ff4d6d; color:#fff; }
+      .fyf-btn.warn { background:#f1b44c; color:#222; }
+      .fyf-btn.danger { background:#d9534f; color:#fff; }
+      .fyf-conc { border:1px solid rgba(255,255,255,.2); background:transparent; color:#ddd; padding:5px 10px; border-radius:7px; cursor:pointer; }
+      .fyf-conc.active { background:#ff4d6d; border-color:#ff4d6d; color:#fff; font-weight:700; }
+      .fyf-progress { height:9px; background:rgba(255,255,255,.1); border-radius:999px; overflow:hidden; flex:1; min-width:200px; }
+      .fyf-progress > div { height:100%; width:0%; background:#ff4d6d; transition:width .2s; }
+      .fyf-current { color:#d8dce3; word-break:break-all; }
+      .fyf-log {
+        margin:0 12px 12px; padding:9px 10px; height:190px; overflow:auto; white-space:pre-wrap;
+        background:#111318; color:#cbd0d8; border-radius:9px; font:11px/1.55 Consolas,monospace;
+      }
+      .fyf-note { margin:0 12px 9px; color:#9fa6b2; font-size:11px; }
+      .fyf-hide { position:absolute; right:10px; top:9px; border:0; background:transparent; color:#aaa; cursor:pointer; font-size:18px; }
+      #fyf-wxlisten-restore { position:fixed; right:18px; top:84px; z-index:2147483647; border:0; border-radius:9px; padding:9px 12px; background:#ff4d6d; color:#fff; font-weight:800; cursor:pointer; }
+    `;
+    document.documentElement.appendChild(style);
+
+    panel = document.createElement('div');
+    panel.id = 'fyf-wxlisten-batch';
+    panel.innerHTML = `
+      <button class="fyf-hide" title="隐藏">×</button>
+      <div class="fyf-head">
+        <div class="fyf-title">微信听书批量数据抓取</div>
+        <div class="fyf-sub">全部专辑 · 音频数据 + 订阅数据 · 不抓单集</div>
+      </div>
+      <div class="fyf-stats">
+        <div class="fyf-card">专辑<b data-k="albumCount">0</b></div>
+        <div class="fyf-card">完成<b data-k="done">0</b></div>
+        <div class="fyf-card">失败<b data-k="failed">0</b></div>
+        <div class="fyf-card">待抓<b data-k="pending">0</b></div>
+      </div>
+      <div class="fyf-row">
+        <div class="fyf-line">
+          <span class="label">状态</span><b data-k="status">空闲</b>
+          <div class="fyf-progress"><div data-k="progressBar"></div></div>
+          <span data-k="progressText">0%</span>
+        </div>
+        <div class="fyf-line"><span class="label">当前</span><span class="fyf-current" data-k="current">-</span></div>
+        <div class="fyf-line"><span class="label">限频保护</span><span class="fyf-current" data-k="rate">动态间隔≈120ms</span></div>
+        <div class="fyf-line">
+          <span class="label">任务并发</span>
+          <button class="fyf-conc" data-value="1">1</button>
+          <button class="fyf-conc" data-value="4">4</button>
+          <button class="fyf-conc" data-value="8">8</button>
+          <button class="fyf-conc" data-value="16">16</button>
+        </div>
+        <div class="fyf-line">
+          <button class="fyf-btn" data-act="list">读取专辑</button>
+          <button class="fyf-btn primary" data-act="start">开始/继续</button>
+          <button class="fyf-btn warn" data-act="pause">暂停</button>
+          <button class="fyf-btn danger" data-act="stop">停止</button>
+        </div>
+        <div class="fyf-line">
+          <button class="fyf-btn" data-act="retry">重试失败</button>
+          <button class="fyf-btn" data-act="export">导出Excel</button>
+          <button class="fyf-btn" data-act="clear">清空断点</button>
+        </div>
+      </div>
+      <div class="fyf-note">抓取范围固定为近30日；近7日汇总由30日明细直接计算。全0是有效数据。v1.5采用动态请求间隔：默认约120ms，稳定时逐步向60ms试探，最慢封顶600ms；请求不等前一个返回即可继续出发。遇到 errcode=-2014 时全部并发统一冷却10秒并自动降速，但不会超过600ms，稳定后再慢慢提速。每抓完一个指标立即保存，失败后只补缺项。</div>
+      <pre class="fyf-log" data-k="log"></pre>
+    `;
+    document.documentElement.appendChild(panel);
+
+    ui = {
+      albumCount: panel.querySelector('[data-k="albumCount"]'),
+      done: panel.querySelector('[data-k="done"]'),
+      failed: panel.querySelector('[data-k="failed"]'),
+      pending: panel.querySelector('[data-k="pending"]'),
+      status: panel.querySelector('[data-k="status"]'),
+      current: panel.querySelector('[data-k="current"]'),
+      rate: panel.querySelector('[data-k="rate"]'),
+      progressBar: panel.querySelector('[data-k="progressBar"]'),
+      progressText: panel.querySelector('[data-k="progressText"]'),
+      log: panel.querySelector('[data-k="log"]'),
+      concurrencyButtons: [...panel.querySelectorAll('.fyf-conc')]
+    };
+
+    panel.querySelector('[data-act="list"]').onclick = loadAlbumList;
+    panel.querySelector('[data-act="start"]').onclick = resumeRun;
+    panel.querySelector('[data-act="pause"]').onclick = pauseRun;
+    panel.querySelector('[data-act="stop"]').onclick = stopRun;
+    panel.querySelector('[data-act="retry"]').onclick = () => startRun('failed');
+    panel.querySelector('[data-act="export"]').onclick = exportExcel;
+    panel.querySelector('[data-act="clear"]').onclick = clearCheckpoint;
+
+    for (const btn of ui.concurrencyButtons) {
+      btn.onclick = () => setConcurrency(btn.dataset.value);
+    }
+
+    panel.querySelector('.fyf-hide').onclick = () => {
+      panel.style.display = 'none';
+      if (!document.getElementById('fyf-wxlisten-restore')) {
+        const b = document.createElement('button');
+        b.id = 'fyf-wxlisten-restore';
+        b.textContent = '微信听书抓取';
+        b.onclick = () => {
+          panel.style.display = '';
+          b.remove();
+        };
+        document.documentElement.appendChild(b);
+      }
+    };
+
+    render();
+    refreshProgress().catch(() => {});
+    setInterval(() => { if (panel) render(); }, 1000);
+    log(`脚本v1.6已加载。动态间隔当前约 ${runtime.rate.gapMs}ms（默认120ms，范围60-600ms）；请求无需等待前一个返回。建议任务并发8，先点击“读取专辑”确认数量后开始。`);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', createUI, { once: true });
+  } else {
+    createUI();
+  }
+})();

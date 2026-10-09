@@ -1,0 +1,3219 @@
+// ==UserScript==
+// @name         蜻蜓FM主播公众平台 - 专辑批量改名 v1.7.5
+// @namespace    https://chatgpt.com/
+// @version      1.7.5
+// @description  蜻蜓FM专辑批量改名：强化保存按钮识别（支持嵌套文字、空格/零宽字符、取消按钮反推、表单提交按钮兜底）；保留断点续跑。
+// @match        https://*.qingting.fm/*
+// @match        https://qingting.fm/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const VERSION = '1.7.5';
+    const KEY = 'QT_BATCH_RENAME_V172_STATE';
+    const PANEL_ID = 'qt-batch-rename-panel-v172';
+
+    const CFG = {
+        maxNameChars: 20,
+
+        searchWaitMin: 800,
+        searchWaitMax: 7000,
+
+        openFormWait: 2800,
+        maxOpenFormRetry: 5,
+
+        submitTimeout: 16000,
+        maxSubmitRetry: 3,
+
+        tick: 900
+    };
+
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const now = () => Date.now();
+
+    function norm(s) {
+        return String(s || '')
+            .replace(/\u00a0/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function textLen(s) {
+        return Array.from(String(s || '')).length;
+    }
+
+    function visible(el) {
+        if (!el) return false;
+
+        const style = getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+
+        return (
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            rect.width > 0 &&
+            rect.height > 0
+        );
+    }
+
+    function insidePanel(el) {
+        return !!(
+            el &&
+            el.closest &&
+            el.closest('#' + PANEL_ID)
+        );
+    }
+
+    function defaultState() {
+        return {
+            running: false,
+            paused: false,
+
+            mode: 'idle',
+
+            listUrl: '',
+            tasks: [],
+
+            scanIndex: 0,
+            renameIndex: 0,
+            currentIndex: -1,
+
+            phase: '',
+
+            openFormAt: 0,
+            openFormRetry: 0,
+
+            submitAt: 0,
+            submitRetry: 0,
+
+            logs: [],
+
+            startedAt: 0,
+            updatedAt: now()
+        };
+    }
+
+    function loadState() {
+        try {
+            const saved = GM_getValue(KEY, null);
+
+            if (!saved || typeof saved !== 'object') {
+                return defaultState();
+            }
+
+            return Object.assign(defaultState(), saved);
+        } catch (e) {
+            return defaultState();
+        }
+    }
+
+    function saveState(s) {
+        s.updatedAt = now();
+        GM_setValue(KEY, s);
+        render();
+    }
+
+    function addLog(s, message) {
+        const time = new Date().toLocaleTimeString();
+
+        s.logs = s.logs || [];
+        s.logs.push(`[${time}] ${message}`);
+
+        if (s.logs.length > 180) {
+            s.logs = s.logs.slice(-180);
+        }
+
+        saveState(s);
+    }
+
+    function setInputValue(input, value) {
+        if (!input) return;
+
+        const proto =
+            input instanceof HTMLTextAreaElement
+                ? HTMLTextAreaElement.prototype
+                : HTMLInputElement.prototype;
+
+        const descriptor =
+            Object.getOwnPropertyDescriptor(proto, 'value');
+
+        if (descriptor && descriptor.set) {
+            descriptor.set.call(input, value);
+        } else {
+            input.value = value;
+        }
+
+        input.dispatchEvent(
+            new Event('input', {
+                bubbles: true
+            })
+        );
+
+        input.dispatchEvent(
+            new Event('change', {
+                bubbles: true
+            })
+        );
+
+        input.dispatchEvent(
+            new Event('blur', {
+                bubbles: true
+            })
+        );
+    }
+
+    function exactTextElements(text) {
+        return [
+            ...document.querySelectorAll(
+                'a,button,span,div,p,label,h1,h2,h3,h4'
+            )
+        ]
+            .filter(visible)
+            .filter(el => !insidePanel(el))
+            .filter(el => {
+                return norm(
+                    el.innerText ||
+                    el.textContent ||
+                    ''
+                ) === text;
+            });
+    }
+
+    function clickable(el) {
+        if (!el) return null;
+
+        const direct =
+            el.closest('a,button,[role="button"]');
+
+        if (direct && !insidePanel(direct)) {
+            return direct;
+        }
+
+        let p = el;
+
+        for (
+            let i = 0;
+            p && i < 5;
+            i++, p = p.parentElement
+        ) {
+            if (insidePanel(p)) {
+                return null;
+            }
+
+            const style = getComputedStyle(p);
+
+            if (
+                typeof p.onclick === 'function' ||
+                p.hasAttribute('onclick') ||
+                p.getAttribute('role') === 'button' ||
+                style.cursor === 'pointer'
+            ) {
+                return p;
+            }
+        }
+
+        return el;
+    }
+
+    function realClick(el) {
+        if (!el) return false;
+
+        const target =
+            clickable(el) || el;
+
+        try {
+            target.scrollIntoView({
+                block: 'center',
+                inline: 'center'
+            });
+        } catch (e) {}
+
+        const rect =
+            target.getBoundingClientRect();
+
+        const x =
+            Math.max(
+                1,
+                Math.min(
+                    window.innerWidth - 2,
+                    rect.left + rect.width / 2
+                )
+            );
+
+        const y =
+            Math.max(
+                1,
+                Math.min(
+                    window.innerHeight - 2,
+                    rect.top + rect.height / 2
+                )
+            );
+
+        const common = {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            clientX: x,
+            clientY: y,
+            button: 0
+        };
+
+        try {
+            target.dispatchEvent(
+                new PointerEvent(
+                    'pointerdown',
+                    Object.assign({}, common, {
+                        buttons: 1
+                    })
+                )
+            );
+        } catch (e) {}
+
+        try {
+            target.dispatchEvent(
+                new MouseEvent(
+                    'mousedown',
+                    Object.assign({}, common, {
+                        buttons: 1
+                    })
+                )
+            );
+        } catch (e) {}
+
+        try {
+            target.dispatchEvent(
+                new PointerEvent(
+                    'pointerup',
+                    Object.assign({}, common, {
+                        buttons: 0
+                    })
+                )
+            );
+        } catch (e) {}
+
+        try {
+            target.dispatchEvent(
+                new MouseEvent(
+                    'mouseup',
+                    Object.assign({}, common, {
+                        buttons: 0
+                    })
+                )
+            );
+        } catch (e) {}
+
+        try {
+            target.dispatchEvent(
+                new MouseEvent(
+                    'click',
+                    Object.assign({}, common, {
+                        buttons: 0
+                    })
+                )
+            );
+        } catch (e) {}
+
+        try {
+            target.click();
+        } catch (e) {}
+
+        return true;
+    }
+
+    function clickText(text) {
+        const els = exactTextElements(text);
+
+        if (!els.length) {
+            return false;
+        }
+
+        const best =
+            els.find(el =>
+                /^(A|BUTTON)$/.test(el.tagName)
+            ) || els[0];
+
+        return realClick(best);
+    }
+
+    // =========================================================
+    // 列表页
+    // =========================================================
+
+    function findSearchInput() {
+        return [
+            ...document.querySelectorAll('input')
+        ]
+            .filter(visible)
+            .filter(el => !insidePanel(el))
+            .find(input => {
+                const placeholder =
+                    norm(
+                        input.getAttribute('placeholder') ||
+                        ''
+                    );
+
+                return (
+                    placeholder.includes('专辑名称') &&
+                    (
+                        placeholder.includes('关键词') ||
+                        placeholder.includes('输入')
+                    )
+                );
+            }) || null;
+    }
+
+    function findSearchButton(input) {
+        if (!input) return null;
+
+        let p = input.parentElement;
+
+        for (
+            let i = 0;
+            p && i < 5;
+            i++, p = p.parentElement
+        ) {
+            const buttons = [
+                ...p.querySelectorAll('button,a')
+            ].filter(visible);
+
+            const candidate =
+                buttons.find(el => {
+                    const t =
+                        norm(
+                            el.innerText ||
+                            el.textContent ||
+                            ''
+                        );
+
+                    return (
+                        t.includes('搜索') ||
+                        el.querySelector('svg,i')
+                    );
+                });
+
+            if (candidate) {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    function albumCount() {
+        const text =
+            document.body
+                ? document.body.innerText
+                : '';
+
+        const match =
+            text.match(/共\s*(\d+)\s*张专辑/);
+
+        return match
+            ? Number(match[1])
+            : null;
+    }
+
+    function manageButtons() {
+        return exactTextElements('管理')
+            .map(el => clickable(el) || el)
+            .filter(visible);
+    }
+
+    function albumCardFromManage(button) {
+        let p = button.parentElement;
+        let fallback = null;
+
+        for (
+            let depth = 0;
+            p && depth < 10;
+            depth++, p = p.parentElement
+        ) {
+            const text =
+                norm(p.innerText || '');
+
+            if (
+                !text.includes('分类') ||
+                !text.includes('更新周期')
+            ) {
+                continue;
+            }
+
+            const manageCount =
+                [
+                    ...p.querySelectorAll(
+                        'a,button,span,div'
+                    )
+                ]
+                    .filter(visible)
+                    .filter(el => {
+                        return norm(
+                            el.innerText ||
+                            el.textContent ||
+                            ''
+                        ) === '管理';
+                    })
+                    .length;
+
+            fallback = p;
+
+            if (manageCount === 1) {
+                return p;
+            }
+        }
+
+        return fallback;
+    }
+
+    function titleFromCard(card) {
+        if (!card) return '';
+
+        const lines =
+            String(card.innerText || '')
+                .split(/\r?\n/)
+                .map(norm)
+                .filter(Boolean);
+
+        const classIndex =
+            lines.findIndex(line => {
+                return (
+                    line.startsWith('分类：') ||
+                    line.startsWith('分类:') ||
+                    line.startsWith('分类 ：')
+                );
+            });
+
+        if (classIndex > 0) {
+            for (
+                let i = classIndex - 1;
+                i >= 0;
+                i--
+            ) {
+                const line = lines[i];
+
+                if (!line) continue;
+
+                if (
+                    line === '管理' ||
+                    line === '分享' ||
+                    line === '上传节目'
+                ) {
+                    continue;
+                }
+
+                if (/^\d+$/.test(line)) {
+                    continue;
+                }
+
+                return line;
+            }
+        }
+
+        const titleAttrs =
+            [
+                ...card.querySelectorAll('[title]')
+            ]
+                .filter(visible)
+                .map(el => norm(
+                    el.getAttribute('title') || ''
+                ))
+                .filter(Boolean)
+                .filter(t =>
+                    ![
+                        '管理',
+                        '分享',
+                        '上传节目'
+                    ].includes(t)
+                );
+
+        if (titleAttrs.length) {
+            titleAttrs.sort(
+                (a, b) => b.length - a.length
+            );
+
+            return titleAttrs[0];
+        }
+
+        return '';
+    }
+
+    function albumCards() {
+        const result = [];
+        const seen = new Set();
+
+        for (const manage of manageButtons()) {
+            const card =
+                albumCardFromManage(manage);
+
+            if (!card || seen.has(card)) {
+                continue;
+            }
+
+            seen.add(card);
+
+            const title =
+                norm(titleFromCard(card));
+
+            if (!title) {
+                continue;
+            }
+
+            result.push({
+                card,
+                manage,
+                title
+            });
+        }
+
+        return result;
+    }
+
+    function currentResultTitles() {
+        return albumCards()
+            .map(x => x.title);
+    }
+
+    async function searchAlbum(query) {
+        const input =
+            findSearchInput();
+
+        if (!input) {
+            throw new Error(
+                '找不到专辑搜索框'
+            );
+        }
+
+        const oldSignature =
+            currentResultTitles().join('|');
+
+        const oldCount =
+            albumCount();
+
+        setInputValue(
+            input,
+            query
+        );
+
+        const button =
+            findSearchButton(input);
+
+        if (button) {
+            realClick(button);
+        } else {
+            input.dispatchEvent(
+                new KeyboardEvent(
+                    'keydown',
+                    {
+                        key: 'Enter',
+                        code: 'Enter',
+                        bubbles: true
+                    }
+                )
+            );
+
+            input.dispatchEvent(
+                new KeyboardEvent(
+                    'keyup',
+                    {
+                        key: 'Enter',
+                        code: 'Enter',
+                        bubbles: true
+                    }
+                )
+            );
+        }
+
+        await sleep(
+            CFG.searchWaitMin
+        );
+
+        const start = now();
+
+        let lastSignature = '';
+        let stableAt = 0;
+
+        while (
+            now() - start <
+            CFG.searchWaitMax
+        ) {
+            const titles =
+                currentResultTitles();
+
+            const count =
+                albumCount();
+
+            const signature =
+                `${count}|${titles.join('|')}`;
+
+            const old =
+                `${oldCount}|${oldSignature}`;
+
+            if (signature !== old) {
+                if (
+                    signature ===
+                    lastSignature
+                ) {
+                    if (!stableAt) {
+                        stableAt = now();
+                    }
+
+                    if (
+                        now() -
+                        stableAt >
+                        450
+                    ) {
+                        break;
+                    }
+                } else {
+                    lastSignature =
+                        signature;
+
+                    stableAt = now();
+                }
+            }
+
+            if (count === 0) {
+                break;
+            }
+
+            if (
+                titles.length &&
+                stableAt &&
+                now() -
+                stableAt >
+                450
+            ) {
+                break;
+            }
+
+            await sleep(180);
+        }
+
+        await sleep(200);
+    }
+
+    function matchOldName(oldName) {
+        const oldN =
+            norm(oldName);
+
+        const cards =
+            albumCards();
+
+        const exact =
+            cards.filter(
+                x => x.title === oldN
+            );
+
+        if (exact.length === 1) {
+            return {
+                kind: 'old',
+                item: exact[0],
+                cards
+            };
+        }
+
+        const contains =
+            cards.filter(
+                x =>
+                    x.title.includes(oldN)
+            );
+
+        if (contains.length === 1) {
+            return {
+                kind: 'old',
+                item: contains[0],
+                cards
+            };
+        }
+
+        if (contains.length > 1) {
+            return {
+                kind: 'ambiguous',
+                cards: contains
+            };
+        }
+
+        return {
+            kind: 'none',
+            cards
+        };
+    }
+
+    function matchExactNew(newName) {
+        const newN =
+            norm(newName);
+
+        const cards =
+            albumCards();
+
+        const exact =
+            cards.filter(
+                x => x.title === newN
+            );
+
+        if (exact.length === 1) {
+            return {
+                kind: 'already',
+                item: exact[0]
+            };
+        }
+
+        if (exact.length > 1) {
+            return {
+                kind: 'ambiguous'
+            };
+        }
+
+        return {
+            kind: 'none'
+        };
+    }
+
+    // =========================================================
+    // 编辑页标题输入框
+    // =========================================================
+
+    function editableTextInputs() {
+        return [
+            ...document.querySelectorAll(
+                'input'
+            )
+        ]
+            .filter(visible)
+            .filter(el =>
+                !insidePanel(el)
+            )
+            .filter(el => {
+                const type =
+                    (
+                        el.getAttribute('type') ||
+                        'text'
+                    )
+                        .toLowerCase();
+
+                if (
+                    type !== 'text' &&
+                    type !== ''
+                ) {
+                    return false;
+                }
+
+                if (
+                    el.disabled ||
+                    el.readOnly
+                ) {
+                    return false;
+                }
+
+                const placeholder =
+                    norm(
+                        el.getAttribute(
+                            'placeholder'
+                        ) || ''
+                    );
+
+                if (
+                    placeholder.includes(
+                        '关键词'
+                    ) ||
+                    placeholder.includes(
+                        '搜索'
+                    )
+                ) {
+                    return false;
+                }
+
+                return true;
+            });
+    }
+
+    function strongTitleInput(task) {
+        const oldName =
+            norm(task.oldName);
+
+        const newName =
+            norm(task.newName);
+
+        const inputs =
+            editableTextInputs();
+
+        // 最优先：
+        // 当前值完整包含原标题
+        let hits =
+            inputs.filter(input => {
+                const value =
+                    norm(input.value);
+
+                return (
+                    value &&
+                    oldName &&
+                    value.includes(oldName)
+                );
+            });
+
+        if (hits.length === 1) {
+            return hits[0];
+        }
+
+        if (hits.length > 1) {
+            hits.sort(
+                (a, b) =>
+                    b.getBoundingClientRect().width -
+                    a.getBoundingClientRect().width
+            );
+
+            return hits[0];
+        }
+
+        // 已经是目标新名称
+        hits =
+            inputs.filter(
+                input =>
+                    norm(input.value) ===
+                    newName
+            );
+
+        if (hits.length === 1) {
+            return hits[0];
+        }
+
+        // 最后兜底
+        const candidates =
+            inputs
+                .filter(input => {
+                    return (
+                        norm(input.value)
+                            .length >= 2
+                    );
+                })
+                .map(input => ({
+                    input,
+                    valueLength:
+                        norm(input.value)
+                            .length,
+                    width:
+                        input
+                            .getBoundingClientRect()
+                            .width,
+                    top:
+                        input
+                            .getBoundingClientRect()
+                            .top
+                }))
+                .filter(
+                    x => x.width >= 180
+                )
+                .sort(
+                    (a, b) => {
+                        if (
+                            b.valueLength !==
+                            a.valueLength
+                        ) {
+                            return (
+                                b.valueLength -
+                                a.valueLength
+                            );
+                        }
+
+                        if (
+                            b.width !==
+                            a.width
+                        ) {
+                            return (
+                                b.width -
+                                a.width
+                            );
+                        }
+
+                        return (
+                            a.top -
+                            b.top
+                        );
+                    }
+                );
+
+        return candidates.length
+            ? candidates[0].input
+            : null;
+    }
+
+    // =========================================================
+    // 页面类型
+    // =========================================================
+
+    function pageType() {
+        const body =
+            norm(
+                document.body
+                    ? document.body.innerText
+                    : ''
+            );
+
+        if (
+            findSearchInput() &&
+            body.includes('专辑管理')
+        ) {
+            return 'list';
+        }
+
+        if (
+            body.includes('专辑信息') &&
+            body.includes('上传节目')
+        ) {
+            return 'detail';
+        }
+
+        if (
+            body.includes('专辑编辑') &&
+            body.includes('基本信息')
+        ) {
+            return 'editView';
+        }
+
+        return 'unknown';
+    }
+
+    // =========================================================
+    // 修改信息
+    // =========================================================
+
+    function modifyCandidates() {
+        const modifies =
+            [
+                ...document.querySelectorAll(
+                    'a,button,span,div,p'
+                )
+            ]
+                .filter(visible)
+                .filter(el =>
+                    !insidePanel(el)
+                )
+                .filter(el => {
+                    return norm(
+                        el.innerText ||
+                        el.textContent ||
+                        ''
+                    ) === '修改信息';
+                });
+
+        if (!modifies.length) {
+            return [];
+        }
+
+        const basic =
+            [
+                ...document.querySelectorAll(
+                    'h1,h2,h3,h4,div,span,p'
+                )
+            ]
+                .filter(visible)
+                .filter(el =>
+                    !insidePanel(el)
+                )
+                .find(el => {
+                    return norm(
+                        el.innerText ||
+                        el.textContent ||
+                        ''
+                    ) === '基本信息';
+                });
+
+        const basicRect =
+            basic
+                ? basic.getBoundingClientRect()
+                : null;
+
+        const result = [];
+        const seen = new Set();
+
+        for (const raw of modifies) {
+            const target =
+                clickable(raw) || raw;
+
+            if (
+                !target ||
+                seen.has(target)
+            ) {
+                continue;
+            }
+
+            seen.add(target);
+
+            const r =
+                raw.getBoundingClientRect();
+
+            let score =
+                r.top;
+
+            if (basicRect) {
+                const dy =
+                    Math.abs(
+                        r.top -
+                        basicRect.top
+                    );
+
+                score =
+                    dy +
+                    (
+                        r.top <
+                        basicRect.top - 80
+                            ? 100000
+                            : 0
+                    );
+            }
+
+            result.push({
+                raw,
+                target,
+                score,
+                top: r.top
+            });
+        }
+
+        result.sort(
+            (a, b) =>
+                a.score -
+                b.score
+        );
+
+        return result;
+    }
+
+    // =========================================================
+    // 保存按钮 —— v1.7.2强化版
+    // =========================================================
+
+    function compactButtonText(s) {
+        return String(s || '')
+            .replace(/[\u200B-\u200D\uFEFF]/g, '')
+            .replace(/\u00a0/g, ' ')
+            .replace(/\s+/g, '')
+            .trim();
+    }
+
+    function textVariants(el) {
+        if (!el) return [];
+
+        const values = [
+            el.innerText,
+            el.textContent,
+            el.value,
+            el.getAttribute && el.getAttribute('value'),
+            el.getAttribute && el.getAttribute('aria-label'),
+            el.getAttribute && el.getAttribute('title')
+        ];
+
+        return values
+            .filter(v => v !== null && v !== undefined)
+            .map(compactButtonText)
+            .filter(Boolean);
+    }
+
+    function isDisabledButton(el) {
+        if (!el) return true;
+
+        if (el.disabled) {
+            return true;
+        }
+
+        const ariaDisabled =
+            String(
+                el.getAttribute &&
+                el.getAttribute('aria-disabled') ||
+                ''
+            ).toLowerCase();
+
+        return ariaDisabled === 'true';
+    }
+
+    function getStyle(el) {
+        try {
+            const win =
+                el.ownerDocument &&
+                el.ownerDocument.defaultView
+                    ? el.ownerDocument.defaultView
+                    : window;
+
+            return win.getComputedStyle(el);
+        } catch (e) {
+            return getComputedStyle(el);
+        }
+    }
+
+    function buttonColorScore(el) {
+        let score = 0;
+
+        try {
+            const style = getStyle(el);
+
+            const bg =
+                style.backgroundColor ||
+                '';
+
+            const rgb =
+                bg.match(
+                    /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/
+                );
+
+            if (rgb) {
+                const r = Number(rgb[1]);
+                const g = Number(rgb[2]);
+                const b = Number(rgb[3]);
+
+                // 蜻蜓页面的“保存”通常是红色主按钮
+                if (
+                    r > 180 &&
+                    r > g + 35 &&
+                    r > b + 35
+                ) {
+                    score -= 500;
+                }
+            }
+
+            const cls =
+                String(el.className || '')
+                    .toLowerCase();
+
+            if (
+                cls.includes('primary') ||
+                cls.includes('danger') ||
+                cls.includes('submit') ||
+                cls.includes('save')
+            ) {
+                score -= 180;
+            }
+        } catch (e) {}
+
+        return score;
+    }
+
+    function buttonBaseScore(el) {
+        let score = 1000;
+
+        if (!el) {
+            return 999999;
+        }
+
+        const tag =
+            String(el.tagName || '')
+                .toUpperCase();
+
+        if (tag === 'BUTTON') score -= 450;
+        if (tag === 'INPUT') score -= 420;
+        if (tag === 'A') score -= 300;
+
+        if (
+            el.getAttribute &&
+            el.getAttribute('role') === 'button'
+        ) {
+            score -= 260;
+        }
+
+        const type =
+            String(
+                el.getAttribute &&
+                el.getAttribute('type') ||
+                ''
+            ).toLowerCase();
+
+        if (type === 'submit') {
+            score -= 260;
+        }
+
+        try {
+            const style = getStyle(el);
+
+            if (style.cursor === 'pointer') {
+                score -= 100;
+            }
+        } catch (e) {}
+
+        try {
+            const rect =
+                el.getBoundingClientRect();
+
+            if (
+                rect.width >= 40 &&
+                rect.width <= 220 &&
+                rect.height >= 20 &&
+                rect.height <= 90
+            ) {
+                score -= 100;
+            }
+        } catch (e) {}
+
+        score +=
+            buttonColorScore(el);
+
+        return score;
+    }
+
+    function collectSaveTextCandidates() {
+        const result = [];
+        const seen = new Set();
+
+        // 这里不再依赖“保存”必须是一个独立 TextNode。
+        // 只要按钮、span、div 等元素最终显示文字去掉空格后等于“保存”，
+        // 就向上找到真实可点击元素。
+        const raws = [
+            ...document.querySelectorAll(
+                'button,a,input,[role="button"],span,div,p'
+            )
+        ]
+            .filter(el =>
+                visible(el) &&
+                !insidePanel(el)
+            );
+
+        for (const raw of raws) {
+            const variants =
+                textVariants(raw);
+
+            if (
+                !variants.some(
+                    t => t === '保存'
+                )
+            ) {
+                continue;
+            }
+
+            const target =
+                clickable(raw) ||
+                raw;
+
+            if (
+                !target ||
+                !visible(target) ||
+                insidePanel(target) ||
+                isDisabledButton(target) ||
+                seen.has(target)
+            ) {
+                continue;
+            }
+
+            seen.add(target);
+
+            result.push(target);
+        }
+
+        return result;
+    }
+
+    function collectCancelCandidates() {
+        const result = [];
+        const seen = new Set();
+
+        const raws = [
+            ...document.querySelectorAll(
+                'button,a,input,[role="button"],span,div,p'
+            )
+        ]
+            .filter(el =>
+                visible(el) &&
+                !insidePanel(el)
+            );
+
+        for (const raw of raws) {
+            const variants =
+                textVariants(raw);
+
+            if (
+                !variants.some(
+                    t => t === '取消'
+                )
+            ) {
+                continue;
+            }
+
+            const target =
+                clickable(raw) ||
+                raw;
+
+            if (
+                !target ||
+                !visible(target) ||
+                insidePanel(target) ||
+                seen.has(target)
+            ) {
+                continue;
+            }
+
+            seen.add(target);
+
+            result.push(target);
+        }
+
+        return result;
+    }
+
+    function saveButton() {
+
+        // =====================================================
+        // 第一层：直接扫描所有可见元素的 innerText/textContent/value
+        // 允许“保 存”、零宽字符、嵌套 span
+        // =====================================================
+
+        const direct =
+            collectSaveTextCandidates();
+
+        if (direct.length) {
+            const scored =
+                direct
+                    .map(el => ({
+                        el,
+                        score:
+                            buttonBaseScore(el)
+                    }))
+                    .sort(
+                        (a, b) =>
+                            a.score -
+                            b.score
+                    );
+
+            console.log(
+                '[蜻蜓FM批量改名] 直接识别到保存候选：',
+                scored.map(x => ({
+                    el: x.el,
+                    score: x.score,
+                    text: textVariants(x.el)
+                }))
+            );
+
+            return scored[0].el;
+        }
+
+        // =====================================================
+        // 第二层：寻找“取消”，再找它左边同一排最近的可点击按钮
+        // 这一层同样允许“取 消”和嵌套文字
+        // =====================================================
+
+        const cancels =
+            collectCancelCandidates();
+
+        for (const cancelElement of cancels) {
+            const cancelRect =
+                cancelElement
+                    .getBoundingClientRect();
+
+            const cancelCenterY =
+                cancelRect.top +
+                cancelRect.height / 2;
+
+            const clickables =
+                [
+                    ...document.querySelectorAll(
+                        'button,a,[role="button"],input[type="button"],input[type="submit"],div,span'
+                    )
+                ]
+                    .filter(
+                        el =>
+                            visible(el) &&
+                            !insidePanel(el) &&
+                            !isDisabledButton(el)
+                    );
+
+            const leftButtons =
+                clickables
+                    .map(el => {
+                        const target =
+                            clickable(el) ||
+                            el;
+
+                        const rect =
+                            target
+                                .getBoundingClientRect();
+
+                        const centerY =
+                            rect.top +
+                            rect.height / 2;
+
+                        return {
+                            el: target,
+                            rect,
+                            dy:
+                                Math.abs(
+                                    centerY -
+                                    cancelCenterY
+                                ),
+                            dx:
+                                cancelRect.left -
+                                rect.right,
+                            score:
+                                buttonBaseScore(target)
+                        };
+                    })
+                    .filter(item =>
+                        item.el !== cancelElement &&
+                        item.dy < 42 &&
+                        item.dx >= -8 &&
+                        item.dx < 360 &&
+                        item.rect.width >= 40 &&
+                        item.rect.width <= 240 &&
+                        item.rect.height >= 20 &&
+                        item.rect.height <= 90
+                    )
+                    .sort((a, b) => {
+                        if (
+                            a.score !==
+                            b.score
+                        ) {
+                            return (
+                                a.score -
+                                b.score
+                            );
+                        }
+
+                        if (
+                            a.dy !==
+                            b.dy
+                        ) {
+                            return (
+                                a.dy -
+                                b.dy
+                            );
+                        }
+
+                        return (
+                            a.dx -
+                            b.dx
+                        );
+                    });
+
+            if (leftButtons.length) {
+                console.log(
+                    '[蜻蜓FM批量改名] 通过取消按钮反推保存按钮：',
+                    leftButtons[0].el
+                );
+
+                return leftButtons[0].el;
+            }
+        }
+
+        // =====================================================
+        // 第三层：如果页面上存在标题输入框所在 form，
+        // 且 form 内只有一个可见 submit 按钮，直接使用它
+        // =====================================================
+
+        const titleInputs =
+            editableTextInputs();
+
+        for (const input of titleInputs) {
+            const form =
+                input.form ||
+                input.closest('form');
+
+            if (!form) {
+                continue;
+            }
+
+            const submits =
+                [
+                    ...form.querySelectorAll(
+                        'button[type="submit"],input[type="submit"]'
+                    )
+                ]
+                    .filter(el =>
+                        visible(el) &&
+                        !insidePanel(el) &&
+                        !isDisabledButton(el)
+                    );
+
+            if (submits.length === 1) {
+                console.log(
+                    '[蜻蜓FM批量改名] 通过标题表单唯一 submit 按钮识别保存：',
+                    submits[0]
+                );
+
+                return submits[0];
+            }
+        }
+
+        // =====================================================
+        // 第四层：页面所有真实按钮里找“最像保存”的红色主按钮。
+        // 只在按钮数量较少时启用，避免误点危险操作。
+        // =====================================================
+
+        const buttons =
+            [
+                ...document.querySelectorAll(
+                    'button,input[type="submit"],input[type="button"],a[role="button"],[role="button"]'
+                )
+            ]
+                .filter(el =>
+                    visible(el) &&
+                    !insidePanel(el) &&
+                    !isDisabledButton(el)
+                )
+                .map(el => ({
+                    el,
+                    score:
+                        buttonBaseScore(el),
+                    text:
+                        textVariants(el)
+                }))
+                .filter(item => {
+                    // 明确排除取消、删除等按钮
+                    const joined =
+                        item.text.join('|');
+
+                    return (
+                        !joined.includes('取消') &&
+                        !joined.includes('删除') &&
+                        !joined.includes('清空') &&
+                        !joined.includes('返回')
+                    );
+                })
+                .sort(
+                    (a, b) =>
+                        a.score -
+                        b.score
+                );
+
+        const redLike =
+            buttons.filter(
+                item =>
+                    buttonColorScore(
+                        item.el
+                    ) <= -500
+            );
+
+        if (redLike.length === 1) {
+            console.log(
+                '[蜻蜓FM批量改名] 通过唯一红色主按钮兜底识别保存：',
+                redLike[0].el
+            );
+
+            return redLike[0].el;
+        }
+
+        console.warn(
+            '[蜻蜓FM批量改名] 最终仍未找到保存按钮。当前可见按钮：',
+            buttons.slice(0, 30)
+        );
+
+        return null;
+    }
+
+    // =========================================================
+    // 任务解析
+    // =========================================================
+
+    function parseTasks(text) {
+        const lines =
+            String(text || '')
+                .split(/\r?\n/)
+                .map(x => x.trim())
+                .filter(Boolean);
+
+        const tasks = [];
+
+        for (const line of lines) {
+            let oldName = '';
+            let newName = '';
+
+            if (line.includes('\t')) {
+                const parts =
+                    line.split('\t');
+
+                oldName =
+                    parts.shift().trim();
+
+                newName =
+                    parts.join('\t').trim();
+
+            } else if (
+                line.includes('->')
+            ) {
+                const index =
+                    line.indexOf('->');
+
+                oldName =
+                    line
+                        .slice(0, index)
+                        .trim();
+
+                newName =
+                    line
+                        .slice(index + 2)
+                        .trim();
+
+            } else if (
+                line.includes('=>')
+            ) {
+                const index =
+                    line.indexOf('=>');
+
+                oldName =
+                    line
+                        .slice(0, index)
+                        .trim();
+
+                newName =
+                    line
+                        .slice(index + 2)
+                        .trim();
+
+            } else {
+                continue;
+            }
+
+            if (
+                !oldName ||
+                !newName
+            ) {
+                continue;
+            }
+
+            const tooLong =
+                textLen(newName) >
+                CFG.maxNameChars;
+
+            tasks.push({
+                oldName,
+                newName,
+
+                status:
+                    tooLong
+                        ? 'too_long'
+                        : 'pending',
+
+                note:
+                    tooLong
+                        ? `目标名称${textLen(newName)}字符，超过20`
+                        : ''
+            });
+        }
+
+        return tasks;
+    }
+
+    // =========================================================
+    // 扫描
+    // =========================================================
+
+    async function scanOne(s) {
+        const index =
+            s.scanIndex;
+
+        if (
+            index >=
+            s.tasks.length
+        ) {
+            s.mode = 'rename';
+
+            s.renameIndex = 0;
+
+            while (
+                s.renameIndex <
+                    s.tasks.length &&
+                s.tasks[
+                    s.renameIndex
+                ].status !== 'pending'
+            ) {
+                s.renameIndex++;
+            }
+
+            if (
+                s.renameIndex >=
+                s.tasks.length
+            ) {
+                s.running = false;
+                s.mode = 'idle';
+
+                addLog(
+                    s,
+                    '扫描完成，没有待修改任务。'
+                );
+
+            } else {
+                addLog(
+                    s,
+                    `扫描完成，从第 ${s.renameIndex + 1} 条未修改任务开始。`
+                );
+            }
+
+            return;
+        }
+
+        const task =
+            s.tasks[index];
+
+        s.currentIndex =
+            index;
+
+        if (
+            task.status ===
+            'too_long'
+        ) {
+            addLog(
+                s,
+                `扫描 ${index + 1}/${s.tasks.length}：超20字符，跳过 → ${task.newName}`
+            );
+
+            s.scanIndex++;
+            saveState(s);
+
+            return;
+        }
+
+        // 搜索原标题
+        await searchAlbum(
+            task.oldName
+        );
+
+        const titles =
+            currentResultTitles();
+
+        addLog(
+            s,
+            `扫描 ${index + 1}/${s.tasks.length}：搜索原标题，页面读取到：[${titles.join('] [') || '无'}]`
+        );
+
+        const oldHit =
+            matchOldName(
+                task.oldName
+            );
+
+        if (
+            oldHit.kind ===
+            'old'
+        ) {
+            if (
+                oldHit.item.title ===
+                norm(task.newName)
+            ) {
+                task.status =
+                    'already';
+
+                task.note =
+                    '当前标题已经是目标新名称';
+
+                addLog(
+                    s,
+                    `扫描 ${index + 1}/${s.tasks.length}：已替换 → ${oldHit.item.title}`
+                );
+
+            } else {
+                task.status =
+                    'pending';
+
+                task.note =
+                    `当前标题：${oldHit.item.title}`;
+
+                addLog(
+                    s,
+                    `扫描 ${index + 1}/${s.tasks.length}：待修改 → ${oldHit.item.title}`
+                );
+            }
+
+            s.scanIndex++;
+
+            saveState(s);
+
+            return;
+        }
+
+        if (
+            oldHit.kind ===
+            'ambiguous'
+        ) {
+            task.status =
+                'ambiguous';
+
+            task.note =
+                '出现多个包含原标题的专辑';
+
+            addLog(
+                s,
+                `扫描 ${index + 1}/${s.tasks.length}：出现多个匹配，保护性跳过。`
+            );
+
+            s.scanIndex++;
+
+            saveState(s);
+
+            return;
+        }
+
+        // 搜不到原标题，再搜目标新名称
+        await searchAlbum(
+            task.newName
+        );
+
+        const newHit =
+            matchExactNew(
+                task.newName
+            );
+
+        if (
+            newHit.kind ===
+            'already'
+        ) {
+            task.status =
+                'already';
+
+            task.note =
+                '通过新名称确认已修改';
+
+            addLog(
+                s,
+                `扫描 ${index + 1}/${s.tasks.length}：已替换 → ${task.newName}`
+            );
+
+        } else if (
+            newHit.kind ===
+            'ambiguous'
+        ) {
+            task.status =
+                'ambiguous';
+
+            task.note =
+                '新名称出现多个完全匹配';
+
+            addLog(
+                s,
+                `扫描 ${index + 1}/${s.tasks.length}：新名称出现多个匹配，跳过。`
+            );
+
+        } else {
+            task.status =
+                'not_found';
+
+            task.note =
+                '原标题和新名称都没找到';
+
+            addLog(
+                s,
+                `扫描 ${index + 1}/${s.tasks.length}：未找到 → ${task.oldName}`
+            );
+        }
+
+        s.scanIndex++;
+
+        saveState(s);
+    }
+
+    // =========================================================
+    // 打开专辑
+    // =========================================================
+
+    async function openFromList(
+        s,
+        index
+    ) {
+        const task =
+            s.tasks[index];
+
+        await searchAlbum(
+            task.oldName
+        );
+
+        addLog(
+            s,
+            `第 ${index + 1} 条搜索结果真实标题：[${currentResultTitles().join('] [') || '无'}]`
+        );
+
+        const hit =
+            matchOldName(
+                task.oldName
+            );
+
+        if (
+            hit.kind ===
+            'old'
+        ) {
+            if (
+                hit.item.title ===
+                norm(task.newName)
+            ) {
+                task.status =
+                    'done';
+
+                task.note =
+                    '已经是目标新名称';
+
+                s.renameIndex =
+                    index + 1;
+
+                addLog(
+                    s,
+                    `第 ${index + 1} 条已经修改完成，直接跳过。`
+                );
+
+                return;
+            }
+
+            s.phase =
+                'open_manage';
+
+            s.openFormRetry = 0;
+            s.openFormAt = 0;
+
+            saveState(s);
+
+            realClick(
+                hit.item.manage
+            );
+
+            addLog(
+                s,
+                `第 ${index + 1} 条：点击“管理” → ${hit.item.title}`
+            );
+
+            return;
+        }
+
+        await searchAlbum(
+            task.newName
+        );
+
+        const newHit =
+            matchExactNew(
+                task.newName
+            );
+
+        if (
+            newHit.kind ===
+            'already'
+        ) {
+            task.status =
+                'done';
+
+            task.note =
+                '二次确认已经修改';
+
+            s.renameIndex =
+                index + 1;
+
+            addLog(
+                s,
+                `第 ${index + 1} 条已经是目标新名称，直接完成。`
+            );
+
+            return;
+        }
+
+        task.status =
+            hit.kind === 'ambiguous'
+                ? 'ambiguous'
+                : 'not_found';
+
+        task.note =
+            '修改阶段未安全匹配';
+
+        s.renameIndex =
+            index + 1;
+
+        addLog(
+            s,
+            `第 ${index + 1} 条无法安全匹配，跳过：${task.oldName}`
+        );
+    }
+
+    // =========================================================
+    // 编辑标题并保存
+    // =========================================================
+
+    async function handleTitleForm(
+        s,
+        index,
+        task,
+        input
+    ) {
+        if (
+            textLen(task.newName) >
+            CFG.maxNameChars
+        ) {
+            task.status =
+                'too_long';
+
+            task.note =
+                `目标名称${textLen(task.newName)}字符，超过20`;
+
+            s.renameIndex =
+                index + 1;
+
+            s.phase = '';
+
+            addLog(
+                s,
+                `第 ${index + 1} 条超过20字符，跳过。`
+            );
+
+            location.href =
+                s.listUrl;
+
+            return true;
+        }
+
+        // 正在等待保存结果
+        if (
+            s.phase ===
+            'submitted'
+        ) {
+            if (
+                now() -
+                s.submitAt <
+                CFG.submitTimeout
+            ) {
+                return true;
+            }
+
+            s.submitRetry++;
+
+            if (
+                s.submitRetry >
+                CFG.maxSubmitRetry
+            ) {
+                task.status =
+                    'failed';
+
+                task.note =
+                    `保存重试${CFG.maxSubmitRetry}次仍失败`;
+
+                s.renameIndex =
+                    index + 1;
+
+                s.phase = '';
+
+                addLog(
+                    s,
+                    `第 ${index + 1} 条保存连续失败，跳过。`
+                );
+
+                location.href =
+                    s.listUrl;
+
+                return true;
+            }
+
+            s.phase =
+                'retry_reload';
+
+            saveState(s);
+
+            addLog(
+                s,
+                `第 ${index + 1} 条保存超时，自动刷新后第 ${s.submitRetry} 次重新提交。`
+            );
+
+            location.reload();
+
+            return true;
+        }
+
+        // 写入标题
+        if (
+            norm(input.value) !==
+            norm(task.newName)
+        ) {
+            setInputValue(
+                input,
+                task.newName
+            );
+
+            await sleep(350);
+
+            if (
+                norm(input.value) !==
+                norm(task.newName)
+            ) {
+                addLog(
+                    s,
+                    `第 ${index + 1} 条：标题写入失败，稍后重试。`
+                );
+
+                return true;
+            }
+        }
+
+        // 找保存按钮
+        const button =
+            saveButton();
+
+        if (!button) {
+            if (
+                s.phase !==
+                'wait_save'
+            ) {
+                s.phase =
+                    'wait_save';
+
+                saveState(s);
+
+                addLog(
+                    s,
+                    `第 ${index + 1} 条：已识别标题框，但暂未找到“保存”按钮。`
+                );
+            }
+
+            return true;
+        }
+
+        s.phase =
+            'submitted';
+
+        s.submitAt =
+            now();
+
+        saveState(s);
+
+        realClick(button);
+
+        addLog(
+            s,
+            `第 ${index + 1} 条：已修改标题并点击保存 → ${task.newName}`
+        );
+
+        return true;
+    }
+
+    // =========================================================
+    // 主修改逻辑
+    // =========================================================
+
+    async function handleRename(s) {
+        let index =
+            s.renameIndex;
+
+        while (
+            index <
+                s.tasks.length &&
+            s.tasks[index]
+                .status !==
+                'pending'
+        ) {
+            index++;
+        }
+
+        s.renameIndex =
+            index;
+
+        if (
+            index >=
+            s.tasks.length
+        ) {
+            s.running = false;
+            s.mode = 'idle';
+            s.phase = '';
+
+            addLog(
+                s,
+                '全部处理完成。'
+            );
+
+            return;
+        }
+
+        const task =
+            s.tasks[index];
+
+        s.currentIndex =
+            index;
+
+        const type =
+            pageType();
+
+        // 任何非列表页：
+        // 只要出现一个输入框的值包含原标题，就直接当标题框
+        if (
+            type !== 'list'
+        ) {
+            const directInput =
+                strongTitleInput(
+                    task
+                );
+
+            if (directInput) {
+                if (
+                    s.phase !==
+                    'submitted'
+                ) {
+                    const value =
+                        norm(
+                            directInput.value
+                        );
+
+                    if (
+                        s.phase !==
+                        'title_input_found' &&
+                        s.phase !==
+                        'wait_save'
+                    ) {
+                        s.phase =
+                            'title_input_found';
+
+                        saveState(s);
+
+                        addLog(
+                            s,
+                            `第 ${index + 1} 条：已直接识别专辑名称输入框，当前值：[${value}]`
+                        );
+                    }
+                }
+
+                await handleTitleForm(
+                    s,
+                    index,
+                    task,
+                    directInput
+                );
+
+                return;
+            }
+        }
+
+        // 已点击保存，并且页面已经离开标题编辑状态
+        if (
+            s.phase ===
+            'submitted'
+        ) {
+            const input =
+                strongTitleInput(
+                    task
+                );
+
+            if (!input) {
+                task.status =
+                    'done';
+
+                task.note =
+                    `保存完成，重试${s.submitRetry}次`;
+
+                s.renameIndex =
+                    index + 1;
+
+                s.phase = '';
+                s.submitAt = 0;
+                s.submitRetry = 0;
+
+                addLog(
+                    s,
+                    `第 ${index + 1} 条保存成功：${task.newName}`
+                );
+
+                location.href =
+                    s.listUrl;
+
+                return;
+            }
+        }
+
+        // 列表页
+        if (
+            type ===
+            'list'
+        ) {
+            await openFromList(
+                s,
+                index
+            );
+
+            return;
+        }
+
+        // 详情页
+        if (
+            type ===
+            'detail'
+        ) {
+            if (
+                !clickText('编辑')
+            ) {
+                addLog(
+                    s,
+                    `第 ${index + 1} 条：暂时找不到“编辑”按钮，继续等待。`
+                );
+
+                return;
+            }
+
+            s.phase =
+                'open_edit';
+
+            s.openFormRetry = 0;
+
+            saveState(s);
+
+            addLog(
+                s,
+                `第 ${index + 1} 条：点击“编辑”。`
+            );
+
+            return;
+        }
+
+        // 专辑编辑查看页
+        if (
+            type ===
+            'editView'
+        ) {
+            // 如果已经点过修改信息
+            if (
+                s.phase ===
+                'open_form_wait'
+            ) {
+                const input =
+                    strongTitleInput(
+                        task
+                    );
+
+                if (input) {
+                    s.phase =
+                        'title_input_found';
+
+                    saveState(s);
+
+                    return;
+                }
+
+                if (
+                    now() -
+                    s.openFormAt <
+                    CFG.openFormWait
+                ) {
+                    return;
+                }
+
+                s.openFormRetry++;
+
+                if (
+                    s.openFormRetry >=
+                    CFG.maxOpenFormRetry
+                ) {
+                    task.status =
+                        'failed';
+
+                    task.note =
+                        '无法进入基本信息编辑表单';
+
+                    s.renameIndex =
+                        index + 1;
+
+                    s.phase = '';
+
+                    addLog(
+                        s,
+                        `第 ${index + 1} 条：连续 ${CFG.maxOpenFormRetry} 次无法进入修改表单，跳过。`
+                    );
+
+                    location.href =
+                        s.listUrl;
+
+                    return;
+                }
+            }
+
+            const candidates =
+                modifyCandidates();
+
+            if (
+                !candidates.length
+            ) {
+                if (
+                    s.phase !==
+                    'wait_modify'
+                ) {
+                    s.phase =
+                        'wait_modify';
+
+                    saveState(s);
+
+                    addLog(
+                        s,
+                        `第 ${index + 1} 条：暂未找到“基本信息”右侧的“修改信息”。`
+                    );
+                }
+
+                return;
+            }
+
+            const retry =
+                s.openFormRetry || 0;
+
+            const candidate =
+                candidates[
+                    Math.min(
+                        retry,
+                        candidates.length - 1
+                    )
+                ];
+
+            s.phase =
+                'open_form_wait';
+
+            s.openFormAt =
+                now();
+
+            saveState(s);
+
+            realClick(
+                candidate.target
+            );
+
+            addLog(
+                s,
+                `第 ${index + 1} 条：已点击“基本信息”右侧修改信息，等待标题框出现${retry ? `（第 ${retry + 1} 次尝试）` : ''}。`
+            );
+
+            return;
+        }
+
+        await sleep(500);
+    }
+
+    // =========================================================
+    // 主循环
+    // =========================================================
+
+    let ticking = false;
+
+    async function tick() {
+        if (ticking) {
+            return;
+        }
+
+        ticking = true;
+
+        try {
+            const s =
+                loadState();
+
+            if (
+                !s.running ||
+                s.paused
+            ) {
+                return;
+            }
+
+            if (
+                s.mode ===
+                'scan'
+            ) {
+                if (
+                    pageType() !==
+                    'list'
+                ) {
+                    if (s.listUrl) {
+                        location.href =
+                            s.listUrl;
+                    }
+
+                    return;
+                }
+
+                await scanOne(s);
+
+                return;
+            }
+
+            if (
+                s.mode ===
+                'rename'
+            ) {
+                await handleRename(s);
+            }
+
+        } catch (error) {
+            const s =
+                loadState();
+
+            addLog(
+                s,
+                `运行异常：${error.message || String(error)}`
+            );
+
+        } finally {
+            ticking = false;
+        }
+    }
+
+    // =========================================================
+    // UI
+    // =========================================================
+
+    function downloadTextFile(filename, content) {
+        const blob =
+            new Blob(
+                [content],
+                {
+                    type: 'text/plain;charset=utf-8'
+                }
+            );
+
+        const url =
+            URL.createObjectURL(blob);
+
+        const a =
+            document.createElement('a');
+
+        a.href = url;
+        a.download = filename;
+
+        document.body.appendChild(a);
+
+        a.click();
+
+        setTimeout(() => {
+            try {
+                URL.revokeObjectURL(url);
+            } catch (e) {}
+
+            try {
+                a.remove();
+            } catch (e) {}
+        }, 800);
+    }
+
+    function exportTaskList(statusType) {
+        const s =
+            loadState();
+
+        const tasks =
+            (s.tasks || [])
+                .filter(task =>
+                    task.status ===
+                    statusType
+                );
+
+        if (!tasks.length) {
+            const label =
+                statusType === 'not_found'
+                    ? '未找到'
+                    : '重复匹配';
+
+            alert(
+                `当前没有“${label}”的书单可导出。`
+            );
+
+            return;
+        }
+
+        // 导出格式保持和导入格式一致：
+        // 原标题[TAB]新名称
+        // 这样导出后可以直接复制回来重新跑。
+        const content =
+            tasks
+                .map(task =>
+                    `${task.oldName}\t${task.newName}`
+                )
+                .join('\n');
+
+        const label =
+            statusType === 'not_found'
+                ? '未找到'
+                : '重复匹配';
+
+        const stamp =
+            new Date()
+                .toISOString()
+                .slice(0, 19)
+                .replace(/[:T]/g, '-');
+
+        downloadTextFile(
+            `蜻蜓FM_${label}书单_${stamp}.txt`,
+            content
+        );
+
+        addLog(
+            s,
+            `已导出“${label}”书单，共 ${tasks.length} 条。`
+        );
+    }
+
+    function countStatus(s) {
+        const result = {};
+
+        for (
+            const task of
+            s.tasks || []
+        ) {
+            result[task.status] =
+                (
+                    result[
+                        task.status
+                    ] || 0
+                ) + 1;
+        }
+
+        return result;
+    }
+
+    function createPanel() {
+        if (
+            document.getElementById(
+                PANEL_ID
+            )
+        ) {
+            return;
+        }
+
+        const panel =
+            document.createElement(
+                'div'
+            );
+
+        panel.id =
+            PANEL_ID;
+
+        panel.innerHTML = `
+            <div class="qt-title">
+
+                <b>蜻蜓FM批量改名 v${VERSION}</b>
+
+                <button id="qt-collapse">
+                    −
+                </button>
+
+            </div>
+
+            <div id="qt-body">
+
+                <div class="qt-help">
+                    每行：原标题[TAB]新名称。<br>
+                    先扫描全部，已改好的自动排除。<br>
+                    自动从第一条未修改的开始。<br>
+                    蜻蜓新名称最多20字符。
+                </div>
+
+                <textarea
+                    id="qt-task-input"
+                    placeholder="原标题[TAB]新名称"
+                ></textarea>
+
+                <div class="qt-buttons">
+
+                    <button id="qt-start">
+                        扫描并开始
+                    </button>
+
+                    <button id="qt-pause">
+                        暂停
+                    </button>
+
+                    <button id="qt-continue">
+                        继续
+                    </button>
+
+                    <button id="qt-reset">
+                        清空进度
+                    </button>
+
+                </div>
+
+                <div class="qt-export-buttons">
+
+                    <button id="qt-export-not-found">
+                        导出未找到
+                    </button>
+
+                    <button id="qt-export-ambiguous">
+                        导出重复
+                    </button>
+
+                </div>
+
+                <div id="qt-status"></div>
+
+                <pre id="qt-log"></pre>
+
+            </div>
+        `;
+
+        document.body.appendChild(
+            panel
+        );
+
+        const style =
+            document.createElement(
+                'style'
+            );
+
+        style.textContent = `
+            #${PANEL_ID} {
+                position: fixed;
+                right: 16px;
+                top: 20px;
+
+                width: 430px;
+
+                z-index: 2147483647;
+
+                background: #1d1d1f;
+                color: white;
+
+                border: 2px solid #ff5a5f;
+                border-radius: 12px;
+
+                box-shadow:
+                    0 8px 28px
+                    rgba(0,0,0,.28);
+
+                font:
+                    13px/1.45
+                    Arial,
+                    "Microsoft YaHei",
+                    sans-serif;
+            }
+
+            #${PANEL_ID} .qt-title {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+
+                padding: 10px 12px;
+
+                color: #ff7074;
+            }
+
+            #${PANEL_ID} .qt-title button {
+                width: 27px;
+                height: 25px;
+
+                color: white;
+                background: #333;
+
+                border: 1px solid #666;
+                border-radius: 4px;
+            }
+
+            #${PANEL_ID} #qt-body {
+                padding: 0 12px 12px;
+            }
+
+            #${PANEL_ID} .qt-help {
+                color: #ccc;
+
+                font-size: 12px;
+
+                margin-bottom: 8px;
+            }
+
+            #${PANEL_ID} textarea {
+                width: 100%;
+                height: 130px;
+
+                box-sizing: border-box;
+                resize: vertical;
+
+                padding: 8px;
+
+                color: #eee;
+                background: #111;
+
+                border: 1px solid #555;
+                border-radius: 6px;
+            }
+
+            #${PANEL_ID} .qt-buttons {
+                display: grid;
+
+                grid-template-columns:
+                    1.4fr
+                    .8fr
+                    .8fr
+                    1fr;
+
+                gap: 6px;
+
+                margin-top: 8px;
+            }
+
+            #${PANEL_ID} .qt-buttons button {
+                padding: 7px 5px;
+
+                border: 0;
+                border-radius: 6px;
+
+                cursor: pointer;
+            }
+
+            #${PANEL_ID} #qt-start {
+                color: white;
+                background: #ff5a5f;
+            }
+
+            #${PANEL_ID} #qt-pause {
+                color: white;
+                background: #ffb020;
+            }
+
+            #${PANEL_ID} #qt-continue {
+                color: white;
+                background: #34c759;
+            }
+
+            #${PANEL_ID} #qt-reset {
+                color: white;
+                background: #5b8def;
+            }
+
+            #${PANEL_ID} .qt-export-buttons {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 6px;
+                margin-top: 7px;
+            }
+
+            #${PANEL_ID} .qt-export-buttons button {
+                padding: 7px 5px;
+                border: 0;
+                border-radius: 6px;
+                cursor: pointer;
+                color: white;
+            }
+
+            #${PANEL_ID} #qt-export-not-found {
+                background: #8e8e93;
+            }
+
+            #${PANEL_ID} #qt-export-ambiguous {
+                background: #af52de;
+            }
+
+            #${PANEL_ID} #qt-status {
+                margin-top: 8px;
+
+                color: #ddd;
+
+                white-space: pre-wrap;
+            }
+
+            #${PANEL_ID} #qt-log {
+                height: 180px;
+
+                overflow: auto;
+
+                margin: 7px 0 0;
+                padding: 7px;
+
+                color: #b8f1a9;
+                background: #101010;
+
+                border: 1px solid #333;
+                border-radius: 6px;
+
+                white-space: pre-wrap;
+
+                font-size: 11px;
+            }
+        `;
+
+        document.head.appendChild(
+            style
+        );
+
+        document
+            .getElementById(
+                'qt-collapse'
+            )
+            .onclick =
+            function () {
+                const body =
+                    document.getElementById(
+                        'qt-body'
+                    );
+
+                const hidden =
+                    body.style.display !==
+                    'none';
+
+                body.style.display =
+                    hidden
+                        ? 'none'
+                        : '';
+
+                this.textContent =
+                    hidden
+                        ? '+'
+                        : '−';
+            };
+
+        document
+            .getElementById(
+                'qt-start'
+            )
+            .onclick =
+            function () {
+                if (
+                    pageType() !==
+                    'list'
+                ) {
+                    alert(
+                        '请先回到“专辑管理”列表页再开始。'
+                    );
+
+                    return;
+                }
+
+                const text =
+                    document
+                        .getElementById(
+                            'qt-task-input'
+                        )
+                        .value;
+
+                const tasks =
+                    parseTasks(text);
+
+                if (!tasks.length) {
+                    alert(
+                        '没有识别到任务。\n格式：原标题[TAB]新名称'
+                    );
+
+                    return;
+                }
+
+                const s =
+                    defaultState();
+
+                s.running = true;
+                s.paused = false;
+
+                s.mode =
+                    'scan';
+
+                s.listUrl =
+                    location.href;
+
+                s.tasks =
+                    tasks;
+
+                s.scanIndex = 0;
+                s.renameIndex = 0;
+
+                s.startedAt =
+                    now();
+
+                saveState(s);
+
+                addLog(
+                    s,
+                    `新批次共 ${tasks.length} 条，开始扫描。`
+                );
+            };
+
+        document
+            .getElementById(
+                'qt-pause'
+            )
+            .onclick =
+            function () {
+                const s =
+                    loadState();
+
+                s.paused =
+                    true;
+
+                saveState(s);
+
+                addLog(
+                    s,
+                    '已暂停。'
+                );
+            };
+
+        document
+            .getElementById(
+                'qt-continue'
+            )
+            .onclick =
+            function () {
+                const s =
+                    loadState();
+
+                if (
+                    !s.tasks.length
+                ) {
+                    alert(
+                        '当前没有可继续的任务。'
+                    );
+
+                    return;
+                }
+
+                s.running =
+                    true;
+
+                s.paused =
+                    false;
+
+                saveState(s);
+
+                addLog(
+                    s,
+                    '继续当前批次。'
+                );
+            };
+
+        document
+            .getElementById(
+                'qt-export-not-found'
+            )
+            .onclick =
+            function () {
+                exportTaskList(
+                    'not_found'
+                );
+            };
+
+        document
+            .getElementById(
+                'qt-export-ambiguous'
+            )
+            .onclick =
+            function () {
+                exportTaskList(
+                    'ambiguous'
+                );
+            };
+
+        document
+            .getElementById(
+                'qt-reset'
+            )
+            .onclick =
+            function () {
+                if (
+                    !confirm(
+                        '确定清空当前批次进度吗？'
+                    )
+                ) {
+                    return;
+                }
+
+                GM_deleteValue(
+                    KEY
+                );
+
+                render();
+            };
+
+        render();
+    }
+
+    function render() {
+        const status =
+            document.getElementById(
+                'qt-status'
+            );
+
+        const log =
+            document.getElementById(
+                'qt-log'
+            );
+
+        if (
+            !status ||
+            !log
+        ) {
+            return;
+        }
+
+        const s =
+            loadState();
+
+        const c =
+            countStatus(s);
+
+        const total =
+            s.tasks.length;
+
+        const position =
+            total
+                ? Math.min(
+                    s.renameIndex + 1,
+                    total
+                )
+                : 0;
+
+        status.textContent =
+            `模式：${s.mode}` +
+            (
+                s.running
+                    ? (
+                        s.paused
+                            ? '（暂停）'
+                            : '（运行中）'
+                    )
+                    : ''
+            ) +
+            '\n' +
+
+            `扫描：${Math.min(s.scanIndex, total)}/${total}　修改位置：${position}` +
+            '\n' +
+
+            `待改:${c.pending || 0}　` +
+            `已替换:${c.already || 0}　` +
+            `完成:${c.done || 0}　` +
+            `未找到:${c.not_found || 0}` +
+            '\n' +
+
+            `重复匹配:${c.ambiguous || 0}　` +
+            `超20:${c.too_long || 0}　` +
+            `失败:${c.failed || 0}`;
+
+        log.textContent =
+            (s.logs || [])
+                .slice(-55)
+                .join('\n');
+
+        log.scrollTop =
+            log.scrollHeight;
+    }
+
+    // =========================================================
+    // 启动
+    // =========================================================
+
+    function boot() {
+        createPanel();
+
+        console.log(
+            `[蜻蜓FM批量改名] 当前版本 v${VERSION}`
+        );
+
+        setInterval(
+            tick,
+            CFG.tick
+        );
+
+        setInterval(
+            render,
+            1200
+        );
+
+        const s =
+            loadState();
+
+        if (
+            s.running &&
+            !s.paused
+        ) {
+            setTimeout(
+                tick,
+                500
+            );
+        }
+    }
+
+    if (
+        document.readyState ===
+        'loading'
+    ) {
+        document.addEventListener(
+            'DOMContentLoaded',
+            boot,
+            {
+                once: true
+            }
+        );
+    } else {
+        boot();
+    }
+
+})();

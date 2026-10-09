@@ -1,0 +1,1144 @@
+// ==UserScript==
+// @name         喜马拉雅榜单抓取助手-动态全量分表版
+// @namespace    fyf.local
+// @version      0.3.1
+// @description  精确抓取喜马拉雅榜单页面显示的四项：书名、账号名、集数、播放数；修复集数漏抓；Excel工作表名称严格跟随当前页面显示的榜单名称。
+// @author       ChatGPT
+// @match        https://www.ximalaya.com/top/*
+// @grant        GM_setClipboard
+// @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const PANEL_ID = 'fyf-xmly-rank-panel';
+  const SCROLL_INTERVAL = 500;
+  const BOTTOM_STABLE_ROUNDS = 4;
+  const DETAIL_CONCURRENCY = 3;
+  const DETAIL_INTERVAL = 180;
+
+  let currentRows = [];
+  let currentRankingName = '';
+
+  // key = 榜单名字；value = 当前榜单数据
+  const rankingGroups = new Map();
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const clean = (v) => String(v ?? '').replace(/\s+/g, ' ').trim();
+
+  function setStatus(text, type = 'normal') {
+    const el = document.querySelector('#fyf-xm-status');
+    if (!el) return;
+    el.textContent = text;
+    el.dataset.type = type;
+  }
+
+  function normalizePath(pathname) {
+    const p = String(pathname || '/').replace(/\/+$/, '');
+    return p || '/';
+  }
+
+  function normalizeRankingLabel(value) {
+    let text = clean(value);
+    if (!text) return '';
+
+    text = text
+      .replace(/\s*[-–—_]\s*喜马拉雅.*$/i, '')
+      .replace(/\s*[-–—_]\s*国内专业音频分享平台.*$/i, '')
+      .replace(/^(?:喜马拉雅|排行榜|榜单)\s*[-｜|:]?\s*/i, '')
+      .trim();
+
+    // SEO标题常见格式：
+    // “好听的有声节目小说_新品听书排行榜单前十名 – 喜马拉雅”
+    // 统一还原成页面上更适合作为工作表名的“新品听书榜”。
+    const seoParts = text.split('_').map(clean).filter(Boolean);
+    if (seoParts.length > 1) text = seoParts[seoParts.length - 1];
+
+    text = text
+      .replace(/排行榜单前(?:十|10)名.*$/i, '榜')
+      .replace(/排行榜前(?:十|10)名.*$/i, '榜')
+      .replace(/榜单前(?:十|10)名.*$/i, '榜')
+      .replace(/排行榜单.*$/i, '榜')
+      .replace(/排行榜.*$/i, '榜')
+      .replace(/榜单.*$/i, '榜')
+      .trim();
+
+    return text;
+  }
+
+  function parseRankingName() {
+    const currentPath = normalizePath(location.pathname);
+
+    // 第一优先级：当前URL对应的榜单导航链接。
+    // 只在 /top/ 导航链接里找，彻底避免把书名里“高分霸榜”等文字误当成工作表名。
+    const exactTopLinks = [...document.querySelectorAll('a[href*="/top/"]')]
+      .filter((a) => {
+        try {
+          const u = new URL(a.getAttribute('href') || a.href, location.origin);
+          return normalizePath(u.pathname) === currentPath;
+        } catch (_) {
+          return false;
+        }
+      })
+      .map((a) => ({
+        text: clean(a.innerText || a.textContent || ''),
+        selected: a.getAttribute('aria-current') === 'page' ||
+          a.getAttribute('aria-selected') === 'true' ||
+          /(?:^|\s)(?:active|selected|current)(?:\s|$)/i.test(a.className || '') ||
+          /(?:^|\s)(?:active|selected|current)(?:\s|$)/i.test(a.parentElement?.className || ''),
+      }))
+      .filter((x) => x.text && x.text.length <= 40);
+
+    if (exactTopLinks.length) {
+      const hit = exactTopLinks.find((x) => x.selected) ||
+        exactTopLinks.find((x) => /榜|排行|听书|新品|热播|畅销|完本/.test(x.text)) ||
+        exactTopLinks[0];
+      const label = normalizeRankingLabel(hit?.text);
+      if (label) return label;
+    }
+
+    // 第二优先级：明确处于选中状态的榜单导航项。
+    const selected = [...document.querySelectorAll(
+      '[aria-current="page"], [aria-selected="true"], .active, .selected, .current'
+    )]
+      .filter((el) => !!el.closest('a[href*="/top/"], [class*="rank" i], [class*="top" i], nav'))
+      .map((el) => clean(el.innerText || el.textContent || ''))
+      .filter((t) => t && t.length <= 40 && /榜|排行|听书|新品|热播|畅销|完本/.test(t));
+
+    if (selected.length) {
+      const label = normalizeRankingLabel(selected[0]);
+      if (label) return label;
+    }
+
+    // 第三优先级：使用页面SEO标题。比扫描所有 title/rank 类名安全得多。
+    const fromTitle = normalizeRankingLabel(document.title);
+    if (fromTitle && /榜|排行|听书|新品|热播|畅销|完本/.test(fromTitle)) {
+      return fromTitle;
+    }
+
+    // 最后才使用URL兜底。
+    return `喜马拉雅榜单_${location.pathname.split('/').filter(Boolean).join('_')}`;
+  }
+
+  function extractAlbumId(href) {
+    if (!href) return '';
+    try {
+      const u = new URL(href, location.origin);
+      const m = u.pathname.match(/^\/album\/(\d+)/);
+      return m?.[1] || '';
+    } catch (_) {
+      const m = String(href).match(/\/album\/(\d+)/);
+      return m?.[1] || '';
+    }
+  }
+
+  function getAlbumLinks(root = document) {
+    return [...root.querySelectorAll('a[href*="/album/"]')]
+      .filter((a) => extractAlbumId(a.getAttribute('href') || a.href));
+  }
+
+  function elementText(el) {
+    return clean(el?.innerText || el?.textContent || '');
+  }
+
+  // 从书名链接向上寻找最像“榜单卡片”的最小父节点
+  function findAlbumCard(link, title) {
+    let el = link;
+    let best = null;
+    let bestScore = -Infinity;
+
+    for (let depth = 0; depth < 10 && el && el !== document.body; depth++, el = el.parentElement) {
+      const text = elementText(el);
+      if (!text || text.length > 2200) continue;
+
+      const albumLinkCount = getAlbumLinks(el).length;
+      const hasAnchorLink = !!el.querySelector('a[href*="/zhubo/"], a[href*="/user/"], a[href*="/profile/"]');
+      const hasCountWord = /播放|集|期|声音|节目/.test(text);
+      const hasTitle = title ? text.includes(title) : true;
+
+      let score = 0;
+      if (hasTitle) score += 6;
+      if (hasAnchorLink) score += 4;
+      if (hasCountWord) score += 3;
+      if (albumLinkCount === 1) score += 5;
+      else if (albumLinkCount <= 2) score += 2;
+      else score -= albumLinkCount;
+      score -= depth * 0.15;
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = el;
+      }
+    }
+
+    return best || link.parentElement || link;
+  }
+
+  function rawLines(el) {
+    return String(el?.innerText || el?.textContent || '')
+      .split(/[\r\n]+/)
+      .map((x) => clean(x))
+      .filter(Boolean);
+  }
+
+  function firstVisibleLine(value) {
+    return String(value || '')
+      .split(/[\r\n]+/)
+      .map((x) => clean(x))
+      .find(Boolean) || '';
+  }
+
+  function isBadTitleCandidate(text) {
+    const t = clean(text);
+    if (!t || t.length < 2 || t.length > 220) return true;
+    if (/^(?:有声书|广播剧|儿童|音乐|娱乐|相声|评书|专辑详情|免费订阅|立即播放|播放全部|VIP)$/i.test(t)) return true;
+    if (/^第\s*\d+\s*集/.test(t)) return true;
+    if (/^(?:\d{1,3}|\d+(?:\.\d+)?(?:万|亿)?)$/.test(t)) return true;
+    return false;
+  }
+
+  // 只取榜单上方“书名”这一行，不再把书名链接下面的简介一起算进去。
+  function pickTitleFromCard(card, albumId, fallbackLink) {
+    const candidates = [];
+    const push = (value, score, source) => {
+      const text = firstVisibleLine(value);
+      if (isBadTitleCandidate(text)) return;
+      candidates.push({ text, score, source });
+    };
+
+    // 最稳的标题来源：按整张卡片的“标题 + 类型 + 账号 + 集数 + 播放数”结构反推。
+    // 这一项优先级最高，可以避免链接本身把简介一起包进去。
+    if (card) {
+      const structured = parseStructuredCardText(card);
+      if (structured.title) push(structured.title, 220, 'structured-card-text');
+    }
+
+    const sameAlbumLinks = card
+      ? getAlbumLinks(card).filter((a) => extractAlbumId(a.getAttribute('href') || a.href) === albumId)
+      : [];
+    if (fallbackLink && !sameAlbumLinks.includes(fallbackLink)) sameAlbumLinks.unshift(fallbackLink);
+
+    for (const a of sameAlbumLinks) {
+      push(a.getAttribute('title'), 105, 'link-title');
+
+      // innerText 可能是“标题\n简介”，这里逐行取第一行，而不是 clean 后整块合并。
+      const lines = rawLines(a);
+      if (lines.length) push(lines[0], 125, 'link-first-line');
+
+      const heading = a.querySelector('h1,h2,h3,h4,[class*="title" i]');
+      if (heading) push(rawLines(heading)[0], 135, 'link-heading');
+
+      const img = a.querySelector('img');
+      if (img) push(img.getAttribute('alt'), 115, 'img-alt');
+    }
+
+    if (card) {
+      for (const el of card.querySelectorAll('h1,h2,h3,h4,[class*="title" i]')) {
+        const link = el.closest('a[href*="/album/"]');
+        if (link && extractAlbumId(link.getAttribute('href') || link.href) !== albumId) continue;
+        push(rawLines(el)[0], 130, 'card-heading');
+      }
+    }
+
+    // 同分时优先较短的文本，避免误把“标题 + 宣传文案”当标题。
+    candidates.sort((a, b) => b.score - a.score || a.text.length - b.text.length);
+    return candidates[0]?.text || '';
+  }
+
+  function findAccountElement(card, title) {
+    if (!card) return null;
+
+    const accountLinks = [...card.querySelectorAll('a[href]')]
+      .filter((a) => {
+        const href = a.getAttribute('href') || '';
+        if (/\/album\//.test(href)) return false;
+        const text = elementText(a);
+        if (!text || text === title || text.length > 80) return false;
+        return /\/(?:zhubo|user|profile)\//i.test(href);
+      });
+    if (accountLinks.length) return accountLinks[0];
+
+    // URL 类名改变时的兜底：在“有声书 + 账号 + 两个数字”的元信息区域里找唯一的文字链接。
+    const links = [...card.querySelectorAll('a[href]')]
+      .filter((a) => {
+        const href = a.getAttribute('href') || '';
+        const text = elementText(a);
+        if (!text || text === title || text.length > 80) return false;
+        if (/\/album\//.test(href)) return false;
+        if (/专辑详情|免费订阅|立即播放|播放全部/.test(text)) return false;
+        return true;
+      });
+
+    return links.find((a) => {
+      let el = a.parentElement;
+      for (let i = 0; i < 4 && el && el !== card; i++, el = el.parentElement) {
+        const t = elementText(el);
+        const nums = extractStandaloneCounts(t);
+        if (nums.length >= 2 && t.length <= 220) return true;
+      }
+      return false;
+    }) || null;
+  }
+
+  function isStandaloneCount(text) {
+    return /^\d+(?:,\d{3})*(?:\.\d+)?(?:万|亿)?$/.test(clean(text));
+  }
+
+  function extractStandaloneCounts(text) {
+    const t = clean(text);
+    if (!t) return [];
+    const matches = t.match(/(?:^|\s)(\d+(?:,\d{3})*(?:\.\d+)?(?:万|亿)?)(?=\s|$)/g) || [];
+    return matches.map((x) => clean(x).replace(/,/g, ''));
+  }
+
+
+  // 喜马拉雅榜单每条数据的核心结构实际是：
+  // “书名  类型标签  账号名  集数  播放数  简介……”
+  // 例如：
+  // “北派盗墓笔记…… 有声书 头陀渊讲故事 1040 4368.5万 我是一个……”
+  // 旧版过度依赖具体 DOM 层级，所以部分卡片虽然页面明明显示了集数，仍会漏抓。
+  // 这里改为从整张卡片可见文本里锁定“连续两个统计数字”，再反推出四个字段。
+  const MEDIA_TYPE_PATTERN = '有声书|其他|广播剧|儿童|相声|评书|音乐|娱乐|人文|历史|情感生活|商业财经|个人成长|外语|教育培训|健康养生|影视|戏曲|二次元|旅游|汽车|科技|播客';
+
+  function extractStandaloneNumberTokens(text) {
+    const t = clean(text);
+    const tokens = [];
+    if (!t) return { text: t, tokens };
+
+    const re = /(?:^|\s)(\d+(?:,\d{3})*(?:\.\d+)?(?:万|亿)?)(?=\s|$)/g;
+    let m;
+    while ((m = re.exec(t))) {
+      const raw = m[1];
+      const offset = m[0].lastIndexOf(raw);
+      const start = m.index + Math.max(0, offset);
+      tokens.push({
+        raw,
+        value: raw.replace(/,/g, ''),
+        start,
+        end: start + raw.length,
+      });
+    }
+    return { text: t, tokens };
+  }
+
+  function parseMetricPairFromText(text) {
+    const parsed = extractStandaloneNumberTokens(text);
+    const t = parsed.text;
+    const tokens = parsed.tokens;
+    let best = null;
+
+    for (let i = 0; i < tokens.length - 1; i++) {
+      const first = tokens[i];
+      const second = tokens[i + 1];
+
+      // 集数应为整数，并且页面通常不会给集数加“万/亿”。
+      if (!/^\d+$/.test(first.value)) continue;
+      if (/万|亿/.test(first.raw)) continue;
+
+      // 两个统计数字在页面上是相邻项；中间只允许空白。
+      const gap = t.slice(first.end, second.start);
+      if (clean(gap) !== '') continue;
+
+      let score = 0;
+      if (/万|亿/.test(second.raw)) score += 20;
+      if (Number(first.value) > 0 && Number(first.value) <= 1000000) score += 5;
+      if (first.start < 260) score += 4;
+      // 越靠前越像榜单第二行，而不是后面的简介/最新一集标题。
+      score -= first.start / 10000;
+
+      const candidate = {
+        score,
+        tracks: first.value,
+        plays: second.value,
+        tracksStart: first.start,
+        tracksEnd: first.end,
+        playsStart: second.start,
+        playsEnd: second.end,
+      };
+
+      if (!best || candidate.score > best.score) best = candidate;
+    }
+
+    return best;
+  }
+
+  function parseStructuredCardText(cardOrText) {
+    const text = typeof cardOrText === 'string' ? clean(cardOrText) : elementText(cardOrText);
+    const pair = parseMetricPairFromText(text);
+    if (!pair) return { title: '', account: '', tracks: '', plays: '' };
+
+    const prefix = clean(text.slice(0, pair.tracksStart));
+    const re = new RegExp(`^(.*)\\s+(${MEDIA_TYPE_PATTERN})\\s+(.+)$`, 'i');
+    const m = prefix.match(re);
+
+    let title = '';
+    let account = '';
+    if (m) {
+      title = clean(m[1]);
+      account = clean(m[3]);
+    }
+
+    return {
+      title,
+      account,
+      tracks: pair.tracks,
+      plays: pair.plays,
+    };
+  }
+
+  // 直接从元信息区域里的独立 DOM 节点取数字。
+  // 这样即使图标、账号名和数字之间没有真实空格，也能准确得到 1040 / 4368.5万。
+  function extractCountsFromElement(container) {
+    if (!container) return [];
+    const found = [];
+    const seen = new Set();
+    const nodes = [container, ...container.querySelectorAll('*')];
+
+    for (const el of nodes) {
+      const text = elementText(el);
+      if (!isStandaloneCount(text)) continue;
+
+      // 如果子元素本身已经是同一个纯数字，父元素不重复记录。
+      const childHasSame = [...el.children].some((child) => elementText(child) === text && isStandaloneCount(text));
+      if (childHasSame) continue;
+
+      const value = text.replace(/,/g, '');
+      if (!seen.has(value)) {
+        seen.add(value);
+        found.push(value);
+      }
+    }
+
+    if (found.length >= 2) return found;
+
+    // DOM 结构不方便时再退回文本分词。
+    for (const value of extractStandaloneCounts(elementText(container))) {
+      if (!seen.has(value)) {
+        seen.add(value);
+        found.push(value);
+      }
+    }
+    return found;
+  }
+
+  function findMetaContainer(card, accountEl) {
+    if (!card) return null;
+
+    if (accountEl) {
+      let el = accountEl;
+      for (let depth = 0; depth < 6 && el && el !== card.parentElement; depth++, el = el.parentElement) {
+        const text = elementText(el);
+        if (!text || text.length > 260) continue;
+        const nums = extractCountsFromElement(el);
+        if (nums.length >= 2) return el;
+      }
+    }
+
+    // 没找到账号节点时，从卡片中找最短的、同时包含两个统计数字的元信息块。
+    const candidates = [...card.querySelectorAll('div,p,span')]
+      .map((el) => ({ el, text: elementText(el) }))
+      .filter((x) => x.text && x.text.length <= 260 && extractCountsFromElement(x.el).length >= 2)
+      .sort((a, b) => a.text.length - b.text.length);
+
+    return candidates[0]?.el || null;
+  }
+
+  // 四项严格对应榜单第二行可见信息：账号名、集数、播放数。
+  // 例如：头陀渊讲故事 | 1040 | 4368.5万
+  function parseVisibleMeta(card, title) {
+    // 第一优先级：直接按整张榜单卡片的固定可见结构解析。
+    // 这能覆盖旧版最容易漏掉的情况：页面显示“782 3920.8万”，但数字外层 DOM 不同。
+    const structured = parseStructuredCardText(card);
+
+    const accountEl = findAccountElement(card, title);
+    const domAccount = elementText(accountEl);
+    const meta = findMetaContainer(card, accountEl);
+    const metaText = elementText(meta);
+    const counts = extractCountsFromElement(meta);
+
+    let account = structured.account || domAccount;
+    let tracks = structured.tracks || counts[0] || '';
+    let plays = structured.plays || counts[1] || '';
+
+    // 最后的兜底才走语义正则/API。
+    if (!tracks) tracks = parseTrackCountFromText(metaText || elementText(card));
+    if (!plays) plays = parsePlayCountFromText(metaText || elementText(card));
+
+    // 防止极端情况下把简介或“购买须知”误当账号。
+    if (account.length > 100 || /购买须知|专辑详情|免费订阅/.test(account)) {
+      account = structured.account || '';
+    }
+
+    return { account, tracks, plays };
+  }
+
+  function parseTrackCountFromText(text) {
+    text = clean(text);
+    const patterns = [
+      /(?:共|总共|全部|已更新|更新至|包含)?\s*([\d,.]+)\s*(?:集|期|个声音|条声音|个节目|条节目)/i,
+      /(?:节目|声音|集数|总集数)\s*[:：]?\s*([\d,.]+)/i,
+    ];
+
+    for (const re of patterns) {
+      const m = text.match(re);
+      if (m?.[1]) return m[1].replace(/,/g, '');
+    }
+    return '';
+  }
+
+  function parsePlayCountFromText(text) {
+    text = clean(text);
+    const patterns = [
+      /(?:总)?播放(?:量|数|次数)?\s*[:：]?\s*([\d,.]+\s*(?:万|亿)?)/i,
+      /([\d,.]+\s*(?:万|亿))\s*(?:次)?播放/i,
+    ];
+
+    for (const re of patterns) {
+      const m = text.match(re);
+      if (m?.[1]) return clean(m[1]).replace(/\s+/g, '');
+    }
+    return '';
+  }
+
+  function parseDomEntries() {
+    const result = [];
+    const seen = new Set();
+
+    for (const link of getAlbumLinks()) {
+      const albumId = extractAlbumId(link.getAttribute('href') || link.href);
+      if (!albumId || seen.has(albumId)) continue;
+
+      // 先用链接第一行作为找卡片的临时标题；最终标题再从整个卡片里精确挑选。
+      const provisionalTitle = firstVisibleLine(
+        link.getAttribute('title') || link.innerText || link.textContent || link.querySelector('img')?.getAttribute('alt') || ''
+      );
+      const card = findAlbumCard(link, provisionalTitle);
+      const title = pickTitleFromCard(card, albumId, link);
+      if (!title || title.length < 2) continue;
+
+      const meta = parseVisibleMeta(card, title);
+
+      seen.add(albumId);
+      result.push({
+        albumId,
+        title,
+        account: meta.account,
+        tracks: meta.tracks,
+        plays: meta.plays,
+        href: new URL(link.getAttribute('href') || link.href, location.origin).href,
+      });
+    }
+
+    return result;
+  }
+
+  async function scanAllCurrentRankingEntries() {
+    const originalY = window.scrollY;
+    const collected = new Map();
+    let stable = 0;
+    let lastHeight = 0;
+
+    const collect = () => {
+      let added = 0;
+      for (const item of parseDomEntries()) {
+        if (!collected.has(item.albumId)) added++;
+        const old = collected.get(item.albumId) || {};
+        collected.set(item.albumId, {
+          ...old,
+          ...item,
+          title: item.title || old.title || '',
+          account: item.account || old.account || '',
+          tracks: item.tracks || old.tracks || '',
+          plays: item.plays || old.plays || '',
+        });
+      }
+      return added;
+    };
+
+    try {
+      window.scrollTo({ top: 0, behavior: 'auto' });
+      await sleep(500);
+
+      while (true) {
+        const beforeAdded = collect();
+        const doc = document.documentElement;
+        const body = document.body;
+        const heightBefore = Math.max(doc.scrollHeight, body?.scrollHeight || 0);
+        const viewport = Math.max(window.innerHeight || 800, 600);
+        const y = window.scrollY;
+        const nearBottom = y + viewport >= heightBefore - 10;
+
+        setStatus(`正在识别当前榜单：已发现 ${collected.size} 本…`);
+
+        if (nearBottom) {
+          window.scrollTo({ top: heightBefore, behavior: 'auto' });
+        } else {
+          window.scrollTo({
+            top: Math.min(y + Math.floor(viewport * 0.85), heightBefore),
+            behavior: 'auto',
+          });
+        }
+
+        await sleep(SCROLL_INTERVAL);
+        const afterAdded = collect();
+        const heightAfter = Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0);
+        const nearBottomAfter = window.scrollY + viewport >= heightAfter - 10;
+        const noNew = beforeAdded === 0 && afterAdded === 0;
+        const heightStable = heightAfter === heightBefore && heightAfter === lastHeight;
+
+        if (nearBottomAfter && noNew && heightStable) stable++;
+        else stable = 0;
+
+        lastHeight = heightAfter;
+        if (stable >= BOTTOM_STABLE_ROUNDS) break;
+      }
+
+      await sleep(250);
+      collect();
+      return [...collected.values()];
+    } finally {
+      window.scrollTo({ top: originalY, behavior: 'auto' });
+    }
+  }
+
+  function firstNonEmpty(...values) {
+    for (const v of values) {
+      if (v !== undefined && v !== null && clean(v) !== '') return v;
+    }
+    return '';
+  }
+
+  function getByKeys(obj, keys) {
+    if (!obj || typeof obj !== 'object') return '';
+    for (const key of keys) {
+      if (Object.prototype.hasOwnProperty.call(obj, key)) {
+        const v = obj[key];
+        if (v !== undefined && v !== null && String(v).trim() !== '') return v;
+      }
+    }
+    return '';
+  }
+
+  function deepFindValue(root, keys, maxDepth = 5) {
+    const visited = new Set();
+    const queue = [{ value: root, depth: 0 }];
+
+    while (queue.length) {
+      const { value, depth } = queue.shift();
+      if (!value || typeof value !== 'object' || visited.has(value)) continue;
+      visited.add(value);
+
+      const direct = getByKeys(value, keys);
+      if (direct !== '') return direct;
+      if (depth >= maxDepth) continue;
+
+      if (Array.isArray(value)) {
+        for (const x of value.slice(0, 30)) queue.push({ value: x, depth: depth + 1 });
+      } else {
+        for (const x of Object.values(value)) {
+          if (x && typeof x === 'object') queue.push({ value: x, depth: depth + 1 });
+        }
+      }
+    }
+    return '';
+  }
+
+  function normalizeCount(v) {
+    if (v === undefined || v === null || v === '') return '';
+    if (typeof v === 'number') return String(v);
+    return clean(v);
+  }
+
+  async function fetchJson(url, timeout = 12000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+      const res = await fetch(url, {
+        method: 'GET',
+        credentials: 'include',
+        headers: {
+          Accept: 'application/json, text/plain, */*',
+          Referer: location.href,
+        },
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      return JSON.parse(text);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function parseSimpleAlbumJson(json) {
+    const data = json?.data || json || {};
+    const main = data?.albumPageMainInfo || data?.albumInfo || data?.album || data;
+
+    const title = firstNonEmpty(
+      getByKeys(main, ['albumTitle', 'albumName', 'title', 'name']),
+      deepFindValue(data, ['albumTitle', 'albumName'])
+    );
+
+    const accountObj = firstNonEmpty(
+      main?.anchorInfo,
+      main?.announcer,
+      main?.anchor,
+      data?.anchorInfo,
+      data?.announcer,
+      data?.anchor
+    );
+
+    let account = '';
+    if (accountObj && typeof accountObj === 'object') {
+      account = getByKeys(accountObj, ['nickname', 'nickName', 'userName', 'anchorName', 'name']);
+    }
+    if (!account) {
+      account = deepFindValue(data, ['anchorName', 'nickname', 'nickName', 'userName'], 4);
+    }
+
+    const tracks = firstNonEmpty(
+      getByKeys(main, ['trackCount', 'trackTotalCount', 'includeTrackCount', 'include_track_count', 'tracksCount', 'totalTrackCount']),
+      deepFindValue(data, ['trackTotalCount', 'includeTrackCount', 'include_track_count', 'trackCount'], 4)
+    );
+
+    const plays = firstNonEmpty(
+      getByKeys(main, ['playCount', 'play_count', 'playsCount', 'playNum', 'playTimes']),
+      deepFindValue(data, ['playCount', 'play_count', 'playsCount'], 4)
+    );
+
+    return {
+      title: clean(title),
+      account: clean(account),
+      tracks: normalizeCount(tracks),
+      plays: normalizeCount(plays),
+    };
+  }
+
+  async function fetchTracksCount(albumId) {
+    try {
+      const url = `/revision/album/v1/getTracksList?albumId=${encodeURIComponent(albumId)}&pageNum=1&sort=0&pageSize=1`;
+      const json = await fetchJson(url);
+      const n = firstNonEmpty(
+        json?.data?.trackTotalCount,
+        json?.data?.totalCount,
+        deepFindValue(json?.data, ['trackTotalCount', 'totalTrackCount'], 3)
+      );
+      return normalizeCount(n);
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function parseAlbumHtml(html, fallbackTitle = '') {
+    try {
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const bodyText = clean(doc.body?.innerText || '');
+
+      let title = clean(
+        doc.querySelector('h1')?.innerText ||
+        doc.querySelector('meta[property="og:title"]')?.getAttribute('content') ||
+        fallbackTitle
+      );
+
+      const accountLink = doc.querySelector('a[href*="/zhubo/"], a[href*="/user/"], a[href*="/profile/"]');
+      let account = elementText(accountLink);
+
+      let tracks = parseTrackCountFromText(bodyText);
+      let plays = parsePlayCountFromText(bodyText);
+
+      // 页面脚本里经常含有SSR JSON，作为兜底再搜一次关键字段
+      const scriptText = [...doc.querySelectorAll('script')]
+        .map((s) => s.textContent || '')
+        .filter((s) => s.length > 50)
+        .join('\n');
+
+      const findJsonText = (patterns) => {
+        for (const re of patterns) {
+          const m = scriptText.match(re);
+          if (m?.[1]) return clean(m[1].replace(/\\u002F/g, '/').replace(/\\"/g, '"'));
+        }
+        return '';
+      };
+
+      if (!account) {
+        account = findJsonText([
+          /"anchorName"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/,
+          /"nickname"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/,
+          /"userName"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/,
+        ]);
+      }
+      if (!tracks) {
+        tracks = findJsonText([
+          /"trackTotalCount"\s*:\s*(\d+)/,
+          /"includeTrackCount"\s*:\s*(\d+)/,
+          /"trackCount"\s*:\s*(\d+)/,
+        ]);
+      }
+      if (!plays) {
+        plays = findJsonText([
+          /"playCount"\s*:\s*(\d+)/,
+          /"play_count"\s*:\s*(\d+)/,
+        ]);
+      }
+
+      return { title, account, tracks, plays };
+    } catch (_) {
+      return { title: fallbackTitle, account: '', tracks: '', plays: '' };
+    }
+  }
+
+  async function fetchAlbumHtmlDetail(albumId, fallbackTitle) {
+    try {
+      const res = await fetch(`/album/${encodeURIComponent(albumId)}`, {
+        credentials: 'include',
+        headers: { Accept: 'text/html,application/xhtml+xml' },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return parseAlbumHtml(await res.text(), fallbackTitle);
+    } catch (_) {
+      return { title: fallbackTitle || '', account: '', tracks: '', plays: '' };
+    }
+  }
+
+  async function enrichAlbum(item) {
+    // 榜单页面四项都已经直接显示时，完全以页面为准，不再额外请求详情接口。
+    // 这样既更快，也不会把页面显示的“4368.5万”替换成接口原始值“43685000”。
+    if (item?.title && item?.account && item?.tracks && item?.plays) {
+      return {
+        书名: clean(item.title),
+        账号名: clean(item.account),
+        集数: clean(item.tracks),
+        播放数: clean(item.plays),
+      };
+    }
+
+    let detail = { title: '', account: '', tracks: '', plays: '' };
+
+    try {
+      const simple = await fetchJson(`/revision/album/v1/simple?albumId=${encodeURIComponent(item.albumId)}`);
+      detail = parseSimpleAlbumJson(simple);
+    } catch (err) {
+      console.warn('[喜马拉雅榜单抓取] simple接口失败：', item.albumId, err);
+    }
+
+    let tracks = firstNonEmpty(item.tracks, detail.tracks);
+    if (!tracks) tracks = await fetchTracksCount(item.albumId);
+
+    let merged = {
+      title: firstNonEmpty(item.title, detail.title),
+      account: firstNonEmpty(item.account, detail.account),
+      tracks,
+      plays: firstNonEmpty(item.plays, detail.plays),
+    };
+
+    if (!merged.account || !merged.tracks || !merged.plays) {
+      const htmlDetail = await fetchAlbumHtmlDetail(item.albumId, merged.title);
+      merged = {
+        title: firstNonEmpty(merged.title, htmlDetail.title),
+        account: firstNonEmpty(merged.account, htmlDetail.account),
+        tracks: firstNonEmpty(merged.tracks, htmlDetail.tracks),
+        plays: firstNonEmpty(merged.plays, htmlDetail.plays),
+      };
+    }
+
+    return {
+      书名: clean(merged.title),
+      账号名: clean(merged.account),
+      集数: clean(merged.tracks),
+      播放数: clean(merged.plays),
+    };
+  }
+
+  async function mapWithConcurrency(items, limit, worker) {
+    const results = new Array(items.length);
+    let next = 0;
+    let done = 0;
+
+    async function runWorker() {
+      while (true) {
+        const idx = next++;
+        if (idx >= items.length) return;
+        try {
+          results[idx] = await worker(items[idx], idx);
+        } catch (err) {
+          console.error('[喜马拉雅榜单抓取] 详情读取失败：', items[idx], err);
+          results[idx] = {
+            书名: items[idx]?.title || '',
+            账号名: items[idx]?.account || '',
+            集数: items[idx]?.tracks || '',
+            播放数: items[idx]?.plays || '',
+          };
+        }
+        done++;
+        setStatus(`正在补全详情：${done}/${items.length}…`);
+        if (DETAIL_INTERVAL > 0) await sleep(DETAIL_INTERVAL);
+      }
+    }
+
+    const workers = Array.from({ length: Math.min(limit, items.length) }, () => runWorker());
+    await Promise.all(workers);
+    return results;
+  }
+
+  async function captureCurrentRanking() {
+    currentRows = [];
+    currentRankingName = parseRankingName();
+    setStatus(`正在识别“${currentRankingName}”实际数量…`);
+
+    const entries = await scanAllCurrentRankingEntries();
+    if (!entries.length) {
+      const err = new Error('没有识别到榜单中的专辑。请确认页面已加载完成，并停留在具体榜单页。');
+      setStatus(`抓取失败：${err.message}`, 'error');
+      throw err;
+    }
+
+    setStatus(`已识别 ${entries.length} 本，正在读取账号名、集数、播放数…`);
+    currentRows = await mapWithConcurrency(entries, DETAIL_CONCURRENCY, enrichAlbum);
+    currentRows = currentRows.filter((r) => r.书名);
+
+    rankingGroups.set(currentRankingName, currentRows);
+    renderPreview(currentRows);
+    renderSavedGroups();
+
+    const missing = currentRows.filter((r) => !r.账号名 || !r.集数 || !r.播放数).length;
+    if (missing) {
+      setStatus(`已保存“${currentRankingName}”：${currentRows.length}本；其中${missing}本有字段未取到`, 'warn');
+    } else {
+      setStatus(`已保存“${currentRankingName}”：${currentRows.length}本；共${rankingGroups.size}个榜单`, 'ok');
+    }
+
+    console.table(currentRows);
+    return currentRows;
+  }
+
+  function safeSheetName(name, usedNames) {
+    let base = String(name || '榜单')
+      .replace(/[\\\/?*\[\]:]/g, '_')
+      .trim()
+      .slice(0, 31) || '榜单';
+
+    let result = base;
+    let n = 2;
+    while (usedNames.has(result)) {
+      const suffix = `_${n++}`;
+      result = base.slice(0, Math.max(1, 31 - suffix.length)) + suffix;
+    }
+    usedNames.add(result);
+    return result;
+  }
+
+  function exportExcel() {
+    if (!rankingGroups.size) {
+      setStatus('还没有抓取任何榜单，请先点“抓取当前榜单”', 'warn');
+      return;
+    }
+    if (typeof XLSX === 'undefined') {
+      setStatus('Excel组件没有加载成功，请刷新页面后重试', 'error');
+      return;
+    }
+
+    const headers = ['书名', '账号名', '集数', '播放数'];
+    const wb = XLSX.utils.book_new();
+    const usedNames = new Set();
+
+    for (const [rankingName, rows] of rankingGroups.entries()) {
+      const data = rows.map((row) => ({
+        书名: row.书名 || '',
+        账号名: row.账号名 || '',
+        集数: row.集数 || '',
+        播放数: row.播放数 || '',
+      }));
+
+      const ws = XLSX.utils.json_to_sheet(data, { header: headers });
+      ws['!cols'] = [
+        { wch: 52 },
+        { wch: 26 },
+        { wch: 14 },
+        { wch: 18 },
+      ];
+      ws['!autofilter'] = { ref: `A1:D${data.length + 1}` };
+
+      XLSX.utils.book_append_sheet(wb, ws, safeSheetName(rankingName, usedNames));
+    }
+
+    const now = new Date();
+    const stamp = [
+      now.getFullYear(),
+      String(now.getMonth() + 1).padStart(2, '0'),
+      String(now.getDate()).padStart(2, '0'),
+      '-',
+      String(now.getHours()).padStart(2, '0'),
+      String(now.getMinutes()).padStart(2, '0'),
+    ].join('');
+
+    const total = [...rankingGroups.values()].reduce((sum, arr) => sum + arr.length, 0);
+    XLSX.writeFile(wb, `喜马拉雅榜单_分表_${stamp}.xlsx`);
+    setStatus(`Excel已导出：${rankingGroups.size}个工作表，共${total}本`, 'ok');
+  }
+
+  async function copyCurrentJson() {
+    if (!currentRows.length) {
+      setStatus('当前榜单还没抓取', 'warn');
+      return;
+    }
+
+    const text = JSON.stringify(currentRows, null, 2);
+    try {
+      if (typeof GM_setClipboard === 'function') GM_setClipboard(text, 'text');
+      else await navigator.clipboard.writeText(text);
+      setStatus(`当前榜单JSON已复制：${currentRows.length}本`, 'ok');
+    } catch (err) {
+      console.error(err);
+      setStatus('复制失败', 'error');
+    }
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;',
+    }[c]));
+  }
+
+  function renderPreview(data) {
+    const box = document.querySelector('#fyf-xm-preview');
+    if (!box) return;
+
+    if (!data.length) {
+      box.innerHTML = '<div class="fyf-empty">当前榜单暂无数据</div>';
+      return;
+    }
+
+    box.innerHTML = data.slice(0, 10).map((row, idx) => `
+      <div class="fyf-row">
+        <div class="fyf-title">${String(idx + 1).padStart(2, '0')} · ${escapeHtml(row.书名 || '(未识别书名)')}</div>
+        <div class="fyf-meta">账号：${escapeHtml(row.账号名 || '未取到')}</div>
+        <div class="fyf-meta">集数：${escapeHtml(row.集数 || '未取到')}　播放：${escapeHtml(row.播放数 || '未取到')}</div>
+      </div>
+    `).join('') + (data.length > 10
+      ? `<div class="fyf-more">当前榜单共 ${data.length} 本，另有 ${data.length - 10} 本未展开</div>`
+      : '');
+  }
+
+  function renderSavedGroups() {
+    const box = document.querySelector('#fyf-xm-groups');
+    if (!box) return;
+
+    if (!rankingGroups.size) {
+      box.innerHTML = '尚未保存榜单';
+      return;
+    }
+
+    box.innerHTML = [...rankingGroups.entries()]
+      .map(([name, data]) => `<div>• ${escapeHtml(name)}：${data.length}本</div>`)
+      .join('');
+  }
+
+  function createPanel() {
+    if (document.getElementById(PANEL_ID)) return;
+
+    const style = document.createElement('style');
+    style.textContent = `
+      #${PANEL_ID}{position:fixed;right:22px;bottom:22px;width:390px;z-index:2147483647;background:rgba(25,28,36,.97);color:#fff;border-radius:14px;box-shadow:0 12px 36px rgba(0,0,0,.28);font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;overflow:hidden}
+      #${PANEL_ID} *{box-sizing:border-box}
+      #${PANEL_ID} .fyf-head{padding:12px 14px 8px;font-weight:700;font-size:14px}
+      #${PANEL_ID} .fyf-sub{display:block;margin-top:3px;color:#9fa7b6;font-size:11px;font-weight:400}
+      #${PANEL_ID} .fyf-actions{padding:8px 12px;display:grid;grid-template-columns:1fr 1fr;gap:8px}
+      #${PANEL_ID} button{border:0;border-radius:9px;padding:9px 8px;cursor:pointer;background:#3c4352;color:#fff;font-weight:600}
+      #${PANEL_ID} button.fyf-primary{background:#ff6a3d}
+      #${PANEL_ID} #fyf-xm-status{margin:0 12px 8px;padding:7px 9px;background:#1e222b;border-radius:8px;color:#c7ceda;font-size:12px}
+      #${PANEL_ID} #fyf-xm-status[data-type="ok"]{color:#a9f0bd}
+      #${PANEL_ID} #fyf-xm-status[data-type="warn"]{color:#ffe08a}
+      #${PANEL_ID} #fyf-xm-status[data-type="error"]{color:#ff9f9f}
+      #${PANEL_ID} .fyf-groups-wrap{margin:0 12px 8px;padding:7px 9px;background:#20252f;border-radius:8px;color:#aeb6c4;font-size:11px;max-height:95px;overflow:auto}
+      #${PANEL_ID} .fyf-groups-title{font-weight:700;color:#d9dee8;margin-bottom:3px}
+      #${PANEL_ID} #fyf-xm-preview{max-height:300px;overflow:auto;border-top:1px solid rgba(255,255,255,.08)}
+      #${PANEL_ID} .fyf-row{padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.06)}
+      #${PANEL_ID} .fyf-title{font-weight:700}
+      #${PANEL_ID} .fyf-meta{color:#aeb6c4;font-size:11px;margin-top:4px}
+      #${PANEL_ID} .fyf-more,#${PANEL_ID} .fyf-empty{padding:10px 12px;color:#9fa7b6;text-align:center}
+    `;
+    document.head.appendChild(style);
+
+    const panel = document.createElement('div');
+    panel.id = PANEL_ID;
+    panel.innerHTML = `
+      <div class="fyf-head">
+        喜马拉雅榜单抓取助手 · 四字段精确版
+        <span class="fyf-sub">字段：书名｜账号名｜集数｜播放数；不同榜单分别保存到Excel工作表</span>
+      </div>
+      <div class="fyf-actions">
+        <button class="fyf-primary" id="fyf-xm-capture">抓取当前榜单（全部）</button>
+        <button id="fyf-xm-export">导出Excel（分表）</button>
+        <button id="fyf-xm-copy">复制当前JSON</button>
+        <button id="fyf-xm-clear">清空全部榜单</button>
+      </div>
+      <div id="fyf-xm-status">等待抓取</div>
+      <div class="fyf-groups-wrap">
+        <div class="fyf-groups-title">本次已保存榜单</div>
+        <div id="fyf-xm-groups">尚未保存榜单</div>
+      </div>
+      <div id="fyf-xm-preview"><div class="fyf-empty">点击“抓取当前榜单（全部）”</div></div>
+    `;
+    document.body.appendChild(panel);
+
+    panel.querySelector('#fyf-xm-capture').addEventListener('click', () =>
+      captureCurrentRanking().catch((err) => {
+        console.error(err);
+        setStatus(`抓取失败：${err.message || err}`, 'error');
+      })
+    );
+
+    panel.querySelector('#fyf-xm-export').addEventListener('click', () => {
+      try { exportExcel(); } catch (err) {
+        console.error(err);
+        setStatus(`Excel导出失败：${err.message || err}`, 'error');
+      }
+    });
+
+    panel.querySelector('#fyf-xm-copy').addEventListener('click', () =>
+      copyCurrentJson().catch(console.error)
+    );
+
+    panel.querySelector('#fyf-xm-clear').addEventListener('click', () => {
+      currentRows = [];
+      currentRankingName = '';
+      rankingGroups.clear();
+      renderPreview([]);
+      renderSavedGroups();
+      setStatus('已清空本次保存的全部榜单');
+    });
+  }
+
+  // 喜马拉雅榜单切换后保留之前已抓的数据，只清空当前预览。
+  function watchNavigation() {
+    let lastUrl = location.href;
+    setInterval(() => {
+      if (location.href === lastUrl) return;
+      lastUrl = location.href;
+      currentRows = [];
+      currentRankingName = '';
+      setTimeout(() => {
+        renderPreview([]);
+        setStatus(`已切换榜单；之前${rankingGroups.size}个榜单仍保留，请抓取当前榜单`);
+      }, 900);
+    }, 500);
+  }
+
+  function init() {
+    createPanel();
+    renderSavedGroups();
+    watchNavigation();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init, { once: true });
+  } else {
+    init();
+  }
+})();

@@ -1,0 +1,2572 @@
+// ==UserScript==
+// @name         童锐内容管理平台 - 一键导出总体与全部专辑 v3.3
+// @namespace    fyf.tongrui.oneclick
+// @version      3.3.0
+// @description  一键抓取总体与全部专辑数据；支持断点、失败重抓、可靠Excel导出，并强化专辑下拉自动打开/搜索/选择。
+// @match        https://cp.idaddy.cn/h5/admin/*
+// @run-at       document-start
+// @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
+// @grant        unsafeWindow
+// @grant        GM_download
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const PAGE = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+  const EVENT_NAME = '__TR_ONECLICK_NETWORK__';
+  const JOB_KEY = '__TR_ONECLICK_JOB_V260__';
+  const CHECKPOINT_DB = '__TR_ONECLICK_CHECKPOINT_DB__';
+  const CHECKPOINT_STORE = 'kv';
+  const CHECKPOINT_META_KEY = 'meta_v260';
+  const MAX_BODY_CHARS = 3_000_000;
+
+  const state = {
+    records: [],
+    logs: [],
+    panel: null,
+    resumeLock: false,
+    retryStartLock: false,
+    cancelRequested: false,
+    overallStep: 0,
+    overallTotal: 9,
+    albumListLoaded: 0,
+    albumListTotal: 0,
+    albumIndex: 0,
+    albumTotal: 0,
+    albumStep: 0,
+    albumStepTotal: 9,
+    currentAlbum: '',
+    success: 0,
+    failed: 0,
+    results: [],
+    savedCount: 0,
+    albums: [],
+    phaseText: '等待开始',
+  };
+
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const now = () => new Date().toISOString();
+  const compact = s => String(s || '').replace(/\s+/g, '').trim();
+  const clean = s => String(s ?? '').replace(/\s+/g, ' ').trim();
+
+  function log(message) {
+    const line = `[${new Date().toLocaleTimeString()}] ${message}`;
+    state.logs.push(line);
+    if (state.logs.length > 1000) state.logs.shift();
+    console.log('[童锐一键导出]', message);
+    render();
+  }
+
+  function detectPageType() {
+    const p = location.pathname;
+    if (p.includes('/statistics_audio')) return 'album_statistics';
+    if (p.includes('/dashboard')) return 'dashboard';
+    if (p.includes('/content/audio')) return 'audio_list';
+    return 'other_admin';
+  }
+
+  function safeJsonParse(text) {
+    if (typeof text !== 'string') return text;
+    const t = text.trim();
+    if (!t) return '';
+    if ((t.startsWith('{') && t.endsWith('}')) || (t.startsWith('[') && t.endsWith(']'))) {
+      try { return JSON.parse(t); } catch (_) {}
+    }
+    return text;
+  }
+
+  function compactBody(body) {
+    if (body == null) return null;
+    try {
+      if (typeof body === 'string') {
+        return body.length > 100000 ? body.slice(0, 100000) + '…[truncated]' : safeJsonParse(body);
+      }
+      if (body instanceof URLSearchParams) return body.toString();
+      if (body instanceof FormData) {
+        const out = {};
+        body.forEach((v, k) => out[k] = typeof v === 'string' ? v : '[file]');
+        return out;
+      }
+      return String(body);
+    } catch (_) {
+      return '[unreadable body]';
+    }
+  }
+
+  function redactHeaders(headers) {
+    const out = {};
+    const sensitive = /(authorization|cookie|set-cookie|token|secret|session|jwt|ticket)/i;
+    try {
+      if (!headers) return out;
+      if (headers instanceof Headers) {
+        headers.forEach((v, k) => out[k] = sensitive.test(k) ? '[REDACTED]' : v);
+      } else if (Array.isArray(headers)) {
+        headers.forEach(([k, v]) => out[k] = sensitive.test(k) ? '[REDACTED]' : String(v));
+      } else if (typeof headers === 'object') {
+        Object.entries(headers).forEach(([k, v]) => out[k] = sensitive.test(k) ? '[REDACTED]' : String(v));
+      }
+    } catch (_) {}
+    return out;
+  }
+
+  function isRelevantApi(url) {
+    try {
+      const u = new URL(url, location.href);
+      if (u.hostname !== 'admin.idaddy.cn') return false;
+      if (!u.pathname.startsWith('/h5/api-combine/')) return false;
+      if (/\/message|\/permissions|\/urls\/prefix|\/user\/detail/.test(u.pathname)) return false;
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function emitNetwork(detail) {
+    try {
+      document.dispatchEvent(new CustomEvent(EVENT_NAME, { detail }));
+    } catch (_) {}
+  }
+
+  function installNetworkHooks() {
+    try {
+      const originalFetch = PAGE.fetch;
+      if (originalFetch && !originalFetch.__trOneClickWrapped) {
+        const wrapped = async function(input, init) {
+          const started = Date.now();
+          let url = '';
+          let method = 'GET';
+          let requestHeaders = {};
+          let requestBody = null;
+          try {
+            url = typeof input === 'string' ? input : (input && input.url) || '';
+            method = (init && init.method) || (input && input.method) || 'GET';
+            requestHeaders = redactHeaders((init && init.headers) || (input && input.headers));
+            requestBody = compactBody(init && init.body);
+          } catch (_) {}
+
+          const response = await originalFetch.apply(this, arguments);
+          if (isRelevantApi(url)) {
+            try {
+              const cloned = response.clone();
+              const ct = cloned.headers.get('content-type') || '';
+              let responseBody = null;
+              if (/json|text|javascript|xml/i.test(ct) || !ct) {
+                const text = await cloned.text();
+                responseBody = text.length > MAX_BODY_CHARS
+                  ? text.slice(0, MAX_BODY_CHARS) + '…[truncated]'
+                  : safeJsonParse(text);
+              }
+              emitNetwork({
+                kind: 'fetch', time: now(), durationMs: Date.now() - started,
+                url, method: String(method).toUpperCase(), requestHeaders, requestBody,
+                status: response.status, responseBody,
+              });
+            } catch (e) {
+              emitNetwork({ kind: 'fetch', time: now(), url, method, status: response.status, captureError: String(e) });
+            }
+          }
+          return response;
+        };
+        wrapped.__trOneClickWrapped = true;
+        PAGE.fetch = wrapped;
+      }
+    } catch (e) {
+      console.warn('[童锐一键导出] fetch hook失败', e);
+    }
+
+    try {
+      const XHR = PAGE.XMLHttpRequest;
+      if (XHR && !XHR.prototype.__trOneClickWrapped) {
+        const origOpen = XHR.prototype.open;
+        const origSend = XHR.prototype.send;
+        const origSetHeader = XHR.prototype.setRequestHeader;
+
+        XHR.prototype.open = function(method, url) {
+          this.__trOneClick = {
+            method: String(method || 'GET').toUpperCase(),
+            url: String(url || ''),
+            requestHeaders: {},
+            started: 0,
+          };
+          return origOpen.apply(this, arguments);
+        };
+
+        XHR.prototype.setRequestHeader = function(k, v) {
+          try {
+            if (this.__trOneClick) {
+              this.__trOneClick.requestHeaders[k] = /(authorization|cookie|set-cookie|token|secret|session|jwt|ticket)/i.test(k)
+                ? '[REDACTED]' : String(v);
+            }
+          } catch (_) {}
+          return origSetHeader.apply(this, arguments);
+        };
+
+        XHR.prototype.send = function(body) {
+          if (this.__trOneClick) {
+            this.__trOneClick.started = Date.now();
+            this.__trOneClick.requestBody = compactBody(body);
+          }
+          this.addEventListener('loadend', () => {
+            try {
+              const p = this.__trOneClick || {};
+              if (!isRelevantApi(p.url || '')) return;
+              let responseBody = null;
+              if (this.responseType === '' || this.responseType === 'text') {
+                const text = String(this.responseText || '');
+                responseBody = text.length > MAX_BODY_CHARS
+                  ? text.slice(0, MAX_BODY_CHARS) + '…[truncated]'
+                  : safeJsonParse(text);
+              } else if (this.responseType === 'json') {
+                responseBody = this.response;
+              }
+              emitNetwork({
+                kind: 'xhr', time: now(), durationMs: p.started ? Date.now() - p.started : null,
+                url: p.url || '', method: p.method || 'GET', requestHeaders: p.requestHeaders || {},
+                requestBody: p.requestBody ?? null, status: this.status, responseBody,
+              });
+            } catch (e) {
+              console.warn('[童锐一键导出] XHR捕获失败', e);
+            }
+          }, { once: true });
+          return origSend.apply(this, arguments);
+        };
+
+        XHR.prototype.__trOneClickWrapped = true;
+      }
+    } catch (e) {
+      console.warn('[童锐一键导出] XHR hook失败', e);
+    }
+  }
+
+  installNetworkHooks();
+  setTimeout(installNetworkHooks, 1200);
+  setTimeout(installNetworkHooks, 5000);
+
+  document.addEventListener(EVENT_NAME, ev => {
+    const record = ev.detail || {};
+    record.pageType = detectPageType();
+    state.records.push(record);
+    if (state.records.length > 5000) state.records.shift();
+    render();
+  });
+
+  function endpointName(url) {
+    try {
+      const u = new URL(url, location.href);
+      const parts = u.pathname.split('/').filter(Boolean);
+      return parts[parts.length - 1] || '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function albumIdFromUrl(url) {
+    try {
+      const u = new URL(url, location.href);
+      const q = u.searchParams.get('audio_id');
+      if (q) return String(q);
+      const m = u.pathname.match(/\/m_cp\/audio\/(\d+)$/);
+      return m ? m[1] : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function dayCountFromRangeUrl(url) {
+    try {
+      const u = new URL(url, location.href);
+      const start = u.searchParams.get('start_time');
+      const end = u.searchParams.get('end_time');
+      if (!start || !end) return null;
+      const s = new Date(start.replace(' ', 'T'));
+      const e = new Date(end.replace(' ', 'T'));
+      if (!Number.isFinite(s.getTime()) || !Number.isFinite(e.getTime())) return null;
+      return Math.round((e - s) / 86400000) + 1;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function classifyAlbumRange(url) {
+    const days = dayCountFromRangeUrl(url);
+    if (days == null) return '';
+    if (days <= 8) return '近7天';
+    if (days <= 35) return '近30天';
+    if (days <= 100) return '近90天';
+    return '';
+  }
+
+  function classifyOverallRange(url) {
+    try {
+      const u = new URL(url, location.href);
+      if (u.searchParams.get('type') === 'month') return '近1年';
+      const start = u.searchParams.get('start_time');
+      const end = u.searchParams.get('end_time');
+      if (!start || !end) return '';
+      const s = new Date(`${start}T00:00:00`);
+      const e = new Date(`${end}T00:00:00`);
+      const days = Math.round((e - s) / 86400000) + 1;
+      return days <= 8 ? '近7天' : '近30天';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function latestRecord(predicate, afterIndex = 0) {
+    for (let i = state.records.length - 1; i >= afterIndex; i--) {
+      const r = state.records[i];
+      if (r && Number(r.status) === 200 && predicate(r)) return r;
+    }
+    return null;
+  }
+
+  async function waitForRecord(predicate, afterIndex = 0, timeout = 15000) {
+    const started = Date.now();
+    while (Date.now() - started < timeout) {
+      const hit = latestRecord(predicate, afterIndex);
+      if (hit) return hit;
+      if (state.cancelRequested) return null;
+      await sleep(120);
+    }
+    return null;
+  }
+
+  function toNumber(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const n = Number(String(value).replace(/,/g, ''));
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function isVisible(el) {
+    if (!el || !(el instanceof Element)) return false;
+    const r = el.getBoundingClientRect();
+    const s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+  }
+
+  function findClickableByText(text) {
+    const target = compact(text);
+    const nodes = Array.from(document.querySelectorAll('[role="tab"],button,a,.ant-tabs-tab,.el-tabs__item,.van-tab,li,span,div'));
+    const exact = nodes.filter(el => isVisible(el) && compact(el.textContent) === target);
+    if (!exact.length) return null;
+    exact.sort((a, b) => {
+      const score = el => {
+        let s = 0;
+        if (el.matches('button,[role="tab"],a,.ant-tabs-tab,.el-tabs__item,.van-tab')) s += 10;
+        if (!el.children.length) s += 2;
+        const r = el.getBoundingClientRect();
+        if (r.width < 400 && r.height < 120) s += 2;
+        return s;
+      };
+      return score(b) - score(a);
+    });
+    return exact[0].closest('button,[role="tab"],a,.ant-tabs-tab,.el-tabs__item,.van-tab') || exact[0];
+  }
+
+  async function clickText(text) {
+    const el = findClickableByText(text);
+    if (!el) return false;
+    try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' }); } catch (_) {}
+    await sleep(100);
+    try {
+      el.click();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function loadJob() {
+    try {
+      const raw = localStorage.getItem(JOB_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function saveJob(job) {
+    try {
+      localStorage.setItem(JOB_KEY, JSON.stringify(job));
+      return true;
+    } catch (e) {
+      console.error(e);
+      return false;
+    }
+  }
+
+  function clearJob() {
+    try { localStorage.removeItem(JOB_KEY); } catch (_) {}
+  }
+
+  function openCheckpointDb() {
+    return new Promise((resolve, reject) => {
+      try {
+        const req = indexedDB.open(CHECKPOINT_DB, 1);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains(CHECKPOINT_STORE)) {
+            db.createObjectStore(CHECKPOINT_STORE, { keyPath: 'key' });
+          }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error || new Error('断点数据库打开失败'));
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
+  async function checkpointGet(key) {
+    const db = await openCheckpointDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(CHECKPOINT_STORE, 'readonly');
+      const req = tx.objectStore(CHECKPOINT_STORE).get(key);
+      req.onsuccess = () => resolve(req.result ? req.result.value : null);
+      req.onerror = () => reject(req.error || new Error('读取断点失败'));
+      tx.oncomplete = () => db.close();
+    });
+  }
+
+  async function checkpointPut(key, value) {
+    const db = await openCheckpointDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(CHECKPOINT_STORE, 'readwrite');
+      tx.objectStore(CHECKPOINT_STORE).put({ key, value });
+      tx.oncomplete = () => { db.close(); resolve(true); };
+      tx.onerror = () => { const e = tx.error; db.close(); reject(e || new Error('保存断点失败')); };
+    });
+  }
+
+  async function checkpointClearAll() {
+    const db = await openCheckpointDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(CHECKPOINT_STORE, 'readwrite');
+      tx.objectStore(CHECKPOINT_STORE).clear();
+      tx.oncomplete = () => { db.close(); resolve(true); };
+      tx.onerror = () => { const e = tx.error; db.close(); reject(e || new Error('清除断点失败')); };
+    });
+  }
+
+  async function loadCheckpointMeta() {
+    try { return await checkpointGet(CHECKPOINT_META_KEY); }
+    catch (e) { console.warn('[童锐一键导出] 读取断点元数据失败', e); return null; }
+  }
+
+  async function loadSavedResults() {
+    try {
+      const db = await openCheckpointDb();
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction(CHECKPOINT_STORE, 'readonly');
+        const req = tx.objectStore(CHECKPOINT_STORE).getAll();
+        req.onsuccess = () => {
+          const rows = (req.result || [])
+            .filter(x => String(x.key || '').startsWith('result:'))
+            .map(x => x.value)
+            .filter(Boolean);
+          resolve(rows);
+        };
+        req.onerror = () => reject(req.error || new Error('读取已保存专辑失败'));
+        tx.oncomplete = () => db.close();
+      });
+    } catch (e) {
+      console.warn('[童锐一键导出] 读取已保存专辑失败', e);
+      return [];
+    }
+  }
+
+  async function saveCheckpointMeta(job, complete = false) {
+    if (!job) return;
+    const albums = Array.isArray(job.albums) && job.albums.length
+      ? job.albums
+      : (Array.isArray(job.catalog?.albums) ? job.catalog.albums : []);
+    const meta = {
+      version: '3.3.0',
+      savedAt: now(),
+      startedAt: job.startedAt || '',
+      returnUrl: job.returnUrl || location.href,
+      phase: job.phase || '',
+      complete: !!complete,
+      overall: job.overall || null,
+      catalog: job.catalog || null,
+      albums,
+      total: Number(job.catalog?.total || albums.length || 0),
+    };
+    try { await checkpointPut(CHECKPOINT_META_KEY, meta); }
+    catch (e) { log(`断点元数据保存失败：${e && e.message ? e.message : e}`); }
+  }
+
+  async function saveCheckpointResult(result) {
+    const id = String(result?.audioId || '');
+    if (!id) return;
+    try {
+      const old = await checkpointGet(`result:${id}`);
+      await checkpointPut(`result:${id}`, result);
+      if (!old) state.savedCount++;
+    } catch (e) {
+      log(`专辑断点保存失败：${result?.name || id} → ${e && e.message ? e.message : e}`);
+    }
+  }
+
+  async function restoreCheckpointState() {
+    const [meta, results] = await Promise.all([loadCheckpointMeta(), loadSavedResults()]);
+    state.savedCount = results.length;
+    state.results = results;
+    state.success = results.filter(x => x?.status === '成功').length;
+    state.failed = results.filter(x => x?.status !== '成功').length;
+    if (meta?.overall) state.overallStep = state.overallTotal;
+    if (Array.isArray(meta?.albums) && meta.albums.length) {
+      state.albums = meta.albums;
+      state.albumListLoaded = meta.albums.length;
+      state.albumListTotal = Number(meta.total || meta.albums.length);
+      state.albumTotal = meta.albums.length;
+      state.albumIndex = Math.min(results.length, meta.albums.length);
+    }
+    if (results.length && !loadJob()?.active) {
+      state.phaseText = meta?.complete
+        ? `已完成，断点保留 ${results.length} 个专辑`
+        : `检测到断点：已保存 ${results.length} 个专辑`;
+    }
+    render();
+  }
+
+  function scrapeOverviewDom() {
+    const labels = ['总播放量', '累计设备数', '弹幕数', '点评数', '收藏数'];
+    const out = {};
+    for (const label of labels) {
+      const node = Array.from(document.querySelectorAll('div,span,p,dt,dd'))
+        .find(el => isVisible(el) && compact(el.textContent) === compact(label));
+      if (!node) continue;
+      let parent = node.parentElement;
+      let raw = '';
+      for (let i = 0; parent && i < 4; i++, parent = parent.parentElement) {
+        const t = String(parent.innerText || '').trim();
+        if (t.length > raw.length && t.length < 220) raw = t;
+      }
+      out[label] = raw;
+    }
+    return out;
+  }
+
+  function domNumber(raw) {
+    raw = String(raw || '');
+    const m = raw.match(/([0-9][0-9,]*(?:\.[0-9]+)?)/);
+    if (!m) return null;
+    let n = Number(m[1].replace(/,/g, ''));
+    if (!Number.isFinite(n)) return null;
+    if (raw.includes('万')) n = Math.round(n * 10000);
+    return n;
+  }
+
+  function normalizeOverall() {
+    const totalRec = latestRecord(r => endpointName(r.url) === 'total_play_comment');
+    let api = {};
+    try { api = totalRec.responseBody.data.audio || {}; } catch (_) {}
+    const dom = scrapeOverviewDom();
+    const overview = {
+      total_play: toNumber(api.total_play) ?? domNumber(dom['总播放量']),
+      total_devices: toNumber(api.total_devices) ?? domNumber(dom['累计设备数']),
+      total_danmaku: toNumber(api.total_danmaku) ?? domNumber(dom['弹幕数']),
+      total_comment: toNumber(api.total_comment) ?? domNumber(dom['点评数']),
+      total_favorite: toNumber(api.total_favorite) ?? domNumber(dom['收藏数']),
+    };
+
+    const ranges = {};
+    for (const rangeName of ['近7天', '近30天', '近1年']) {
+      const map = new Map();
+      const ensure = d => {
+        if (!map.has(d)) map.set(d, { date: d, play: null, device: null, newDevice: null, comment: null });
+        return map.get(d);
+      };
+
+      const playRec = latestRecord(r => endpointName(r.url) === 'work_play' && classifyOverallRange(r.url) === rangeName);
+      const devRec = latestRecord(r => endpointName(r.url) === 'play_device' && classifyOverallRange(r.url) === rangeName);
+      const comRec = latestRecord(r => endpointName(r.url) === 'work_comment' && classifyOverallRange(r.url) === rangeName);
+
+      try {
+        for (const x of playRec.responseBody.data.audio || []) {
+          const d = String(x.date || ''); if (d) ensure(d).play = toNumber(x.total_play_count);
+        }
+      } catch (_) {}
+      try {
+        for (const x of devRec.responseBody.data.audio || []) {
+          const d = String(x.date || ''); if (!d) continue;
+          const row = ensure(d);
+          if (String(x.type || '').includes('新增')) row.newDevice = toNumber(x.device_count);
+          else row.device = toNumber(x.device_count);
+        }
+      } catch (_) {}
+      try {
+        for (const x of comRec.responseBody.data.audio || []) {
+          const d = String(x.date || ''); if (d) ensure(d).comment = toNumber(x.total_comment_count);
+        }
+      } catch (_) {}
+
+      ranges[rangeName] = Array.from(map.values()).sort((a, b) => a.date.localeCompare(b.date));
+    }
+
+    return { overview, ranges, capturedAt: now() };
+  }
+
+  async function runOverallPhase(job) {
+    state.phaseText = '抓取总体数据';
+    state.overallStep = 0;
+    render();
+    log('开始抓取总体数据（7天 / 30天 / 1年）。');
+
+    await waitForRecord(r => endpointName(r.url) === 'total_play_comment', 0, 16000);
+
+    const tasks = [
+      ['播放趋势', 'work_play'],
+      ['播放设备趋势', 'play_device'],
+      ['点评趋势', 'work_comment'],
+    ];
+    const ranges = ['近7天', '近30天', '近1年'];
+
+    for (const [metric, endpoint] of tasks) {
+      if (state.cancelRequested) throw new Error('用户停止任务');
+      await clickText(metric);
+      await sleep(350);
+      for (const range of ranges) {
+        if (state.cancelRequested) throw new Error('用户停止任务');
+        const mark = state.records.length;
+        await clickText(range);
+        let rec = await waitForRecord(
+          r => endpointName(r.url) === endpoint && classifyOverallRange(r.url) === range,
+          mark,
+          12000
+        );
+        if (!rec) {
+          log(`总体 ${metric}/${range} 首次未捕获，重试一次。`);
+          const mark2 = state.records.length;
+          await clickText(range);
+          rec = await waitForRecord(
+            r => endpointName(r.url) === endpoint && classifyOverallRange(r.url) === range,
+            mark2,
+            12000
+          );
+        }
+        state.overallStep++;
+        render();
+        if (!rec) log(`总体 ${metric}/${range} 未捕获到接口。`);
+        await sleep(120);
+      }
+    }
+
+    job.overall = normalizeOverall();
+    job.phase = 'need_album_catalog';
+    job.catalog = { page: 1, total: 0, albums: [] };
+    saveJob(job);
+    await saveCheckpointMeta(job, false);
+    log('总体数据完成，正在前往音频管理分页读取全部专辑。');
+    await sleep(700);
+    location.href = 'https://cp.idaddy.cn/h5/admin/content/audio?keyword=&page=1&tabKey=-1';
+  }
+
+  function albumListRecords() {
+    return state.records.filter(r => {
+      try {
+        const u = new URL(r.url, location.href);
+        return Number(r.status) === 200 && u.pathname === '/h5/api-combine/m_cp/audio' &&
+          r.responseBody && r.responseBody.data && Array.isArray(r.responseBody.data.list);
+      } catch (_) {
+        return false;
+      }
+    });
+  }
+
+  function extractAlbums() {
+    const map = new Map();
+    let total = 0;
+    for (const rec of albumListRecords()) {
+      const data = rec.responseBody.data || {};
+      total = Math.max(total, Number(data.count || 0));
+      for (const item of data.list || []) {
+        const id = String(item.audio_id || '');
+        if (!id) continue;
+        map.set(id, {
+          audioId: id,
+          name: clean(item.audio_name || id),
+          totalPlay: toNumber(item.statis && item.statis.audio_playtimes),
+          favorite: toNumber(item.statis && item.statis.audio_favtimes),
+          chapters: toNumber(item.chapter_overview && item.chapter_overview.valid_count) ??
+            toNumber(item.chapter_count_new) ?? toNumber(item.chapter_count),
+          waitingChapters: toNumber(item.chapter_overview && item.chapter_overview.waiting_count),
+          onsaleTs: item.onsale_ts || '',
+          auditStatus: item.audit_status,
+        });
+      }
+    }
+    return { albums: Array.from(map.values()), total: total || map.size };
+  }
+
+
+  function normalizeAlbumItem(item) {
+    if (!item || item.audio_id == null) return null;
+    const id = String(item.audio_id || '');
+    if (!id) return null;
+    return {
+      audioId: id,
+      name: clean(item.audio_name || id),
+      totalPlay: toNumber(item.statis && item.statis.audio_playtimes),
+      favorite: toNumber(item.statis && item.statis.audio_favtimes),
+      chapters: toNumber(item.chapter_overview && item.chapter_overview.valid_count) ??
+        toNumber(item.chapter_count_new) ?? toNumber(item.chapter_count),
+      waitingChapters: toNumber(item.chapter_overview && item.chapter_overview.waiting_count),
+      onsaleTs: item.onsale_ts || '',
+      auditStatus: item.audit_status,
+    };
+  }
+
+  function currentAudioListPage() {
+    try {
+      return Math.max(1, Number(new URL(location.href).searchParams.get('page') || 1) || 1);
+    } catch (_) {
+      return 1;
+    }
+  }
+
+  function audioListRecordForPage(page) {
+    return latestRecord(r => {
+      try {
+        const u = new URL(r.url, location.href);
+        if (u.pathname !== '/h5/api-combine/m_cp/audio') return false;
+        if (!Array.isArray(r.responseBody?.data?.list)) return false;
+        const p = Number(u.searchParams.get('page') || 1) || 1;
+        return p === Number(page);
+      } catch (_) {
+        return false;
+      }
+    });
+  }
+
+  function mergeCatalog(job, rec) {
+    job.catalog = job.catalog || { page: 1, total: 0, albums: [] };
+    const map = new Map((job.catalog.albums || []).map(x => [String(x.audioId), x]));
+    const data = rec?.responseBody?.data || {};
+    const list = Array.isArray(data.list) ? data.list : [];
+    for (const item of list) {
+      const normalized = normalizeAlbumItem(item);
+      if (normalized) map.set(String(normalized.audioId), normalized);
+    }
+    job.catalog.albums = Array.from(map.values());
+    job.catalog.total = Math.max(Number(job.catalog.total || 0), Number(data.count || 0), map.size);
+    return { listLength: list.length, total: job.catalog.total, loaded: map.size };
+  }
+
+  async function runAlbumCatalogPage(job) {
+    state.phaseText = '分页读取全部专辑';
+    state.currentAlbum = '—';
+    state.albumIndex = 0;
+    state.albumTotal = 0;
+    state.albumStep = 0;
+    render();
+
+    const page = currentAudioListPage();
+    job.catalog = job.catalog || { page: page, total: 0, albums: [] };
+    job.catalog.page = page;
+    saveJob(job);
+    await saveCheckpointMeta(job, false);
+
+    log(`读取音频管理专辑列表：第 ${page} 页。`);
+    let rec = audioListRecordForPage(page);
+    if (!rec) {
+      rec = await waitForRecord(r => {
+        try {
+          const u = new URL(r.url, location.href);
+          return u.pathname === '/h5/api-combine/m_cp/audio' &&
+            Number(u.searchParams.get('page') || 1) === page &&
+            Array.isArray(r.responseBody?.data?.list);
+        } catch (_) { return false; }
+      }, 0, 18000);
+    }
+    if (!rec) throw new Error(`音频管理第 ${page} 页没有捕获到专辑列表接口。`);
+
+    const merged = mergeCatalog(job, rec);
+    state.albumListLoaded = merged.loaded;
+    state.albumListTotal = merged.total;
+    render();
+    log(`专辑列表第 ${page} 页完成：累计 ${merged.loaded}/${merged.total || '?'}。`);
+    saveJob(job);
+    await saveCheckpointMeta(job, false);
+
+    if (merged.total > 0 && merged.loaded >= merged.total) {
+      job.albums = job.catalog.albums;
+      job.phase = 'need_albums';
+      saveJob(job);
+      await saveCheckpointMeta(job, false);
+      log(`全部专辑列表读取完成，共 ${job.albums.length} 个。正在返回作品数据页。`);
+      await sleep(500);
+      location.href = job.returnUrl;
+      return;
+    }
+
+    if (!merged.listLength) {
+      // 没有更多列表时，使用已累计数据继续，避免死循环。
+      job.albums = job.catalog.albums;
+      job.phase = 'need_albums';
+      saveJob(job);
+      await saveCheckpointMeta(job, false);
+      log(`第 ${page} 页返回为空，停止分页；已累计 ${job.albums.length}/${merged.total || '?'} 个专辑。`);
+      await sleep(500);
+      location.href = job.returnUrl;
+      return;
+    }
+
+    const nextPage = page + 1;
+    if (nextPage > 20) throw new Error('专辑分页超过20页，已停止以避免异常循环。');
+    job.catalog.page = nextPage;
+    saveJob(job);
+    await saveCheckpointMeta(job, false);
+    await sleep(450);
+    location.href = `https://cp.idaddy.cn/h5/admin/content/audio?keyword=&page=${nextPage}&tabKey=-1`;
+  }
+
+  function albumDropdownTitle() {
+    const detailRec = latestRecord(r => {
+      try { return /\/m_cp\/audio\/\d+$/.test(new URL(r.url, location.href).pathname); }
+      catch (_) { return false; }
+    });
+    try { return clean(detailRec?.responseBody?.data?.audio_name || ''); } catch (_) { return ''; }
+  }
+
+  function goodDropdownRect(el) {
+    if (!isVisible(el)) return false;
+    if (el.closest && el.closest('#__tr_oneclick_panel__')) return false;
+    const r = el.getBoundingClientRect();
+    return r.top >= 40 && r.top < 320 && r.left > window.innerWidth * 0.38 &&
+      r.width >= 120 && r.width <= 760 && r.height >= 24 && r.height <= 160;
+  }
+
+  function findAlbumDropdownTriggers() {
+    const found = [];
+    const seen = new Set();
+    const push = (el, bonus = 0) => {
+      if (!el || seen.has(el) || !goodDropdownRect(el)) return;
+      seen.add(el);
+      found.push({ el, bonus });
+    };
+
+    const title = albumDropdownTitle();
+    const prefix = compact(title).slice(0, Math.min(18, compact(title).length));
+
+    // 1. 当前专辑标题是最可靠的锚点：从标题节点向上找真正可点击的卡片/选择器。
+    if (prefix) {
+      const nodes = Array.from(document.querySelectorAll('div,span,button,p,strong'))
+        .filter(isVisible)
+        .filter(el => !el.closest?.('#__tr_oneclick_panel__'))
+        .filter(el => compact(el.textContent).includes(prefix));
+      for (const node of nodes) {
+        const clickable = node.closest?.('button,[role="button"],[role="combobox"],[aria-haspopup],a');
+        if (clickable) push(clickable, 180);
+        let el = node;
+        for (let i = 0; el && i < 8; i++, el = el.parentElement) push(el, 145 - i * 9);
+      }
+    }
+
+    // 2. 标准下拉/选择器结构。
+    for (const el of document.querySelectorAll(
+      '[role="combobox"],[aria-haspopup="listbox"],[aria-haspopup="menu"],.ant-select-selector,.ant-select,.el-select__wrapper,.el-select,[class*="select"],[class*="Select"]'
+    )) push(el, 60);
+
+    // 3. 童锐这里的选择器通常带专辑封面。封面所在的右上卡片也作为强候选。
+    for (const img of Array.from(document.querySelectorAll('img')).filter(isVisible)) {
+      const ir = img.getBoundingClientRect();
+      if (ir.top < 40 || ir.top > 280 || ir.left < window.innerWidth * 0.45) continue;
+      let el = img;
+      for (let i = 0; el && i < 7; i++, el = el.parentElement) {
+        const r = el.getBoundingClientRect();
+        const t = clean(el.textContent);
+        if (r.width >= 170 && r.width <= 620 && r.height >= 40 && r.height <= 130 && t && t.length <= 260) {
+          push(el, 110 - i * 7);
+        }
+      }
+    }
+
+    // 4. 几何兜底：右上区域、有文字、有箭头/图标的卡片。
+    const geo = Array.from(document.querySelectorAll('div,button,span'))
+      .filter(isVisible)
+      .filter(el => !el.closest?.('#__tr_oneclick_panel__'))
+      .filter(el => {
+        const r = el.getBoundingClientRect();
+        const t = clean(el.textContent);
+        if (r.top < 45 || r.top > 285 || r.left < window.innerWidth * 0.48) return false;
+        if (r.width < 150 || r.width > 620 || r.height < 28 || r.height > 130) return false;
+        if (!t || t.length < 3 || t.length > 260) return false;
+        if (/播放数|设备数|销售数据|近7天|近30天|近90天|童锐一键导出|搜索你想找/.test(t)) return false;
+        return !!el.querySelector?.('svg,i,[class*="arrow"],[class*="Arrow"],[class*="icon"],[class*="Icon"],img');
+      });
+    for (const el of geo) push(el, 75);
+
+    found.sort((a, b) => {
+      const score = item => {
+        const el = item.el;
+        const r = el.getBoundingClientRect();
+        const t = compact(el.textContent);
+        let s = item.bonus || 0;
+        if (prefix && t.includes(prefix)) s += 180;
+        if (el.matches('[role="combobox"],[aria-haspopup="listbox"],.ant-select-selector,.el-select__wrapper')) s += 50;
+        if (el.querySelector?.('svg,[class*="arrow"],[class*="Arrow"]')) s += 25;
+        if (el.querySelector?.('img')) s += 22;
+        if (getComputedStyle(el).cursor === 'pointer') s += 18;
+        s -= Math.abs(r.height - 58) / 7 + Math.abs(r.width - 300) / 120;
+        return s;
+      };
+      return score(b) - score(a);
+    });
+    return found.map(x => x.el);
+  }
+
+  function findAlbumSearchInput() {
+    const inputs = Array.from(document.querySelectorAll('input'))
+      .filter(isVisible)
+      .filter(input => !input.closest?.('#__tr_oneclick_panel__'));
+
+    let hit = inputs.find(input => /搜索你想找的专辑名称或ID|专辑名称或ID|名称或ID/.test(String(input.placeholder || '')));
+    if (hit) return hit;
+    hit = inputs.find(input => /专辑|想找/.test(String(input.placeholder || '')));
+    if (hit) return hit;
+
+    // 位置兜底必须同时满足右上区域，避免把日期输入框当成专辑搜索框。
+    hit = inputs.find(input => {
+      const r = input.getBoundingClientRect();
+      if (!(r.top >= 45 && r.top < 340 && r.left > window.innerWidth * 0.52 && r.width >= 150 && r.height >= 24)) return false;
+      const parentText = clean(input.parentElement?.parentElement?.textContent || '');
+      return /搜索/.test(parentText) || input.type === 'text' || !input.type;
+    });
+    return hit || null;
+  }
+
+  async function fireOpenClick(el) {
+    if (!el || state.cancelRequested) return;
+    try { el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' }); } catch (_) {}
+    try { el.focus?.({ preventScroll: true }); } catch (_) {}
+    const r = el.getBoundingClientRect?.();
+    const init = {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+      buttons: 1,
+      clientX: r ? r.left + Math.min(Math.max(r.width / 2, 4), Math.max(4, r.width - 4)) : 1,
+      clientY: r ? r.top + Math.min(Math.max(r.height / 2, 4), Math.max(4, r.height - 4)) : 1,
+    };
+    try { el.dispatchEvent(new PointerEvent('pointerover', { ...init, pointerId: 1, pointerType: 'mouse', isPrimary: true })); } catch (_) {}
+    try { el.dispatchEvent(new MouseEvent('mouseover', init)); } catch (_) {}
+    try { el.dispatchEvent(new PointerEvent('pointerdown', { ...init, pointerId: 1, pointerType: 'mouse', isPrimary: true })); } catch (_) {}
+    try { el.dispatchEvent(new MouseEvent('mousedown', init)); } catch (_) {}
+    try { el.dispatchEvent(new PointerEvent('pointerup', { ...init, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true })); } catch (_) {}
+    try { el.dispatchEvent(new MouseEvent('mouseup', { ...init, buttons: 0 })); } catch (_) {}
+    try { el.click(); } catch (_) {}
+  }
+
+  function dropdownRootForInput(input) {
+    if (!input) return null;
+    let best = null;
+    let bestArea = Infinity;
+    let el = input;
+    for (let i = 0; el && i < 12; i++, el = el.parentElement) {
+      if (!isVisible(el) || el.closest?.('#__tr_oneclick_panel__')) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 180 || r.width > 850 || r.height < 54 || r.height > 820) continue;
+      if (r.left < window.innerWidth * 0.28) continue;
+      const hasSearch = Array.from(el.querySelectorAll?.('button,a,span,div') || [])
+        .some(x => isVisible(x) && compact(x.textContent) === '搜索');
+      if (!el.contains(input)) continue;
+      const area = r.width * r.height;
+      if ((hasSearch || r.height >= 95) && area < bestArea) {
+        best = el;
+        bestArea = area;
+      }
+    }
+    if (best) return best;
+
+    const ir = input.getBoundingClientRect();
+    const overlays = Array.from(document.querySelectorAll(
+      '.ant-select-dropdown,.el-select-dropdown,[role="listbox"],[class*="dropdown"],[class*="Dropdown"],[class*="popover"],[class*="Popover"],[class*="popup"],[class*="Popup"]'
+    )).filter(isVisible).filter(x => !x.closest?.('#__tr_oneclick_panel__'));
+    overlays.sort((a, b) => {
+      const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+      const da = Math.abs(ra.left - ir.left) + Math.abs(ra.top - ir.top);
+      const db = Math.abs(rb.left - ir.left) + Math.abs(rb.top - ir.top);
+      return da - db;
+    });
+    return overlays[0] || input.parentElement || document.body;
+  }
+
+  function findAlbumSearchButton(input) {
+    const ir = input?.getBoundingClientRect?.();
+    const pools = [];
+    const root = dropdownRootForInput(input);
+    if (root) pools.push(root);
+    pools.push(document);
+    const seen = new Set();
+    const nodes = [];
+    for (const pool of pools) {
+      for (const el of pool.querySelectorAll('button,a,span,div')) {
+        if (seen.has(el) || !isVisible(el) || el.closest?.('#__tr_oneclick_panel__')) continue;
+        seen.add(el);
+        if (compact(el.textContent) !== '搜索') continue;
+        if (ir) {
+          const r = el.getBoundingClientRect();
+          if (Math.abs(r.top - ir.top) > 90) continue;
+          if (r.left < ir.left - 40 || r.left > ir.right + 240) continue;
+        }
+        nodes.push(el.closest('button,a,[role="button"]') || el);
+      }
+    }
+    nodes.sort((a, b) => {
+      const score = el => {
+        const r = el.getBoundingClientRect();
+        let s = 0;
+        if (el.matches('button,a,[role="button"]')) s += 40;
+        if (ir) {
+          s -= Math.abs(r.top - ir.top) / 5;
+          if (r.left >= ir.right - 25) s += 25;
+        }
+        return s;
+      };
+      return score(b) - score(a);
+    });
+    return nodes[0] || null;
+  }
+
+  function isAlbumSearchUiOpen(input) {
+    if (!input || !isVisible(input)) return false;
+    const r = input.getBoundingClientRect();
+    if (r.left < window.innerWidth * 0.45 || r.top < 35 || r.top > 380) return false;
+    return !!findAlbumSearchButton(input);
+  }
+
+  async function waitStableAlbumSearchInput(timeout = 1800) {
+    const started = Date.now();
+    let last = null;
+    let stableSince = 0;
+    while (Date.now() - started < timeout) {
+      if (state.cancelRequested) return null;
+      const input = findAlbumSearchInput();
+      if (input && isAlbumSearchUiOpen(input)) {
+        if (input === last) {
+          if (!stableSince) stableSince = Date.now();
+          if (Date.now() - stableSince >= 140) return input;
+        } else {
+          last = input;
+          stableSince = Date.now();
+        }
+      } else {
+        last = null;
+        stableSince = 0;
+      }
+      await sleep(60);
+    }
+    return null;
+  }
+
+  async function openAlbumDropdown() {
+    if (state.cancelRequested) return null;
+
+    // 如果下拉搜索框已经真实展开，直接复用。不要先按 Escape 再重新打开，
+    // 否则童锐的关闭动画会让脚本抓到“正在消失的旧输入框”。
+    let input = await waitStableAlbumSearchInput(260);
+    if (input) return input;
+
+    const triggers = findAlbumDropdownTriggers();
+    for (const trigger of triggers.slice(0, 20)) {
+      if (state.cancelRequested) return null;
+
+      const clickTargets = [
+        trigger,
+        trigger.querySelector?.('[class*="arrow"],[class*="Arrow"],[class*="suffix"],[class*="Suffix"],svg,i'),
+        trigger.querySelector?.('img'),
+      ].filter(Boolean);
+
+      for (const target of clickTargets) {
+        await fireOpenClick(target);
+        input = await waitStableAlbumSearchInput(1200);
+        if (input) {
+          log('专辑下拉框已自动打开。');
+          return input;
+        }
+      }
+    }
+
+    // 最后一次兜底：对右上最像“当前专辑卡片”的候选做一次双击式触发。
+    const fallback = triggers[0];
+    if (fallback) {
+      await fireOpenClick(fallback);
+      await sleep(120);
+      await fireOpenClick(fallback);
+      input = await waitStableAlbumSearchInput(1500);
+      if (input) return input;
+    }
+    return null;
+  }
+
+  function nativeSetInputValue(input, value) {
+    if (!input) return;
+    try { input.focus(); } catch (_) {}
+    try {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      if (setter) setter.call(input, value);
+      else input.value = value;
+    } catch (_) {
+      input.value = value;
+    }
+    try {
+      input.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        cancelable: true,
+        inputType: value ? 'insertText' : 'deleteContentBackward',
+        data: value ? String(value).slice(-1) : null,
+      }));
+    } catch (_) {
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    try { input.dispatchEvent(new KeyboardEvent('keyup', { key: value ? String(value).slice(-1) : 'Backspace', bubbles: true })); } catch (_) {}
+  }
+
+  async function submitAlbumSearch(input) {
+    if (!input || state.cancelRequested) return false;
+    const btn = findAlbumSearchButton(input);
+    if (btn) {
+      await fireOpenClick(btn);
+      await sleep(180);
+      return true;
+    }
+    try { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true })); } catch (_) {}
+    try { input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true })); } catch (_) {}
+    await sleep(180);
+    return true;
+  }
+
+  function candidateAlbumResultContainers(input) {
+    const out = [];
+    const seen = new Set();
+    const add = el => {
+      if (!el || seen.has(el) || !isVisible(el) || el.closest?.('#__tr_oneclick_panel__')) return;
+      seen.add(el);
+      out.push(el);
+    };
+    add(dropdownRootForInput(input));
+
+    const ir = input?.getBoundingClientRect?.();
+    for (const el of document.querySelectorAll(
+      '.ant-select-dropdown,.el-select-dropdown,[role="listbox"],[class*="dropdown"],[class*="Dropdown"],[class*="popover"],[class*="Popover"],[class*="popup"],[class*="Popup"],[class*="menu"],[class*="Menu"]'
+    )) {
+      if (!isVisible(el)) continue;
+      if (ir) {
+        const r = el.getBoundingClientRect();
+        const horizontalNear = r.right >= ir.left - 180 && r.left <= ir.right + 360;
+        const verticalNear = r.bottom >= ir.top - 30 && r.top <= ir.bottom + 620;
+        if (!horizontalNear || !verticalNear) continue;
+      }
+      add(el);
+    }
+    return out;
+  }
+
+  function toAlbumRow(el, root, input = null) {
+    if (!el) return null;
+    let cur = el;
+    const rr = root?.getBoundingClientRect?.();
+    const ir = input?.getBoundingClientRect?.();
+    for (let i = 0; cur && i < 8 && cur !== document.body; i++, cur = cur.parentElement) {
+      if (!isVisible(cur) || cur.closest?.('#__tr_oneclick_panel__')) continue;
+      const r = cur.getBoundingClientRect();
+      if (rr && (r.top < rr.top - 6 || r.bottom > rr.bottom + 10)) continue;
+      if (ir && r.top < ir.bottom - 4) continue;
+      if (r.height >= 30 && r.height <= 135 && r.width >= 150 && r.width <= 760) {
+        const t = clean(cur.textContent);
+        if (t && t.length >= 2 && t.length <= 380 && !/^搜索$/.test(t)) return cur;
+      }
+    }
+    return el;
+  }
+
+  function albumResultRows(root, input) {
+    const ir = input?.getBoundingClientRect?.();
+    const seen = new Set();
+    const rows = [];
+    const add = (el, owner) => {
+      const row = toAlbumRow(el, owner, input);
+      if (!row || seen.has(row) || !isVisible(row) || row.closest?.('#__tr_oneclick_panel__')) return;
+      const r = row.getBoundingClientRect();
+      const t = clean(row.textContent);
+      if (!t || t.length > 380 || /^搜索$/.test(t)) return;
+      if (ir) {
+        if (r.top < ir.bottom - 4 || r.top > ir.bottom + 650) return;
+        if (r.right < ir.left - 180 || r.left > ir.right + 420) return;
+      }
+      if (r.height < 26 || r.height > 145 || r.width < 120) return;
+      seen.add(row);
+      rows.push(row);
+    };
+
+    for (const container of candidateAlbumResultContainers(input)) {
+      for (const el of container.querySelectorAll('[role="option"],.ant-select-item-option,.el-select-dropdown__item,li,[class*="option"],[class*="Option"],[class*="item"],[class*="Item"],img')) {
+        add(el, container);
+      }
+      for (const el of container.querySelectorAll('div,span,p,strong')) {
+        const t = clean(el.textContent);
+        if (t && t.length >= 3 && t.length <= 240) add(el, container);
+      }
+    }
+
+    // 有些站点把结果列表 Portal 到 body，和搜索框不是父子关系。
+    // 再按“搜索框下方的右上区域”做一次全局扫描。
+    if (ir) {
+      for (const el of document.querySelectorAll('[role="option"],li,div,span,p,strong')) {
+        if (!isVisible(el) || el.closest?.('#__tr_oneclick_panel__')) continue;
+        const r = el.getBoundingClientRect();
+        if (r.top < ir.bottom - 2 || r.top > ir.bottom + 560) continue;
+        if (r.right < ir.left - 80 || r.left > ir.right + 380) continue;
+        const t = clean(el.textContent);
+        if (!t || t.length < 3 || t.length > 220) continue;
+        add(el, document.body);
+      }
+    }
+    return rows;
+  }
+
+  function findAlbumOption(root, input, album, searchTerm = '') {
+    const target = compact(album.name);
+    const core = compact(String(album.name || '').split(/[丨|｜]/)[0]);
+    const id = String(album.audioId || '');
+    const prefixes = [target, core, target.slice(0, 24), target.slice(0, 18), target.slice(0, 12)].filter(Boolean);
+    const rows = albumResultRows(root, input);
+
+    const scored = rows.map(el => {
+      const t = compact(el.textContent);
+      const r = el.getBoundingClientRect();
+      let score = 0;
+      if (target && t === target) score += 420;
+      if (target && t.includes(target)) score += 320;
+      if (core && t.includes(core)) score += 240;
+      if (prefixes[2] && t.includes(prefixes[2])) score += 180;
+      if (prefixes[3] && t.includes(prefixes[3])) score += 130;
+      if (prefixes[4] && t.includes(prefixes[4])) score += 90;
+      if (id && t.includes(id)) score += 150;
+      if (el.querySelector?.('img')) score += 25;
+      if (el.matches('[role="option"],li,.ant-select-item-option,.el-select-dropdown__item')) score += 35;
+      if (r.height >= 34 && r.height <= 100) score += 18;
+      if (searchTerm === id && rows.length === 1) score += 180;
+      if ((compact(searchTerm) === core || compact(searchTerm) === target) && rows.length === 1) score += 110;
+      return { el, score };
+    }).filter(x => x.score > 0).sort((a, b) => b.score - a.score);
+
+    if (scored.length) return scored[0].el;
+    if ((searchTerm === id || compact(searchTerm) === core || compact(searchTerm) === target) && rows.length === 1) return rows[0];
+    return null;
+  }
+
+  async function closeAlbumDropdown() {
+    const before = findAlbumSearchInput();
+    if (!before || !isVisible(before)) return;
+    try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true })); } catch (_) {}
+    try { document.dispatchEvent(new KeyboardEvent('keyup', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true })); } catch (_) {}
+
+    // 等关闭动画真正结束，避免下一次 openAlbumDropdown 误抓到正在消失的旧输入框。
+    const started = Date.now();
+    while (Date.now() - started < 850) {
+      const current = findAlbumSearchInput();
+      if (!current || !isVisible(current) || !isAlbumSearchUiOpen(current)) return;
+      await sleep(70);
+    }
+  }
+
+  function currentSelectedAudioId() {
+    // 取最近一次“专辑详情或三类统计接口”的 audio_id，避免只看很久以前的详情请求。
+    for (let i = state.records.length - 1; i >= 0; i--) {
+      const r = state.records[i];
+      if (!r || Number(r.status) !== 200) continue;
+      let path = '';
+      try { path = new URL(r.url, location.href).pathname; } catch (_) {}
+      const ep = endpointName(r.url);
+      if (/\/m_cp\/audio\/\d+$/.test(path) || ['audio_play', 'audio_play_device', 'income'].includes(ep)) {
+        const id = albumIdFromUrl(r.url);
+        if (id) return String(id);
+      }
+    }
+    return '';
+  }
+
+  async function waitAlbumSelected(album, afterIndex, timeout = 12000) {
+    const started = Date.now();
+    const targetId = String(album.audioId || '');
+    while (Date.now() - started < timeout) {
+      if (state.cancelRequested) return false;
+      const hit = latestRecord(r => albumIdFromUrl(r.url) === targetId && (
+        /\/m_cp\/audio\/\d+$/.test(new URL(r.url, location.href).pathname) ||
+        ['audio_play', 'audio_play_device', 'income'].includes(endpointName(r.url))
+      ), afterIndex);
+      if (hit) return true;
+      await sleep(120);
+    }
+    return false;
+  }
+
+  async function keyboardChooseFirstAlbumResult(input, album, mark) {
+    if (!input || state.cancelRequested) return false;
+    try { input.focus(); } catch (_) {}
+    try { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', bubbles: true, cancelable: true })); } catch (_) {}
+    try { input.dispatchEvent(new KeyboardEvent('keyup', { key: 'ArrowDown', code: 'ArrowDown', bubbles: true, cancelable: true })); } catch (_) {}
+    await sleep(140);
+    try { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true })); } catch (_) {}
+    try { input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true })); } catch (_) {}
+    return await waitAlbumSelected(album, mark, 3500);
+  }
+
+  async function clickAlbumOptionAndConfirm(option, input, album) {
+    if (!option || state.cancelRequested) return false;
+    const mark = state.records.length;
+    const clickable = option.closest?.('[role="option"],li,button,a,[role="button"]') || option;
+    await fireOpenClick(clickable);
+    if (await waitAlbumSelected(album, mark, 4200)) return true;
+
+    // 第一击没有触发时，重新定位一次结果行并点击更具体的标题/图片区域。
+    const root = dropdownRootForInput(input);
+    const again = findAlbumOption(root, input, album, input?.value || '');
+    if (again && isVisible(again)) {
+      const child = Array.from(again.querySelectorAll?.('span,p,strong,img,div') || [])
+        .filter(isVisible)
+        .find(x => compact(x.textContent).includes(compact(String(album.name || '').split(/[丨|｜]/)[0])) || x.tagName === 'IMG');
+      await fireOpenClick(child || again);
+      if (await waitAlbumSelected(album, mark, 4200)) return true;
+    }
+    return false;
+  }
+
+  async function selectAlbum(album) {
+    if (state.cancelRequested) return false;
+    const targetId = String(album.audioId || '');
+
+    // 如果最近的真实统计/详情请求已经是目标专辑，说明当前页面确实处于该专辑，可直接抓。
+    if (currentSelectedAudioId() === targetId) return true;
+
+    const full = clean(album.name || '');
+    const core = clean(full.split(/[丨|｜]/)[0]);
+    // 先搜核心书名，和人工使用方式一致；再尝试完整名称、数字ID和前缀。
+    const terms = [core, full, targetId, full.slice(0, 20)]
+      .filter((x, i, arr) => x && arr.indexOf(x) === i);
+
+    let input = await openAlbumDropdown();
+    if (!input) {
+      log(`无法自动打开专辑下拉框：${album.name}`);
+      return false;
+    }
+
+    for (const term of terms) {
+      if (state.cancelRequested) return false;
+
+      // 弹层可能因为上一轮搜索重渲染，先重新拿一次活的输入框；不存在才重新打开。
+      const live = await waitStableAlbumSearchInput(280);
+      input = live || await openAlbumDropdown();
+      if (!input) {
+        log(`专辑下拉框在搜索过程中关闭，重新打开失败：${album.name}`);
+        continue;
+      }
+
+      nativeSetInputValue(input, '');
+      await sleep(120);
+      nativeSetInputValue(input, term);
+      await sleep(220);
+      if (!state.cancelRequested) log(`专辑搜索：${album.name}（关键词：${term}）`);
+      await submitAlbumSearch(input);
+
+      // 等结果列表渲染；结果经常 Portal 到 body，所以全局扫描右上搜索框下方区域。
+      let option = null;
+      const searchStarted = Date.now();
+      while (Date.now() - searchStarted < 5200) {
+        if (state.cancelRequested) return false;
+        const freshInput = findAlbumSearchInput();
+        if (freshInput && isVisible(freshInput)) input = freshInput;
+        const root = dropdownRootForInput(input);
+        option = findAlbumOption(root, input, album, term);
+        if (option) break;
+        await sleep(140);
+      }
+
+      if (option) {
+        log(`已识别目标专辑结果，准备自动选择：${album.name}`);
+        const selected = await clickAlbumOptionAndConfirm(option, input, album);
+        if (selected) {
+          log(`专辑已自动切换成功：${album.name}`);
+          await sleep(300);
+          return true;
+        }
+        log(`已点击专辑结果但没有收到目标专辑的新接口，继续尝试：${album.name}`);
+      } else {
+        // DOM没识别到结果时，用键盘选择首条作为兜底。是否成功仍以新的目标ID接口确认，
+        // 因此不会把选错的专辑误判为成功。
+        const mark = state.records.length;
+        log(`未识别到可点击结果，尝试键盘选择首条：${album.name}`);
+        if (await keyboardChooseFirstAlbumResult(input, album, mark)) {
+          log(`专辑已通过键盘方式自动切换成功：${album.name}`);
+          await sleep(300);
+          return true;
+        }
+      }
+
+      // 不在每个关键词前强制 Escape；只有本轮确实失败后才完整关闭并等待动画结束，再重开。
+      await closeAlbumDropdown();
+      input = await openAlbumDropdown();
+    }
+
+    if (!state.cancelRequested) log(`专辑下拉自动选择失败：${album.name}`);
+    return false;
+  }
+
+  function normalizeAlbumEndpoint(record, endpoint) {
+    if (!record) return null;
+    try {
+      if (endpoint === 'audio_play') {
+        const arr = Array.isArray(record.responseBody?.data) ? record.responseBody.data : [];
+        return arr.map(x => ({ date: String(x.date || ''), play_count: toNumber(x.play_count) }));
+      }
+      if (endpoint === 'audio_play_device') {
+        const arr = Array.isArray(record.responseBody?.data) ? record.responseBody.data : [];
+        return arr.map(x => ({
+          date: String(x.stat_date || ''),
+          play_devices: toNumber(x.play_devices),
+          new_play_devices: toNumber(x.new_play_devices),
+        }));
+      }
+      if (endpoint === 'income') {
+        const data = record.responseBody?.data || {};
+        return {
+          sum: toNumber(data.sum) ?? 0,
+          list: Array.isArray(data.list) ? data.list : [],
+        };
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function albumMetricPredicate(album, endpoint, range) {
+    return r => endpointName(r.url) === endpoint &&
+      albumIdFromUrl(r.url) === String(album.audioId) &&
+      classifyAlbumRange(r.url) === range;
+  }
+
+  function alternateRange(range) {
+    if (range === '近7天') return '近30天';
+    if (range === '近30天') return '近7天';
+    return '近30天';
+  }
+
+  async function fetchAlbumMetricByUi(album, metric, endpoint, range, albumStartIndex = 0) {
+    const predicate = albumMetricPredicate(album, endpoint, range);
+
+    // 先正常点击目标范围，等待新请求。
+    const mark = state.records.length;
+    const ok = await clickText(range);
+    if (!ok) return latestRecord(predicate, albumStartIndex);
+
+    let rec = await waitForRecord(predicate, mark, 9000);
+
+    // 有些 Tab 在切换“播放数/设备数/销售数据”时会提前自动请求当前范围，
+    // 该请求可能发生在 mark 之前。只要它是在本专辑本轮抓取开始之后产生，就是有效数据。
+    if (!rec) rec = latestRecord(predicate, albumStartIndex);
+
+    if (!rec) {
+      log(`${album.name} ${metric}/${range} 未检测到新请求，强制切换筛选后重试一次。`);
+
+      // 如果目标范围本来就是当前激活项，再点一次不会触发请求。
+      // 先切到另一个范围，再切回来，强制页面重新发接口。
+      const other = alternateRange(range);
+      await clickText(other);
+      await sleep(260);
+
+      const mark2 = state.records.length;
+      await clickText(range);
+      rec = await waitForRecord(predicate, mark2, 12000);
+      if (!rec) rec = latestRecord(predicate, albumStartIndex);
+    }
+    return rec;
+  }
+
+  async function runSingleAlbum(album) {
+    const result = {
+      ...album,
+      status: '处理中',
+      error: '',
+      ranges: {
+        '近7天': { play: null, device: null, sales: null },
+        '近30天': { play: null, device: null, sales: null },
+        '近90天': { play: null, device: null, sales: null },
+      },
+    };
+
+    state.currentAlbum = album.name;
+    state.albumStep = 0;
+    render();
+
+    // 记录本专辑本轮抓取的起点，用于接住切换 Tab 时提前自动发出的有效请求。
+    const albumStartIndex = state.records.length;
+    const selected = await selectAlbum(album);
+    if (!selected) {
+      result.status = '失败';
+      result.error = '下拉列表未能选中该专辑';
+      return result;
+    }
+
+    const tasks = [
+      ['播放数', 'audio_play', 'play'],
+      ['设备数', 'audio_play_device', 'device'],
+      ['销售数据', 'income', 'sales'],
+    ];
+    const ranges = ['近7天', '近30天', '近90天'];
+    const missing = [];
+
+    for (const [metric, endpoint, key] of tasks) {
+      if (state.cancelRequested) throw new Error('用户停止任务');
+      const tabOk = await clickText(metric);
+      if (!tabOk) {
+        missing.push(`${metric}-标签`);
+        state.albumStep += 3;
+        render();
+        continue;
+      }
+      await sleep(250);
+
+      for (const range of ranges) {
+        if (state.cancelRequested) throw new Error('用户停止任务');
+        const rec = await fetchAlbumMetricByUi(album, metric, endpoint, range, albumStartIndex);
+        result.ranges[range][key] = normalizeAlbumEndpoint(rec, endpoint);
+        if (!rec) missing.push(`${metric}/${range}`);
+        state.albumStep++;
+        render();
+        await sleep(90);
+      }
+    }
+
+    if (missing.length) {
+      result.status = '部分成功';
+      result.error = `缺少：${missing.join('、')}`;
+    } else {
+      result.status = '成功';
+    }
+    return result;
+  }
+
+  function mergeRetryResult(oldResult, newResult) {
+    if (!oldResult) return newResult;
+    if (!newResult) return oldResult;
+
+    const merged = {
+      ...oldResult,
+      ...newResult,
+      ranges: {},
+    };
+    const ranges = ['近7天', '近30天', '近90天'];
+    const keys = ['play', 'device', 'sales'];
+    const missing = [];
+
+    for (const range of ranges) {
+      merged.ranges[range] = {};
+      for (const key of keys) {
+        const fresh = newResult?.ranges?.[range]?.[key];
+        const old = oldResult?.ranges?.[range]?.[key];
+        const value = fresh !== null && fresh !== undefined ? fresh : (old ?? null);
+        merged.ranges[range][key] = value;
+        if (value === null || value === undefined) missing.push(`${key}/${range}`);
+      }
+    }
+
+    if (!missing.length) {
+      merged.status = '成功';
+      merged.error = '';
+    } else {
+      merged.status = '部分成功';
+      merged.error = `缺少：${missing.join('、')}`;
+    }
+    return merged;
+  }
+
+  function formatFilenameDate() {
+    const d = new Date();
+    const p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
+  }
+
+  function appendAoaSheet(wb, name, aoa, widths, numericCols = [], mergeFirstCol = false) {
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws['!cols'] = widths.map(w => ({ wch: w }));
+    if (aoa.length >= 2) ws['!autofilter'] = { ref: `A1:${XLSX.utils.encode_col(aoa[0].length - 1)}${aoa.length}` };
+
+    for (const col of numericCols) {
+      for (let row = 2; row <= aoa.length; row++) {
+        const addr = XLSX.utils.encode_cell({ c: col, r: row - 1 });
+        if (ws[addr] && typeof ws[addr].v === 'number') ws[addr].z = '#,##0.00';
+      }
+    }
+
+    // 明细表美化：A列相邻且相同的“专辑名称”纵向合并。
+    // 第1行是表头，所以从索引1（Excel第2行）开始。
+    if (mergeFirstCol && aoa.length > 2) {
+      const merges = [];
+      let start = 1;
+
+      const flushMerge = (end) => {
+        if (end > start) {
+          merges.push({
+            s: { r: start, c: 0 },
+            e: { r: end, c: 0 },
+          });
+
+          // 合并后的专辑名称垂直居中、自动换行。
+          const addr = XLSX.utils.encode_cell({ r: start, c: 0 });
+          if (ws[addr]) {
+            ws[addr].s = ws[addr].s || {};
+            ws[addr].s.alignment = {
+              ...(ws[addr].s.alignment || {}),
+              vertical: 'center',
+              horizontal: 'left',
+              wrapText: true,
+            };
+          }
+        }
+      };
+
+      for (let i = 2; i < aoa.length; i++) {
+        const prev = String(aoa[i - 1]?.[0] ?? '');
+        const curr = String(aoa[i]?.[0] ?? '');
+
+        if (!curr || curr !== prev) {
+          flushMerge(i - 1);
+          start = i;
+        }
+      }
+      flushMerge(aoa.length - 1);
+
+      if (merges.length) ws['!merges'] = merges;
+    }
+
+    XLSX.utils.book_append_sheet(wb, ws, name);
+  }
+
+  function buildPeriodRows(results, rangeName) {
+    const rows = [];
+    for (const album of results) {
+      const pack = album.ranges?.[rangeName] || {};
+      const map = new Map();
+      const ensure = date => {
+        if (!map.has(date)) map.set(date, { date, play: null, device: null, newDevice: null });
+        return map.get(date);
+      };
+      for (const x of pack.play || []) {
+        if (!x.date) continue;
+        ensure(x.date).play = toNumber(x.play_count);
+      }
+      for (const x of pack.device || []) {
+        if (!x.date) continue;
+        const r = ensure(x.date);
+        r.device = toNumber(x.play_devices);
+        r.newDevice = toNumber(x.new_play_devices);
+      }
+      const list = Array.from(map.values()).sort((a, b) => a.date.localeCompare(b.date));
+      for (const r of list) rows.push([album.name, r.date, r.play, r.device, r.newDevice]);
+    }
+    return rows;
+  }
+
+  function salesDetailTable(results) {
+    const baseKeys = new Set();
+    const entries = [];
+    const excludedKeys = new Set(['order_cnt', 'amount', 'good_id']);
+
+    for (const album of results) {
+      for (const range of ['近7天', '近30天', '近90天']) {
+        const sales = album.ranges?.[range]?.sales;
+        const list = Array.isArray(sales?.list) ? sales.list : [];
+
+        if (!list.length) {
+          entries.push({ album, range, sum: sales?.sum ?? null, item: null });
+          continue;
+        }
+
+        for (const item of list) {
+          if (item && typeof item === 'object' && !Array.isArray(item)) {
+            Object.keys(item).forEach(k => {
+              if (!excludedKeys.has(k)) baseKeys.add(k);
+            });
+          }
+          entries.push({ album, range, sum: sales?.sum ?? null, item });
+        }
+      }
+    }
+
+    const keys = Array.from(baseKeys);
+    const header = ['专辑名称', '时间范围', '销售sum', ...keys];
+
+    const rows = entries.map(({ album, range, sum, item }) => {
+      const vals = keys.map(k => {
+        const v = item && typeof item === 'object' ? item[k] : null;
+        return v && typeof v === 'object' ? JSON.stringify(v) : v;
+      });
+      return [album.name, range, sum, ...vals];
+    });
+
+    return { header, rows };
+  }
+
+  function buildCombinedWorkbook(overall, albums, results, filenameOverride = '') {
+    if (typeof XLSX === 'undefined') throw new Error('Excel组件未加载，请检查网络后刷新页面。');
+    const wb = XLSX.utils.book_new();
+    wb.Props = {
+      Title: '童锐总体与全部专辑数据',
+      Subject: '总体音频数据 + 全部专辑7/30/90天数据',
+      Author: '童锐一键导出工具',
+      CreatedDate: new Date(),
+    };
+
+    const o = overall?.overview || {};
+    appendAoaSheet(wb, '总体数据', [
+      ['数据范围', '总播放量', '累计设备数', '弹幕数', '点评数', '收藏数', '抓取时间'],
+      ['数据总览', o.total_play, o.total_devices, o.total_danmaku, o.total_comment, o.total_favorite, overall?.capturedAt || ''],
+    ], [14,16,16,14,14,14,22], [1,2,3,4,5]);
+
+    for (const range of ['近7天', '近30天', '近1年']) {
+      const rows = overall?.ranges?.[range] || [];
+      appendAoaSheet(wb, `总体_${range.replace('近','')}`, [
+        ['日期/月份', '播放量', '播放设备数', '新增播放设备数', '点评数'],
+        ...rows.map(x => [x.date, x.play, x.device, x.newDevice, x.comment]),
+      ], [16,16,16,18,14], [1,2,3,4]);
+    }
+
+    const byId = new Map(results.map(x => [String(x.audioId), x]));
+    const overviewRows = albums.map(album => {
+      const r = byId.get(String(album.audioId));
+      const g = range => r?.ranges?.[range] || {};
+      return [
+        album.name,
+        album.totalPlay,
+        album.favorite,
+        album.chapters,
+        album.waitingChapters,
+        g('近7天').sales?.sum ?? null,
+        g('近30天').sales?.sum ?? null,
+        g('近90天').sales?.sum ?? null,
+        r?.status || '未抓取',
+        r?.error || '',
+      ];
+    });
+
+    appendAoaSheet(wb, '专辑总览', [
+      ['专辑名称','总播放量','收藏数','有效集数','待更新集数','近7天销售sum','近30天销售sum','近90天销售sum','抓取状态','错误信息'],
+      ...overviewRows,
+    ], [42,18,18,18,20,22,22,22,12,35], [1,2,3,4,5,6,7]);
+
+    for (const range of ['近7天', '近30天', '近90天']) {
+      appendAoaSheet(wb, `专辑_${range.replace('近','')}`, [
+        ['专辑名称','日期','播放数','播放设备数','新增播放设备数'],
+        ...buildPeriodRows(results, range),
+      ], [42,14,14,16,18], [2,3,4], true);
+    }
+
+    const sales = salesDetailTable(results);
+    appendAoaSheet(wb, '专辑销售明细', [sales.header, ...sales.rows],
+      [42,12,18, ...Array(Math.max(0, sales.header.length - 3)).fill(18)], [2], true);
+
+    const filename = filenameOverride || `童锐_总体+全部专辑_${formatFilenameDate()}.xlsx`;
+    return { wb, filename };
+  }
+
+  function workbookBlob(wb) {
+    const bytes = XLSX.write(wb, {
+      bookType: 'xlsx',
+      type: 'array',
+      compression: true,
+    });
+    return new Blob([bytes], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    });
+  }
+
+  async function saveBlobWithFilePicker(blob, filename) {
+    const picker = PAGE.showSaveFilePicker || window.showSaveFilePicker;
+    if (typeof picker !== 'function') return { ok: false, reason: 'picker_unavailable' };
+
+    try {
+      const handle = await picker.call(PAGE, {
+        suggestedName: filename,
+        types: [{
+          description: 'Excel 工作簿',
+          accept: {
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
+          },
+        }],
+        excludeAcceptAllOption: false,
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return { ok: true, method: 'file-picker' };
+    } catch (e) {
+      if (e && e.name === 'AbortError') return { ok: false, cancelled: true, reason: '用户取消保存' };
+      return { ok: false, reason: e && e.message ? e.message : String(e) };
+    }
+  }
+
+  function downloadBlobWithGM(blob, filename, saveAs = false) {
+    return new Promise(resolve => {
+      if (typeof GM_download !== 'function') {
+        resolve({ ok: false, reason: 'GM_download unavailable' });
+        return;
+      }
+
+      const url = URL.createObjectURL(blob);
+      let finished = false;
+      const finish = result => {
+        if (finished) return;
+        finished = true;
+        setTimeout(() => URL.revokeObjectURL(url), 1500);
+        resolve(result);
+      };
+
+      try {
+        GM_download({
+          url,
+          name: filename,
+          saveAs,
+          onload: () => finish({ ok: true, method: saveAs ? 'GM_download-saveAs' : 'GM_download' }),
+          onerror: err => finish({
+            ok: false,
+            reason: err?.error || err?.details || err?.message || JSON.stringify(err || {}),
+          }),
+          ontimeout: () => finish({ ok: false, reason: '下载超时' }),
+        });
+      } catch (e) {
+        finish({ ok: false, reason: e && e.message ? e.message : String(e) });
+      }
+    });
+  }
+
+  function downloadBlobWithAnchor(blob, filename) {
+    try {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      return { ok: true, method: 'anchor' };
+    } catch (e) {
+      return { ok: false, reason: e && e.message ? e.message : String(e) };
+    }
+  }
+
+  async function exportCombinedWorkbook(overall, albums, results, filenameOverride = '', options = {}) {
+    const { wb, filename } = buildCombinedWorkbook(overall, albums, results, filenameOverride);
+    const blob = workbookBlob(wb);
+    const interactive = !!options.interactive;
+
+    // 用户手动点击“可靠导出”时，优先使用浏览器原生文件保存器。
+    // 这条路径会让用户明确选择保存位置，可绕开 Edge 自动下载 Office 文件时的“没有权限”。
+    if (interactive) {
+      const pickerResult = await saveBlobWithFilePicker(blob, filename);
+      if (pickerResult.ok) {
+        log(`Excel 已可靠保存：${filename}`);
+        return { ok: true, filename, method: pickerResult.method };
+      }
+      if (pickerResult.cancelled) {
+        log('已取消 Excel 保存；断点数据仍然保留，可随时再次导出。');
+        return { ok: false, filename, cancelled: true, reason: pickerResult.reason };
+      }
+
+      // 如果浏览器不支持文件保存器，则退到 Tampermonkey 下载，并弹出保存位置。
+      const gmSave = await downloadBlobWithGM(blob, filename, true);
+      if (gmSave.ok) {
+        log(`Excel 已通过篡改猴保存：${filename}`);
+        return { ok: true, filename, method: gmSave.method };
+      }
+
+      const anchor = downloadBlobWithAnchor(blob, filename);
+      if (anchor.ok) {
+        log(`已发起备用 Excel 下载：${filename}`);
+        return { ok: true, filename, method: anchor.method };
+      }
+
+      log(`Excel 保存失败，但抓取数据和断点均未丢失：${gmSave.reason || anchor.reason || pickerResult.reason || '未知原因'}`);
+      return { ok: false, filename, reason: gmSave.reason || anchor.reason || pickerResult.reason || '未知原因' };
+    }
+
+    // 自动完成时先用 Tampermonkey 下载API。它能返回明确的成功/失败状态。
+    const gmResult = await downloadBlobWithGM(blob, filename, false);
+    if (gmResult.ok) {
+      log(`Excel 已自动下载：${filename}`);
+      return { ok: true, filename, method: gmResult.method };
+    }
+
+    // 不再自动反复触发普通浏览器下载，避免 Edge 再次出现“没有权限”。
+    // 用户可点击“可靠导出目前已保存专辑 Excel”，用文件保存器直接落盘。
+    log(`自动下载失败（${gmResult.reason || '浏览器拒绝下载'}）。数据已全部保存在断点中，请点击“可靠导出目前已保存专辑 Excel”。`);
+    return { ok: false, filename, reason: gmResult.reason || '浏览器拒绝下载' };
+  }
+
+  async function runAlbumPhase(job) {
+    state.phaseText = '准备批量抓取全部专辑';
+    render();
+
+    const catalogAlbums = Array.isArray(job.albums) && job.albums.length
+      ? job.albums
+      : (Array.isArray(job.catalog?.albums) ? job.catalog.albums : []);
+    const catalogTotal = Number(job.catalog?.total || catalogAlbums.length || 0);
+    if (!catalogAlbums.length) throw new Error('没有获取到完整专辑列表。');
+
+    const snap = { albums: catalogAlbums, total: catalogTotal || catalogAlbums.length };
+    const retryIds = new Set(Array.isArray(job.retryIds) ? job.retryIds.map(String) : []);
+    const retryOnly = !!job.retryOnly && retryIds.size > 0;
+    const workAlbums = retryOnly
+      ? snap.albums.filter(x => retryIds.has(String(x.audioId)))
+      : snap.albums;
+
+    if (retryOnly && !workAlbums.length) throw new Error('没有找到需要重新抓取的失败专辑。');
+
+    state.albumListLoaded = snap.albums.length;
+    state.albumListTotal = snap.total;
+    state.albums = snap.albums;
+    state.albumTotal = workAlbums.length;
+
+    const savedResults = await loadSavedResults();
+    const resultMap = new Map(savedResults.map(x => [String(x.audioId), x]));
+    state.results = Array.from(resultMap.values());
+    state.savedCount = state.results.length;
+    state.success = state.results.filter(x => x?.status === '成功').length;
+    state.failed = state.results.filter(x => x?.status !== '成功').length;
+    job.completedIds = Array.from(resultMap.keys());
+    saveJob(job);
+    await saveCheckpointMeta(job, false);
+
+    render();
+    log(`已加载专辑列表 ${snap.albums.length}/${snap.total}；断点中已有 ${state.savedCount} 个专辑。`);
+    state.phaseText = retryOnly ? `重新抓取失败专辑（${workAlbums.length} 个）` : '批量抓取全部专辑';
+    if (retryOnly) log(`本次只重抓失败/部分成功专辑 ${workAlbums.length} 个，成功专辑不会重复抓取。`);
+    render();
+
+    for (let i = 0; i < workAlbums.length; i++) {
+      if (state.cancelRequested) throw new Error('用户停止任务');
+      const album = workAlbums[i];
+      state.albumIndex = i + 1;
+      state.currentAlbum = album.name;
+      state.albumStep = 0;
+      render();
+
+      if (!retryOnly && resultMap.has(String(album.audioId))) {
+        state.albumStep = state.albumStepTotal;
+        render();
+        log(`断点跳过 ${i + 1}/${workAlbums.length}：${album.name}`);
+        await sleep(40);
+        continue;
+      }
+
+      log(`${retryOnly ? '重抓' : '专辑'} ${i + 1}/${workAlbums.length}：${album.name}`);
+      const previousResult = resultMap.get(String(album.audioId)) || null;
+      let result;
+      try {
+        result = await runSingleAlbum(album);
+      } catch (e) {
+        // 用户主动暂停时，不把正在抓的半本专辑误记成“失败”。
+        // 之前已经保存的断点保持原样，下一次继续/重抓时再处理这一本。
+        if (state.cancelRequested) throw e;
+        result = { ...album, status: '失败', error: String(e), ranges: {} };
+      }
+
+      // 重抓时只用新抓到的字段覆盖旧字段。
+      // 如果本次某一项又没抓到，不会把上一次已经成功的数据覆盖成空值。
+      if (retryOnly && previousResult) result = mergeRetryResult(previousResult, result);
+
+      resultMap.set(String(album.audioId), result);
+      state.results = Array.from(resultMap.values());
+      await saveCheckpointResult(result);
+      job.completedIds = Array.from(resultMap.keys());
+      saveJob(job);
+      await saveCheckpointMeta(job, false);
+
+      state.success = state.results.filter(x => x?.status === '成功').length;
+      state.failed = state.results.filter(x => x?.status !== '成功').length;
+      render();
+      log(`断点已保存：${state.savedCount}/${snap.albums.length} 个专辑。`);
+      await sleep(120);
+    }
+
+    state.phaseText = '生成 Excel';
+    render();
+    const downloadResult = await exportCombinedWorkbook(job.overall || {}, snap.albums, state.results, '', { interactive: false });
+
+    job.phase = 'complete_saved';
+    job.active = false;
+    job.retryOnly = false;
+    job.retryIds = [];
+    saveJob(job);
+    await saveCheckpointMeta(job, true);
+    state.phaseText = downloadResult.ok
+      ? '完成（断点已保留，可再次导出）'
+      : '抓取完成（自动下载失败，请点可靠导出）';
+    log(`${retryOnly ? '失败专辑重抓' : '全部任务'}完成：专辑总数 ${snap.albums.length}，成功 ${state.success}，需重抓 ${state.failed}。断点已保留。`);
+    render();
+  }
+
+  async function resumeJobIfNeeded() {
+    if (state.resumeLock) return;
+    const job = loadJob();
+    if (!job || !job.active || job.phase === 'complete_saved') return;
+    if (job.overall) state.overallStep = state.overallTotal;
+    state.resumeLock = true;
+    state.cancelRequested = false;
+    try {
+      if (job.phase === 'need_overall') {
+        if (detectPageType() !== 'dashboard') {
+          location.href = 'https://cp.idaddy.cn/h5/admin/dashboard';
+          return;
+        }
+        await sleep(1400);
+        await runOverallPhase(job);
+        return;
+      }
+
+      if (job.phase === 'need_album_catalog') {
+        if (detectPageType() !== 'audio_list') {
+          const page = Number(job.catalog?.page || 1) || 1;
+          location.href = `https://cp.idaddy.cn/h5/admin/content/audio?keyword=&page=${page}&tabKey=-1`;
+          return;
+        }
+        await sleep(1500);
+        await runAlbumCatalogPage(job);
+        return;
+      }
+
+      if (job.phase === 'need_albums') {
+        if (detectPageType() !== 'album_statistics') {
+          location.href = job.returnUrl;
+          return;
+        }
+        state.albumListLoaded = Array.isArray(job.albums) ? job.albums.length : (job.catalog?.albums?.length || 0);
+        state.albumListTotal = Number(job.catalog?.total || state.albumListLoaded || 0);
+        await sleep(1800);
+        await runAlbumPhase(job);
+      }
+    } catch (e) {
+      const paused = state.cancelRequested && loadJob() && !loadJob().active;
+      if (paused) {
+        state.phaseText = `已暂停（断点已保存 ${state.savedCount} 个）`;
+        log(`任务已暂停。下次点击“继续断点抓取”即可从已保存专辑之后继续。`);
+      } else {
+        state.phaseText = '任务异常';
+        log(`一键任务异常：${e && e.message ? e.message : e}`);
+      }
+      render();
+    } finally {
+      state.resumeLock = false;
+    }
+  }
+
+  async function startOneClick() {
+    if (detectPageType() !== 'album_statistics') {
+      alert('请先打开任意一个专辑的“作品数据”页面，再点击一键导出。\n\n脚本会自动：作品数据页 → 首页总体数据 → 音频管理分页读取全部专辑 → 返回作品数据页 → 批量抓取 → 导出一个Excel。');
+      return;
+    }
+
+    const activeJob = loadJob();
+    if (activeJob?.active) {
+      alert('已有正在进行的任务。可以选择“暂停并保存断点”，或等待任务完成。');
+      return;
+    }
+
+    const oldResults = await loadSavedResults();
+    if (oldResults.length) {
+      const ok = confirm(`检测到已有断点数据：${oldResults.length} 个专辑。\n\n开始“全新任务”会清除这些断点。\n如果只是想继续之前的任务，请点“继续断点抓取”。\n\n确定清除旧断点并重新开始吗？`);
+      if (!ok) return;
+    }
+
+    try { await checkpointClearAll(); } catch (_) {}
+    clearJob();
+    try {
+      localStorage.removeItem('__TR_ONECLICK_JOB_V200__');
+      localStorage.removeItem('__TR_ONECLICK_JOB_V210__');
+    } catch (_) {}
+
+    state.cancelRequested = false;
+    state.savedCount = 0;
+    state.results = [];
+    state.success = 0;
+    state.failed = 0;
+    state.albumIndex = 0;
+    state.albumTotal = 0;
+    state.overallStep = 0;
+
+    const job = {
+      active: true,
+      version: '3.3.0',
+      phase: 'need_overall',
+      startedAt: now(),
+      returnUrl: location.href,
+      overall: null,
+      catalog: { page: 1, total: 0, albums: [] },
+      albums: [],
+      completedIds: [],
+    };
+    saveJob(job);
+    await saveCheckpointMeta(job, false);
+    state.phaseText = '准备抓总体数据';
+    log('全新任务启动。每完成一个专辑都会自动保存断点。');
+    render();
+    setTimeout(() => {
+      location.href = 'https://cp.idaddy.cn/h5/admin/dashboard';
+    }, 500);
+  }
+
+  async function waitForWorkerIdle(timeout = 10000) {
+    const started = Date.now();
+    while (state.resumeLock && Date.now() - started < timeout) {
+      await sleep(100);
+    }
+    return !state.resumeLock;
+  }
+
+  async function pauseOneClick() {
+    const job = loadJob();
+    if (!job) {
+      alert('当前没有可暂停的任务。');
+      return;
+    }
+
+    // 先把持久任务标记为暂停，再通知当前异步循环尽快退出。
+    state.cancelRequested = true;
+    job.active = false;
+    saveJob(job);
+    await saveCheckpointMeta(job, false);
+    state.phaseText = `正在暂停…（断点已保存 ${state.savedCount} 个）`;
+    log(`已收到暂停请求，正在结束当前页面操作；断点已保存 ${state.savedCount} 个专辑。`);
+    render();
+
+    // 下拉选择/接口等待都支持cancelRequested，通常几百毫秒内即可退出。
+    // 等旧任务真正释放resumeLock后，用户无需刷新就可直接继续或重抓失败专辑。
+    const idle = await waitForWorkerIdle(12000);
+    if (idle) {
+      await restoreCheckpointState();
+      state.phaseText = `已暂停，可直接继续或重抓（已保存 ${state.savedCount} 个）`;
+      log('任务已完全暂停。现在可以直接点击“继续断点抓取”或“重新抓取失败 / 部分成功专辑”，无需刷新页面。');
+    } else {
+      state.phaseText = `暂停已保存，旧操作仍在收尾`;
+      log('断点已保存，但旧页面操作仍在收尾；重抓按钮会等待旧任务释放后再启动，无需刷新。');
+    }
+    render();
+  }
+
+  async function resumeCheckpoint() {
+    let runningJob = loadJob();
+    if (runningJob?.active) {
+      alert('当前已有抓取/重抓任务正在运行，请不要重复启动。');
+      return;
+    }
+    if (state.resumeLock) {
+      if (state.cancelRequested && !runningJob?.active) {
+        state.phaseText = '等待上一个任务完全停止…';
+        render();
+        const idle = await waitForWorkerIdle(12000);
+        if (!idle) {
+          alert('上一个任务仍在收尾，请稍后再点一次；无需刷新页面。');
+          return;
+        }
+      } else {
+        alert('当前已有抓取/重抓任务正在运行，请不要重复启动。');
+        return;
+      }
+    }
+    runningJob = loadJob();
+    let job = runningJob;
+    const [meta, results] = await Promise.all([loadCheckpointMeta(), loadSavedResults()]);
+    if (!job && !meta) {
+      alert('没有找到断点数据。');
+      return;
+    }
+    if (meta?.complete || job?.phase === 'complete_saved') {
+      alert(`这批数据已经抓取完成并保存了 ${results.length} 个专辑。\n可以直接点击“可靠导出已保存 Excel”。如果存在失败专辑，也可以点击“重抓失败专辑”。`);
+      return;
+    }
+
+    if (!job) {
+      const albums = Array.isArray(meta?.albums) ? meta.albums : [];
+      job = {
+        active: true,
+        version: '3.3.0',
+        phase: meta?.phase || (albums.length ? 'need_albums' : 'need_overall'),
+        startedAt: meta?.startedAt || now(),
+        returnUrl: meta?.returnUrl || location.href,
+        overall: meta?.overall || null,
+        catalog: meta?.catalog || { page: 1, total: meta?.total || albums.length, albums },
+        albums,
+        completedIds: results.map(x => String(x.audioId || '')).filter(Boolean),
+      };
+    } else {
+      job.active = true;
+      job.completedIds = results.map(x => String(x.audioId || '')).filter(Boolean);
+    }
+    saveJob(job);
+    state.cancelRequested = false;
+    state.resumeLock = false;
+    await restoreCheckpointState();
+    state.phaseText = `继续断点（已保存 ${results.length} 个）`;
+    log(`继续断点抓取：已有 ${results.length} 个专辑不会重复抓。`);
+    render();
+
+    if (job.phase === 'need_overall' && detectPageType() !== 'dashboard') {
+      location.href = 'https://cp.idaddy.cn/h5/admin/dashboard';
+      return;
+    }
+    if (job.phase === 'need_album_catalog' && detectPageType() !== 'audio_list') {
+      const page = Number(job.catalog?.page || 1) || 1;
+      location.href = `https://cp.idaddy.cn/h5/admin/content/audio?keyword=&page=${page}&tabKey=-1`;
+      return;
+    }
+    if (job.phase === 'need_albums' && detectPageType() !== 'album_statistics') {
+      location.href = job.returnUrl || location.href;
+      return;
+    }
+    setTimeout(resumeJobIfNeeded, 200);
+  }
+
+  async function exportSavedWorkbook() {
+    const [meta, results] = await Promise.all([loadCheckpointMeta(), loadSavedResults()]);
+    if (!results.length) {
+      alert('目前还没有已保存的专辑数据。至少完成一个专辑后才能导出。');
+      return;
+    }
+    const job = loadJob();
+    const allAlbums = Array.isArray(meta?.albums) && meta.albums.length
+      ? meta.albums
+      : (Array.isArray(job?.albums) && job.albums.length ? job.albums : results);
+    const savedIds = new Set(results.map(x => String(x.audioId || '')));
+    const savedAlbums = allAlbums.filter(x => savedIds.has(String(x.audioId || '')));
+    const overall = meta?.overall || job?.overall || {};
+    const filename = `童锐_已保存专辑_${results.length}个_${formatFilenameDate()}.xlsx`;
+    const saveResult = await exportCombinedWorkbook(overall, savedAlbums.length ? savedAlbums : results, results, filename, { interactive: true });
+    if (saveResult.ok) {
+      log(`已可靠导出断点中的 ${results.length} 个专辑；无需重新抓取。`);
+    }
+  }
+
+
+  async function retryFailedAlbums() {
+    let runningJob = loadJob();
+    if (state.retryStartLock || runningJob?.active) {
+      alert('当前已有抓取/重抓任务正在运行，请不要重复点击“重新抓取失败专辑”。');
+      return;
+    }
+
+    // 暂停按钮刚按下时，旧异步循环可能还在几十到几百毫秒的收尾阶段。
+    // 这里直接等待它释放，而不是要求用户刷新页面。
+    if (state.resumeLock) {
+      if (state.cancelRequested && !runningJob?.active) {
+        state.phaseText = '等待暂停任务释放后开始重抓…';
+        render();
+        const idle = await waitForWorkerIdle(12000);
+        if (!idle) {
+          alert('上一个任务仍在收尾，请稍后再点一次；断点不会丢，也不需要刷新页面。');
+          return;
+        }
+      } else {
+        alert('当前已有抓取/重抓任务正在运行，请先暂停。');
+        return;
+      }
+    }
+
+    runningJob = loadJob();
+    state.retryStartLock = true;
+    render();
+    try {
+      const [meta, results] = await Promise.all([loadCheckpointMeta(), loadSavedResults()]);
+      if (!results.length) {
+        alert('目前没有已保存的专辑结果，无法重抓失败专辑。');
+        return;
+      }
+
+      const retryResults = results.filter(x => x?.status !== '成功');
+      if (!retryResults.length) {
+        alert('目前没有失败或部分成功的专辑，无需重抓。');
+        return;
+      }
+
+      const currentJob = loadJob();
+      if (currentJob?.active || state.resumeLock) {
+        alert('当前已有任务正在运行，请等待完成或先暂停。');
+        return;
+      }
+
+      const allAlbums = Array.isArray(meta?.albums) && meta.albums.length
+        ? meta.albums
+        : (Array.isArray(currentJob?.albums) ? currentJob.albums : []);
+      if (!allAlbums.length) {
+        alert('没有找到完整专辑列表，暂时无法只重抓失败专辑。');
+        return;
+      }
+
+      const names = retryResults.slice(0, 8).map(x => `• ${x.name || x.audioId}`).join('\n');
+      const more = retryResults.length > 8 ? `\n……另有 ${retryResults.length - 8} 个` : '';
+      const ok = confirm(`检测到 ${retryResults.length} 个失败/部分成功专辑。\n\n${names}${more}\n\n是否只重新抓取这些专辑？已经成功的专辑不会重复抓取。`);
+      if (!ok) return;
+
+      // 确认框期间也可能发生状态变化，启动前再检查一次，避免双任务并发操作同一页面。
+      const beforeStart = loadJob();
+      if (beforeStart?.active || state.resumeLock) {
+        alert('另一个任务已经启动，本次重抓已取消，避免两个任务同时操作页面。');
+        return;
+      }
+
+      const retryIds = retryResults.map(x => String(x.audioId || '')).filter(Boolean);
+      const oldJob = beforeStart || {};
+      const job = {
+        ...oldJob,
+        active: true,
+        version: '3.3.0',
+        phase: 'need_albums',
+        startedAt: oldJob.startedAt || meta?.startedAt || now(),
+        returnUrl: oldJob.returnUrl || meta?.returnUrl || location.href,
+        overall: meta?.overall || oldJob.overall || null,
+        catalog: meta?.catalog || oldJob.catalog || { page: 1, total: allAlbums.length, albums: allAlbums },
+        albums: allAlbums,
+        completedIds: results.filter(x => x?.status === '成功').map(x => String(x.audioId || '')).filter(Boolean),
+        retryOnly: true,
+        retryIds,
+      };
+
+      saveJob(job);
+      await saveCheckpointMeta(job, false);
+      state.cancelRequested = false;
+      state.phaseText = `准备重抓失败专辑（${retryIds.length} 个）`;
+      state.albumIndex = 0;
+      state.albumTotal = retryIds.length;
+      state.currentAlbum = '';
+      state.albumStep = 0;
+      log(`已建立失败重抓队列：${retryIds.length} 个。成功专辑保持原断点，不会重新抓。`);
+      render();
+
+      if (detectPageType() !== 'album_statistics') {
+        location.href = job.returnUrl || 'https://cp.idaddy.cn/h5/admin/statistics_audio';
+        return;
+      }
+      setTimeout(resumeJobIfNeeded, 200);
+    } finally {
+      state.retryStartLock = false;
+      render();
+    }
+  }
+
+  async function clearCheckpointAndTask() {
+    const ok = confirm('确定清除当前任务和全部断点数据吗？\n清除后，已抓取的专辑数据将无法通过脚本重新导出。');
+    if (!ok) return;
+    state.cancelRequested = true;
+    clearJob();
+    try { await checkpointClearAll(); } catch (_) {}
+    state.results = [];
+    state.savedCount = 0;
+    state.success = 0;
+    state.failed = 0;
+    state.albumIndex = 0;
+    state.albumTotal = 0;
+    state.albumListLoaded = 0;
+    state.albumListTotal = 0;
+    state.currentAlbum = '';
+    state.albumStep = 0;
+    state.overallStep = 0;
+    state.phaseText = '断点已清除';
+    log('任务和断点数据已全部清除。');
+    render();
+  }
+
+
+  function pageLabel() {
+    const t = detectPageType();
+    if (t === 'album_statistics') return '作品数据';
+    if (t === 'dashboard') return '首页/总体数据';
+    if (t === 'audio_list') return '音频管理';
+    return '其他后台页面';
+  }
+
+  function overallPercent() {
+    return Math.min(100, state.overallTotal ? state.overallStep / state.overallTotal * 100 : 0);
+  }
+
+  function albumPercent() {
+    if (!state.albumTotal) return 0;
+    const completedBefore = Math.max(0, state.albumIndex - 1);
+    const fraction = state.albumStepTotal ? state.albumStep / state.albumStepTotal : 0;
+    return Math.min(100, (completedBefore + fraction) / state.albumTotal * 100);
+  }
+
+  function render() {
+    const p = state.panel;
+    if (!p) return;
+    const job = loadJob();
+    p.querySelector('#tr-page').textContent = pageLabel();
+    p.querySelector('#tr-phase').textContent = state.phaseText || (job?.active ? job.phase : '等待开始');
+    p.querySelector('#tr-overall-step').textContent = `${state.overallStep} / ${state.overallTotal}`;
+    p.querySelector('#tr-overall-bar').style.width = `${overallPercent()}%`;
+    p.querySelector('#tr-list').textContent = `${state.albumListLoaded} / ${state.albumListTotal || '?'}`;
+    p.querySelector('#tr-album-step').textContent = `${state.albumIndex} / ${state.albumTotal || '?'}`;
+    p.querySelector('#tr-album-bar').style.width = `${albumPercent()}%`;
+    p.querySelector('#tr-current').textContent = state.currentAlbum || '—';
+    p.querySelector('#tr-current-step').textContent = `${state.albumStep} / ${state.albumStepTotal}`;
+    p.querySelector('#tr-success').textContent = String(state.success);
+    p.querySelector('#tr-failed').textContent = String(state.failed);
+    const savedEl = p.querySelector('#tr-saved');
+    if (savedEl) savedEl.textContent = `${state.savedCount} 个专辑`;
+    p.querySelector('#tr-lastlog').textContent = state.logs.slice(-5).join('\n') || '等待开始…';
+
+    const pausedShuttingDown = !!state.resumeLock && !!state.cancelRequested && !job?.active;
+    const busy = !!job?.active || state.retryStartLock || (!!state.resumeLock && !pausedShuttingDown);
+    const retryBtn = p.querySelector('#tr-retry-failed');
+    const resumeBtn = p.querySelector('#tr-resume');
+    const startBtn = p.querySelector('#tr-start');
+    if (retryBtn) retryBtn.disabled = busy;
+    if (resumeBtn) resumeBtn.disabled = busy;
+    if (startBtn) startBtn.disabled = !!job?.active || state.resumeLock || state.retryStartLock;
+  }
+
+  function createPanel() {
+    if (state.panel || !document.body) return;
+    const panel = document.createElement('div');
+    panel.id = '__tr_oneclick_panel__';
+    panel.innerHTML = `
+      <style>
+        #__tr_oneclick_panel__{position:fixed;z-index:2147483647;right:18px;top:82px;width:390px;background:rgba(255,255,255,.985);color:#1f2329;border:1px solid #dfe3e8;border-radius:12px;box-shadow:0 10px 32px rgba(0,0,0,.17);font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;overflow:hidden}
+        #__tr_oneclick_panel__ .tr-head{padding:12px 14px 9px;font-weight:700;font-size:15px;border-bottom:1px solid #edf0f3;background:#fafbfc}
+        #__tr_oneclick_panel__ .tr-body{padding:12px 14px 14px}
+        #__tr_oneclick_panel__ .tr-row{margin:7px 0}
+        #__tr_oneclick_panel__ .tr-muted{color:#7a8490}
+        #__tr_oneclick_panel__ .tr-progress{height:8px;border-radius:99px;background:#edf0f3;overflow:hidden;margin-top:5px}
+        #__tr_oneclick_panel__ .tr-progress>div{height:100%;width:0;background:#1677ff;transition:width .2s ease}
+        #__tr_oneclick_panel__ .tr-status{max-height:100px;overflow:auto;padding:7px 8px;background:#f6f8fa;border-radius:7px;white-space:pre-wrap;word-break:break-all}
+        #__tr_oneclick_panel__ .tr-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:10px}
+        #__tr_oneclick_panel__ button{border:1px solid #cfd6de;background:#fff;color:#20252b;border-radius:7px;padding:8px;cursor:pointer;font:inherit}
+        #__tr_oneclick_panel__ button:hover{background:#f3f6f9}
+        #__tr_oneclick_panel__ button:disabled{opacity:.5;cursor:not-allowed;background:#f5f5f5;color:#8c8c8c}
+        #__tr_oneclick_panel__ .tr-primary{background:#1677ff;color:#fff;border-color:#1677ff;font-weight:700}
+        #__tr_oneclick_panel__ .tr-danger{color:#d4380d}
+
+        #__tr_oneclick_panel__ .tr-head,
+        #__tr_export_panel__ .tr-head,
+        [id*="tr_"][id*="panel"] .tr-head {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+        }
+        .tr-head-title {
+          flex: 1;
+          min-width: 0;
+        }
+        .tr-minimize {
+          flex: 0 0 auto;
+          width: 28px !important;
+          height: 26px !important;
+          min-width: 28px !important;
+          padding: 0 !important;
+          margin: 0 !important;
+          border: 1px solid #d9dee5 !important;
+          border-radius: 6px !important;
+          background: #fff !important;
+          color: #5d6670 !important;
+          font-size: 18px !important;
+          line-height: 22px !important;
+          cursor: pointer !important;
+        }
+        .tr-minimize:hover {
+          background: #f3f6f9 !important;
+        }
+        .tr-panel-minimized {
+          width: 230px !important;
+          min-width: 230px !important;
+          height: auto !important;
+        }
+        .tr-panel-minimized .tr-body {
+          display: none !important;
+        }
+        .tr-panel-minimized .tr-head {
+          border-bottom: 0 !important;
+          padding: 9px 10px !important;
+        }
+        .tr-panel-minimized .tr-minimize {
+          font-size: 15px !important;
+        }
+
+      </style>
+      <div class="tr-head"><div class="tr-head-title">童锐一键导出：总体 + 全部专辑 v3.3</div><button id="tr-minimize" class="tr-minimize" title="最小化">—</button></div>
+      <div class="tr-body">
+        <div class="tr-row"><b>当前页面：</b><span id="tr-page">识别中</span></div>
+        <div class="tr-row"><b>当前阶段：</b><span id="tr-phase">等待开始</span></div>
+        <div class="tr-row"><b>总体数据：</b><span id="tr-overall-step">0 / 9</span><div class="tr-progress"><div id="tr-overall-bar"></div></div></div>
+        <div class="tr-row"><b>专辑列表：</b><span id="tr-list">0 / ?</span></div>
+        <div class="tr-row"><b>专辑进度：</b><span id="tr-album-step">0 / ?</span><div class="tr-progress"><div id="tr-album-bar"></div></div></div>
+        <div class="tr-row"><b>当前专辑：</b><span id="tr-current">—</span></div>
+        <div class="tr-row"><b>当前专辑：</b><span id="tr-current-step">0 / 9</span>　成功 <span id="tr-success">0</span> / 需重抓 <span id="tr-failed">0</span></div>
+        <div class="tr-row"><b>断点保存：</b><span id="tr-saved">0 个专辑</span></div>
+        <div class="tr-row tr-muted">每完成一个专辑立即保存断点。Excel自动下载失败也不会丢数据；手动“可靠导出”会弹出保存位置。失败/部分成功专辑可单独重抓；暂停后无需刷新即可直接继续或重抓。</div>
+        <div class="tr-status" id="tr-lastlog">等待开始…</div>
+        <div class="tr-grid">
+          <button class="tr-primary" id="tr-start" style="grid-column:1/-1">全新抓取：总体 + 全部专辑 Excel</button>
+          <button id="tr-pause">暂停并保存断点</button>
+          <button id="tr-resume">继续断点抓取</button>
+          <button id="tr-export-saved" style="grid-column:1/-1;font-weight:700">可靠导出目前已保存专辑 Excel</button>
+          <button id="tr-retry-failed" style="grid-column:1/-1;font-weight:700">重新抓取失败 / 部分成功专辑</button>
+          <button class="tr-danger" id="tr-clear">清除任务和断点</button>
+        </div>
+      </div>`;
+    document.body.appendChild(panel);
+    state.panel = panel;
+    panel.querySelector('#tr-start').addEventListener('click', startOneClick);
+    panel.querySelector('#tr-pause').addEventListener('click', pauseOneClick);
+    panel.querySelector('#tr-resume').addEventListener('click', resumeCheckpoint);
+    panel.querySelector('#tr-export-saved').addEventListener('click', exportSavedWorkbook);
+    panel.querySelector('#tr-retry-failed').addEventListener('click', retryFailedAlbums);
+    panel.querySelector('#tr-clear').addEventListener('click', clearCheckpointAndTask);
+
+    const minimizeBtn = panel.querySelector('#tr-minimize');
+    if (minimizeBtn) {
+      minimizeBtn.addEventListener('click', () => {
+        const minimized = panel.classList.toggle('tr-panel-minimized');
+        minimizeBtn.textContent = minimized ? '□' : '—';
+        minimizeBtn.title = minimized ? '展开' : '最小化';
+        try {
+          localStorage.setItem('__tr_oneclick_panel_minimized__', minimized ? '1' : '0');
+        } catch (_) {}
+      });
+
+      // 记住上一次最小化状态
+      try {
+        if (localStorage.getItem('__tr_oneclick_panel_minimized__') === '1') {
+          panel.classList.add('tr-panel-minimized');
+          minimizeBtn.textContent = '□';
+          minimizeBtn.title = '展开';
+        }
+      } catch (_) {}
+    }
+
+    render();
+  }
+
+  function init() {
+    const ready = async () => {
+      createPanel();
+      await restoreCheckpointState();
+      setTimeout(resumeJobIfNeeded, 1200);
+    };
+    if (document.body) ready();
+    else {
+      const obs = new MutationObserver(() => {
+        if (document.body) {
+          obs.disconnect();
+          ready();
+        }
+      });
+      obs.observe(document.documentElement || document, { childList: true, subtree: true });
+    }
+  }
+
+  init();
+})();

@@ -1,0 +1,5482 @@
+// ==UserScript==
+// @name         喜马拉雅全部专辑数据导出（核心数据 + 流量转化 + 留存）
+// @namespace    https://ximalaya.com/
+// @version      3.2.0-api-selectable
+// @description  可选并发接口版：支持 4/8/12/16 路并发档位；联动 HTTP 与留存分页并发；保留接口直抓、断点续传、分周期Sheet和阶段备份。
+// @match        https://studio.ximalaya.com/*
+// @match        https://*.ximalaya.com/*
+// @run-at       document-idle
+// @grant        GM_xmlhttpRequest
+// @grant        GM_registerMenuCommand
+// @connect      hybrid.ximalaya.com
+// @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  const VERSION = "3.2.0-api-selectable";
+  const PANEL_ID = "xm-export-panel-v320-api-selectable";
+  const STORAGE_KEY = "xm_export_album_id";
+  const ALL_EXPORT_PROGRESS_KEY = "xm_export_all_progress_v220";
+  const LEGACY_PROGRESS_KEYS = [
+    "xm_export_all_progress_v220",
+    "xm_export_all_progress_v206",
+    "xm_export_all_progress_v205",
+    "xm_export_all_progress",
+  ];
+  const PROGRESS_DB_NAME = "xm_export_durable_progress";
+  const PROGRESS_DB_STORE = "snapshots";
+  const PROGRESS_DB_KEY = "all_albums";
+
+  const PAGE_SIZE = 100;
+  const WEEK_SLOTS = 9;
+  const MAX_ALBUM_PAGES = 50;
+  const MAX_RETENTION_PAGES = 200;
+
+  /*
+   * 如果留存率接口返回 0.35，实际代表 35%，改为 true。
+   * 如果接口直接返回 35，代表 35%，保持 false。
+   */
+  const RATE_IS_FRACTION = false;
+
+  const BASE_ALBUM = "https://hybrid.ximalaya.com/data/albumByPage";
+  const BASE_RETENTION = "https://hybrid.ximalaya.com/data/web/albumRetention";
+
+  // v3.0.0 高速接口版：核心数据一次返回 5 个周期；流量转化直接按日期窗口请求。
+  const BASE_KPI_TOTAL = "https://hybrid.ximalaya.com/data/api/v2/album/web/kpiTotal";
+  const BASE_CONVERSION = "https://hybrid.ximalaya.com/data/getAlbumConversion";
+  const CONVERSION_SEARCH_TYPE = "intelligent_recommendation";
+
+  // v3.2.0：并发档位可在面板中选择，并自动记忆。
+  // 档位会同时控制“专辑 worker / 全局 HTTP / 单专辑留存分页”三层并发，
+  // 避免只放大某一层导致其余环节成为瓶颈。
+  const CONCURRENCY_PROFILE_KEY = "xm_export_concurrency_profile_v320";
+  const DEFAULT_CONCURRENCY_LEVEL = "8";
+  const CONCURRENCY_PROFILES = Object.freeze({
+    "4":  Object.freeze({ level: "4",  label: "保守", album: 4,  http: 8,  retentionPages: 3 }),
+    "8":  Object.freeze({ level: "8",  label: "标准", album: 8,  http: 12, retentionPages: 6 }),
+    "12": Object.freeze({ level: "12", label: "快速", album: 12, http: 18, retentionPages: 8 }),
+    "16": Object.freeze({ level: "16", label: "激进", album: 16, http: 24, retentionPages: 10 }),
+  });
+  const CHECKPOINT_INTERVAL_MS = 1200;
+  const CHECKPOINT_ALBUM_BATCH = 5;
+
+  const CORE_METRICS = [
+    "曝光数",
+    "点击数",
+    "播放数",
+    "完播率",
+    "次日留存率",
+    "7日留存率",
+    "订阅数",
+    "月票数",
+    "分享数",
+  ];
+
+  const OUTPUT_HEADERS = [
+    ...CORE_METRICS,
+    "“曝光-点击”转化率",
+    "“点击-播放”点击率",
+    "“播放-完播”转换率",
+  ];
+
+  const EXPORT_PERIODS = [
+    {
+      outputName: "昨日",
+      coreAliases: ["昨日", "昨天"],
+      trafficAliases: null,
+    },
+    {
+      outputName: "近7天",
+      coreAliases: ["近7日", "近7天", "最近7日", "最近7天"],
+      trafficAliases: ["近7日", "近7天", "最近7日", "最近7天"],
+    },
+    {
+      outputName: "近30天",
+      coreAliases: ["近30日", "近30天", "最近30日", "最近30天"],
+      trafficAliases: ["近30日", "近30天", "最近30日", "最近30天"],
+    },
+    {
+      outputName: "近1年",
+      coreAliases: ["近1年", "近一年", "近365日", "近365天", "最近1年", "最近一年"],
+      // 喜马拉雅流量转化板块没有可靠的近1年周期，因此年度三项转换率固定留空。
+      trafficAliases: null,
+    },
+    {
+      outputName: "累计",
+      coreAliases: ["累计"],
+      // v2.4.1：累计只切换“核心数据”的累计周期。
+      // 暂不主动切换“流量转化”的累计，避免它改变页面周期状态并干扰下一张专辑的昨日/近7天识别。
+      trafficAliases: null,
+    },
+  ];
+
+  const MSG_FLAG = "__XM_EXPORT_V251_PERIOD_SHEETS__";
+  const MSG_COMMAND = "COMMAND";
+  const MSG_RESULT = "COMMAND_RESULT";
+
+  const VALUE_SOURCE =
+    "(?:-|--|—|[+\\-]?\\d[\\d,]*(?:\\.\\d+)?(?:万|亿|千|百)?%?)";
+  const VALUE_RE = new RegExp(`^${VALUE_SOURCE}$`);
+  const RATE_RE = /^[+\-]?\d[\d,]*(?:\.\d+)?%$/;
+
+  const sleep = (ms) =>
+    new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
+
+  const cleanText = (value) =>
+    String(value == null ? "" : value)
+      .replace(/\u00a0/g, " ")
+      .replace(/\r/g, "")
+      .replace(/[ \t]+/g, " ")
+      .trim();
+
+  const normalizeText = (value) =>
+    cleanText(value)
+      .replace(/[?？ⓘℹ:：()（）]/g, "")
+      .replace(/\s+/g, "")
+      .trim();
+
+  /*
+   * 专辑标题在页面中经常会被截断，并且“| / ｜”、空格、书名号等符号
+   * 可能和接口返回值不完全一致，因此专辑匹配使用单独的标准化规则。
+   */
+  const normalizeAlbumText = (value) =>
+    cleanText(value)
+      .replace(/[.。…\u2026·•]/g, "")
+      .replace(/[|｜]/g, "")
+      .replace(/[【】\[\]《》<>〈〉「」『』()（）{}“”"'‘’：:，,、；;！!？?＿_\-—–~～]/g, "")
+      .replace(/\s+/g, "")
+      .toLowerCase()
+      .trim();
+
+  const albumTitleMatchScore = (candidateTitle, targetTitle) => {
+    const candidate = normalizeAlbumText(candidateTitle);
+    const target = normalizeAlbumText(targetTitle);
+
+    if (!candidate || !target) {
+      return 0;
+    }
+
+    if (candidate === target) {
+      return 10000 + candidate.length;
+    }
+
+    const shorter = candidate.length <= target.length ? candidate : target;
+    const longer = candidate.length > target.length ? candidate : target;
+
+    /* 页面标题被省略号截断时，允许较长的稳定前缀匹配。 */
+    if (shorter.length >= 8 && longer.startsWith(shorter)) {
+      return 8500 + shorter.length;
+    }
+
+    let commonPrefix = 0;
+    const maxPrefix = Math.min(candidate.length, target.length);
+    while (commonPrefix < maxPrefix && candidate[commonPrefix] === target[commonPrefix]) {
+      commonPrefix += 1;
+    }
+
+    if (commonPrefix >= 8 && commonPrefix / shorter.length >= 0.8) {
+      return 7000 + commonPrefix;
+    }
+
+    /* 仅对足够长的文本允许包含匹配，避免“快更版”等短前缀误判。 */
+    if (shorter.length >= 12 && longer.includes(shorter)) {
+      return 6000 + shorter.length;
+    }
+
+    return 0;
+  };
+
+  const albumTitlesMatch = (candidateTitle, targetTitle) =>
+    albumTitleMatchScore(candidateTitle, targetTitle) > 0;
+
+  const safeName = (value) =>
+    cleanText(value)
+      .replace(/[\\/:*?"<>|]/g, "_")
+      .slice(0, 80);
+
+  const isValue = (value) => VALUE_RE.test(cleanText(value));
+
+  const formatRate = (value) => {
+    if (value == null || value === "") {
+      return "";
+    }
+
+    let number = Number(value);
+
+    if (!Number.isFinite(number)) {
+      return "";
+    }
+
+    if (RATE_IS_FRACTION) {
+      number *= 100;
+    }
+
+    return `${number.toFixed(2).replace(/\.?0+$/, "")}%`;
+  };
+
+  const csvCell = (value) => {
+    const text = String(value == null ? "" : value).replace(/"/g, '""');
+    return `"${text}"`;
+  };
+
+  const downloadCsv = (filename, rows) => {
+    const csv = rows.map((row) => row.map(csvCell).join(",")).join("\r\n");
+    const blob = new Blob(["\ufeff", csv], {
+      type: "text/csv;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.style.display = "none";
+    (document.body || document.documentElement).appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  };
+
+  const EMPTY_TRAFFIC = Object.freeze({
+    exposureClick: "",
+    clickPlay: "",
+    playFinish: "",
+  });
+
+  const isTrafficDisabledPeriod = (period) => {
+    const text = normalizeText(period);
+    return [
+      "昨日",
+      "昨天",
+      "近1年",
+      "近一年",
+      "近365日",
+      "近365天",
+      "最近1年",
+      "最近一年",
+      "累计",
+    ].includes(text);
+  };
+
+  /*
+   * 统一的数据清洗入口：昨日、近1年和累计不保存流量转换率。
+   * v2.4.1 的累计仅抓核心数据，避免累计流量周期干扰下一张专辑的周期状态。
+   * 该保护同时覆盖新抓取、旧断点、导入的阶段备份和最终导出。
+   */
+  const sanitizeRecordTraffic = (record) => {
+    if (!record || typeof record !== "object") return record;
+
+    const sanitized = {
+      ...record,
+      core: record.core && typeof record.core === "object" ? { ...record.core } : {},
+      traffic:
+        record.traffic && typeof record.traffic === "object"
+          ? {
+              exposureClick: cleanText(record.traffic.exposureClick),
+              clickPlay: cleanText(record.traffic.clickPlay),
+              playFinish: cleanText(record.traffic.playFinish),
+            }
+          : { ...EMPTY_TRAFFIC },
+    };
+
+    if (isTrafficDisabledPeriod(record.period)) {
+      sanitized.traffic = { ...EMPTY_TRAFFIC };
+    }
+
+    return sanitized;
+  };
+
+  const normalizeRetentionRate = (value) => {
+    const text = cleanText(value);
+    if (!text) return "";
+    if (/%$/.test(text)) return text;
+    return formatRate(value);
+  };
+
+  const sanitizeRetentionRecord = (record) => {
+    if (!record || typeof record !== "object") return null;
+    const rates = Array.isArray(record.rates) ? record.rates : [];
+    return {
+      albumId: String(record.albumId == null ? "" : record.albumId),
+      albumName: cleanText(record.albumName),
+      weekIndex: cleanText(record.weekIndex),
+      startDate: cleanText(record.startDate),
+      endDate: cleanText(record.endDate),
+      added: record.added == null ? "" : cleanText(record.added),
+      rates: Array.from({ length: WEEK_SLOTS }, (_, index) =>
+        normalizeRetentionRate(rates[index])
+      ),
+    };
+  };
+
+  const retentionRecordKey = (record) => {
+    const item = sanitizeRetentionRecord(record);
+    if (!item) return "";
+    return [item.albumId, item.weekIndex, item.startDate, item.endDate].join("::");
+  };
+
+  const sanitizeProgressTraffic = (progress) => {
+    if (!progress || typeof progress !== "object") return progress;
+    const retentionCompletedAlbumIds = Array.from(
+      new Set(
+        (Array.isArray(progress.retentionCompletedAlbumIds)
+          ? progress.retentionCompletedAlbumIds
+          : [])
+          .map((value) => String(value || ""))
+          .filter(Boolean)
+      )
+    );
+    return {
+      ...progress,
+      records: Array.isArray(progress.records)
+        ? progress.records.map(sanitizeRecordTraffic).filter(Boolean)
+        : [],
+      retentionRecords: Array.isArray(progress.retentionRecords)
+        ? progress.retentionRecords.map(sanitizeRetentionRecord).filter(Boolean)
+        : [],
+      retentionCompletedAlbumIds,
+    };
+  };
+
+  const sortRetentionRecordsForExport = (records) => {
+    const albumOrder = new Map(cachedAlbums.map((item, index) => [String(item.id), index]));
+    const deduped = new Map();
+
+    for (const raw of Array.isArray(records) ? records : []) {
+      const record = sanitizeRetentionRecord(raw);
+      if (!record || !record.albumId) continue;
+      deduped.set(retentionRecordKey(record), record);
+    }
+
+    const numberFromWeek = (value) => {
+      const match = cleanText(value).match(/\d+/);
+      return match ? Number(match[0]) : Number.NaN;
+    };
+
+    const sorted = Array.from(deduped.values()).sort((a, b) => {
+      const ai = albumOrder.has(String(a.albumId)) ? albumOrder.get(String(a.albumId)) : Number.MAX_SAFE_INTEGER;
+      const bi = albumOrder.has(String(b.albumId)) ? albumOrder.get(String(b.albumId)) : Number.MAX_SAFE_INTEGER;
+      if (ai !== bi) return ai - bi;
+
+      const aw = numberFromWeek(a.weekIndex);
+      const bw = numberFromWeek(b.weekIndex);
+      if (Number.isFinite(aw) && Number.isFinite(bw) && aw !== bw) return bw - aw;
+
+      const dateCompare = String(b.startDate || "").localeCompare(String(a.startDate || ""));
+      if (dateCompare) return dateCompare;
+      return String(a.albumName || "").localeCompare(String(b.albumName || ""));
+    });
+
+    let previousAlbumId = null;
+    return sorted.map((record) => {
+      const albumId = String(record.albumId);
+      const showAlbumName = albumId !== previousAlbumId;
+      previousAlbumId = albumId;
+      return { ...record, showAlbumName };
+    });
+  };
+
+  const formatRetentionListenTime = (record) => {
+    const rawWeek = cleanText(record && record.weekIndex);
+    let weekText = "";
+    if (rawWeek) {
+      weekText = /^第.*周$/.test(rawWeek) ? rawWeek : `第${rawWeek}周`;
+    }
+    const startDate = cleanText(record && record.startDate);
+    const endDate = cleanText(record && record.endDate);
+    const dateText = startDate && endDate ? `${startDate}~${endDate}` : (startDate || endDate);
+    return [weekText, dateText].filter(Boolean).join(" ");
+  };
+
+  const sortRecordsForExport = (records) => {
+    const albumOrder = new Map(cachedAlbums.map((item, index) => [String(item.id), index]));
+    const periodOrder = new Map(EXPORT_PERIODS.map((item, index) => [item.outputName, index]));
+    const deduped = new Map();
+
+    for (const record of Array.isArray(records) ? records : []) {
+      if (!record || record.albumId == null || !record.period) continue;
+      const sanitizedRecord = sanitizeRecordTraffic(record);
+      deduped.set(
+        `${String(sanitizedRecord.albumId)}::${sanitizedRecord.period}`,
+        sanitizedRecord
+      );
+    }
+
+    const sorted = Array.from(deduped.values()).sort((a, b) => {
+      const ai = albumOrder.has(String(a.albumId)) ? albumOrder.get(String(a.albumId)) : Number.MAX_SAFE_INTEGER;
+      const bi = albumOrder.has(String(b.albumId)) ? albumOrder.get(String(b.albumId)) : Number.MAX_SAFE_INTEGER;
+      const ap = periodOrder.has(a.period) ? periodOrder.get(a.period) : Number.MAX_SAFE_INTEGER;
+      const bp = periodOrder.has(b.period) ? periodOrder.get(b.period) : Number.MAX_SAFE_INTEGER;
+      return ai - bi || ap - bp || String(a.albumName || "").localeCompare(String(b.albumName || ""));
+    });
+
+    let previousAlbumId = null;
+    return sorted.map((record) => {
+      const albumId = String(record.albumId);
+      const showAlbumName = albumId !== previousAlbumId;
+      previousAlbumId = albumId;
+      return { ...record, showAlbumName };
+    });
+  };
+
+  const downloadAllAlbumsXlsx = (
+    records,
+    failures = [],
+    filenameOverride = "",
+    retentionRecords = [],
+    includePeriodSheets = true
+  ) => {
+    if (typeof XLSX === "undefined") {
+      throw new Error("XLSX 组件没有加载成功，请刷新页面后重试");
+    }
+
+    const exportRecords = sortRecordsForExport(records);
+    const exportRetentionRecords = sortRetentionRecordsForExport(retentionRecords);
+    const rows = [
+      Array(14).fill(""),
+      Array(14).fill(""),
+      ["专辑名称", "统计周期", ...OUTPUT_HEADERS],
+    ];
+
+    for (const record of exportRecords) {
+      rows.push([
+        record.showAlbumName ? record.albumName : "",
+        record.period,
+        ...CORE_METRICS.map((name) => (record.core && record.core[name]) || ""),
+        (record.traffic && record.traffic.exposureClick) || "",
+        (record.traffic && record.traffic.clickPlay) || "",
+        (record.traffic && record.traffic.playFinish) || "",
+      ]);
+    }
+
+    const worksheet = XLSX.utils.aoa_to_sheet(rows);
+    worksheet["!cols"] = [
+      { wch: 46 }, { wch: 12 }, { wch: 13 }, { wch: 13 }, { wch: 13 },
+      { wch: 13 }, { wch: 15 }, { wch: 15 }, { wch: 13 }, { wch: 13 },
+      { wch: 13 }, { wch: 22 }, { wch: 22 }, { wch: 22 },
+    ];
+    worksheet["!rows"] = [{ hpt: 8 }, { hpt: 8 }, { hpt: 24 }];
+
+    const albumMerges = [];
+    let mergeStartRow = -1;
+    let mergeAlbumId = "";
+    const firstDataRow = 3;
+
+    const closeAlbumMerge = (endRow) => {
+      if (mergeStartRow >= 0 && endRow > mergeStartRow) {
+        albumMerges.push({
+          s: { r: mergeStartRow, c: 0 },
+          e: { r: endRow, c: 0 },
+        });
+      }
+    };
+
+    exportRecords.forEach((record, index) => {
+      const albumId = String(record.albumId || "");
+      const rowIndex = firstDataRow + index;
+      if (albumId !== mergeAlbumId) {
+        closeAlbumMerge(rowIndex - 1);
+        mergeAlbumId = albumId;
+        mergeStartRow = rowIndex;
+      }
+    });
+    closeAlbumMerge(firstDataRow + exportRecords.length - 1);
+
+    if (albumMerges.length) {
+      worksheet["!merges"] = albumMerges;
+    }
+
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "核心数据汇总");
+
+    // 新增：按统计周期拆分 5 个核心数据工作表。
+    // 每个分周期表仍保留“统计周期”列，字段结构与“核心数据汇总”完全一致，便于后续统一分析。
+    if (includePeriodSheets) {
+      const periodSheetDefinitions = [
+        { period: "昨日", sheetName: "昨日" },
+        { period: "近7天", sheetName: "近七天" },
+        { period: "近30天", sheetName: "近30天" },
+        { period: "近1年", sheetName: "近一年" },
+        { period: "累计", sheetName: "累计" },
+      ];
+
+      for (const definition of periodSheetDefinitions) {
+        const periodRecords = exportRecords.filter(
+          (record) => normalizePeriodName(record.period) === definition.period
+        );
+
+        const periodRows = [
+          Array(14).fill(""),
+          Array(14).fill(""),
+          ["专辑名称", "统计周期", ...OUTPUT_HEADERS],
+        ];
+
+        for (const record of periodRecords) {
+          periodRows.push([
+            record.albumName || "",
+            definition.period,
+            ...CORE_METRICS.map((name) =>
+              (record.core && record.core[name]) || ""
+            ),
+            (record.traffic && record.traffic.exposureClick) || "",
+            (record.traffic && record.traffic.clickPlay) || "",
+            (record.traffic && record.traffic.playFinish) || "",
+          ]);
+        }
+
+        const periodSheet = XLSX.utils.aoa_to_sheet(periodRows);
+        periodSheet["!cols"] = [
+          { wch: 46 }, { wch: 12 }, { wch: 13 }, { wch: 13 }, { wch: 13 },
+          { wch: 13 }, { wch: 15 }, { wch: 15 }, { wch: 13 }, { wch: 13 },
+          { wch: 13 }, { wch: 22 }, { wch: 22 }, { wch: 22 },
+        ];
+        periodSheet["!rows"] = [{ hpt: 8 }, { hpt: 8 }, { hpt: 24 }];
+
+        XLSX.utils.book_append_sheet(
+          workbook,
+          periodSheet,
+          definition.sheetName
+        );
+      }
+    }
+
+    // 新增：全部专辑“留存分析”。字段与页面保持一致：首次收听时间、新增听众、1~9周后留存率。
+    const retentionRows = [
+      [
+        "专辑名称",
+        "首次收听时间",
+        "新增听众",
+        ...Array.from({ length: WEEK_SLOTS }, (_, index) => `${index + 1}周后`),
+      ],
+    ];
+
+    for (const record of exportRetentionRecords) {
+      retentionRows.push([
+        record.showAlbumName ? record.albumName : "",
+        formatRetentionListenTime(record),
+        record.added,
+        ...Array.from({ length: WEEK_SLOTS }, (_, index) =>
+          (record.rates && record.rates[index]) || ""
+        ),
+      ]);
+    }
+
+    const retentionSheet = XLSX.utils.aoa_to_sheet(retentionRows);
+    retentionSheet["!cols"] = [
+      { wch: 46 },
+      { wch: 34 },
+      { wch: 13 },
+      ...Array.from({ length: WEEK_SLOTS }, () => ({ wch: 12 })),
+    ];
+    retentionSheet["!rows"] = [{ hpt: 24 }];
+
+    const retentionMerges = [];
+    let retentionMergeStart = -1;
+    let retentionMergeAlbumId = "";
+    const retentionFirstDataRow = 1;
+    const closeRetentionMerge = (endRow) => {
+      if (retentionMergeStart >= 0 && endRow > retentionMergeStart) {
+        retentionMerges.push({
+          s: { r: retentionMergeStart, c: 0 },
+          e: { r: endRow, c: 0 },
+        });
+      }
+    };
+    exportRetentionRecords.forEach((record, index) => {
+      const albumId = String(record.albumId || "");
+      const rowIndex = retentionFirstDataRow + index;
+      if (albumId !== retentionMergeAlbumId) {
+        closeRetentionMerge(rowIndex - 1);
+        retentionMergeAlbumId = albumId;
+        retentionMergeStart = rowIndex;
+      }
+    });
+    closeRetentionMerge(retentionFirstDataRow + exportRetentionRecords.length - 1);
+    if (retentionMerges.length) retentionSheet["!merges"] = retentionMerges;
+    XLSX.utils.book_append_sheet(workbook, retentionSheet, "留存分析");
+
+    if (failures.length) {
+      const failureRows = [
+        ["序号", "专辑ID", "专辑名称", "失败阶段", "失败原因"],
+        ...failures.map((item, index) => [
+          index + 1, item.albumId || "", item.albumName || "",
+          item.stage || "专辑抓取", item.reason || "未知错误",
+        ]),
+      ];
+      const failureSheet = XLSX.utils.aoa_to_sheet(failureRows);
+      failureSheet["!cols"] = [
+        { wch: 8 }, { wch: 18 }, { wch: 55 }, { wch: 18 }, { wch: 90 },
+      ];
+      XLSX.utils.book_append_sheet(workbook, failureSheet, "失败专辑");
+    }
+
+    const filename = filenameOverride || (failures.length
+      ? `全部专辑数据_含${failures.length}个失败项.xlsx`
+      : "全部专辑数据汇总.xlsx");
+
+    // 隐藏断点表：核心数据。
+    const recoveryRows = [
+      [
+        "albumId",
+        "albumName",
+        "period",
+        ...CORE_METRICS,
+        "exposureClick",
+        "clickPlay",
+        "playFinish",
+      ],
+      ...exportRecords.map((record) => [
+        String(record.albumId || ""),
+        record.albumName || "",
+        record.period || "",
+        ...CORE_METRICS.map((name) => (record.core && record.core[name]) || ""),
+        (record.traffic && record.traffic.exposureClick) || "",
+        (record.traffic && record.traffic.clickPlay) || "",
+        (record.traffic && record.traffic.playFinish) || "",
+      ]),
+    ];
+    const recoverySheet = XLSX.utils.aoa_to_sheet(recoveryRows);
+    XLSX.utils.book_append_sheet(workbook, recoverySheet, "断点恢复");
+
+    // 隐藏断点表：留存分析。阶段备份导入后可以继续补抓未完成专辑的留存。
+    const retentionRecoveryRows = [
+      [
+        "albumId",
+        "albumName",
+        "weekIndex",
+        "startDate",
+        "endDate",
+        "added",
+        ...Array.from({ length: WEEK_SLOTS }, (_, index) => `rate${index + 1}`),
+      ],
+      ...exportRetentionRecords.map((record) => [
+        String(record.albumId || ""),
+        record.albumName || "",
+        record.weekIndex || "",
+        record.startDate || "",
+        record.endDate || "",
+        record.added == null ? "" : record.added,
+        ...Array.from({ length: WEEK_SLOTS }, (_, index) =>
+          (record.rates && record.rates[index]) || ""
+        ),
+      ]),
+    ];
+    const retentionRecoverySheet = XLSX.utils.aoa_to_sheet(retentionRecoveryRows);
+    XLSX.utils.book_append_sheet(workbook, retentionRecoverySheet, "留存断点恢复");
+
+    workbook.Workbook = workbook.Workbook || {};
+    workbook.Workbook.Sheets = workbook.SheetNames.map((name) => ({
+      Hidden: ["断点恢复", "留存断点恢复"].includes(name) ? 1 : 0,
+    }));
+
+    XLSX.writeFile(workbook, filename, { compression: true });
+  };
+
+  // ==================================================
+  // DOM 与 Shadow DOM 通用扫描
+  // ==================================================
+
+  const isPanelElement = (element) => {
+    if (!element || element.nodeType !== 1) {
+      return false;
+    }
+
+    try {
+      if (element.id && String(element.id).startsWith("xm-export-panel")) {
+        return true;
+      }
+
+      return Boolean(
+        element.closest && element.closest('[id^="xm-export-panel"]')
+      );
+    } catch (error) {
+      return false;
+    }
+  };
+
+  const isVisible = (element) => {
+    if (!element || element.nodeType !== 1 || isPanelElement(element)) {
+      return false;
+    }
+
+    try {
+      const view = element.ownerDocument.defaultView || window;
+      const style = view.getComputedStyle(element);
+
+      if (
+        style.display === "none" ||
+        style.visibility === "hidden" ||
+        Number(style.opacity) === 0
+      ) {
+        return false;
+      }
+
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    } catch (error) {
+      return false;
+    }
+  };
+
+  const getOwnText = (element) => {
+    let text = "";
+
+    try {
+      text = Array.from(element.childNodes || [])
+        .filter((node) => node.nodeType === 3)
+        .map((node) => node.nodeValue || "")
+        .join(" ");
+    } catch (error) {
+      text = "";
+    }
+
+    text = cleanText(text);
+
+    if (!text) {
+      try {
+        text = cleanText(
+          element.getAttribute("aria-label") ||
+            element.getAttribute("title") ||
+            element.getAttribute("value") ||
+            ""
+        );
+      } catch (error) {
+        text = "";
+      }
+    }
+
+    return text;
+  };
+
+  const getElementText = (element) => {
+    if (!element) {
+      return "";
+    }
+
+    try {
+      if (String(element.tagName || "").toLowerCase() === "input") {
+        return cleanText(
+          element.value ||
+            element.getAttribute("placeholder") ||
+            element.getAttribute("title") ||
+            ""
+        );
+      }
+
+      if (String(element.tagName || "").toLowerCase() === "select") {
+        const option = element.options[element.selectedIndex];
+        return cleanText(option ? option.textContent : "");
+      }
+
+      return cleanText(
+        element.getAttribute("title") ||
+          element.getAttribute("aria-label") ||
+          element.innerText ||
+          element.textContent ||
+          ""
+      );
+    } catch (error) {
+      return "";
+    }
+  };
+
+  const collectRoots = () => {
+    const roots = [];
+    const seen = new Set();
+
+    const visit = (root) => {
+      if (!root || seen.has(root)) {
+        return;
+      }
+
+      seen.add(root);
+      roots.push(root);
+
+      let elements = [];
+
+      try {
+        elements = Array.from(root.querySelectorAll("*"));
+      } catch (error) {
+        elements = [];
+      }
+
+      for (const element of elements) {
+        if (element.shadowRoot) {
+          visit(element.shadowRoot);
+        }
+      }
+    };
+
+    visit(document);
+    return roots;
+  };
+
+  const queryAllLocal = (selector) => {
+    const result = [];
+    const seen = new Set();
+
+    for (const root of collectRoots()) {
+      let elements = [];
+
+      try {
+        elements = Array.from(root.querySelectorAll(selector));
+      } catch (error) {
+        elements = [];
+      }
+
+      for (const element of elements) {
+        if (!seen.has(element)) {
+          seen.add(element);
+          result.push(element);
+        }
+      }
+    }
+
+    return result;
+  };
+
+  const getParent = (element) => {
+    if (!element) {
+      return null;
+    }
+
+    if (element.parentElement) {
+      return element.parentElement;
+    }
+
+    try {
+      const root = element.getRootNode();
+      return root && root.host ? root.host : null;
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const elementContains = (container, element) => {
+    if (!container || !element) {
+      return false;
+    }
+
+    let current = element;
+
+    for (let depth = 0; depth < 30 && current; depth += 1) {
+      if (current === container) {
+        return true;
+      }
+      current = getParent(current);
+    }
+
+    return false;
+  };
+
+  const buildTokens = (container = null) => {
+    const tokens = [];
+
+    for (const element of queryAllLocal("*")) {
+      if (!isVisible(element)) {
+        continue;
+      }
+
+      if (container && !elementContains(container, element)) {
+        continue;
+      }
+
+      const text = getOwnText(element);
+
+      if (!text || text.length > 120) {
+        continue;
+      }
+
+      let rect;
+      let fontSize = 0;
+      let fontWeight = 400;
+
+      try {
+        rect = element.getBoundingClientRect();
+        const style = (element.ownerDocument.defaultView || window).getComputedStyle(
+          element
+        );
+        fontSize = parseFloat(style.fontSize) || 0;
+        fontWeight = parseInt(style.fontWeight, 10) || 400;
+      } catch (error) {
+        continue;
+      }
+
+      const parts = text.split(/\n+/).map(cleanText).filter(Boolean);
+
+      for (const part of parts) {
+        tokens.push({
+          element,
+          text: part,
+          normalized: normalizeText(part),
+          rect,
+          fontSize,
+          fontWeight,
+        });
+      }
+    }
+
+    return tokens;
+  };
+
+  const findSectionRoot = (titleAliases, requiredWords = []) => {
+    const aliases = titleAliases.map(normalizeText);
+    const candidates = [];
+
+    for (const element of queryAllLocal("div,section,article,main,h1,h2,h3,h4,p,span")) {
+      if (!isVisible(element)) {
+        continue;
+      }
+
+      const own = normalizeText(getOwnText(element));
+      if (!aliases.includes(own)) {
+        continue;
+      }
+
+      let current = element;
+
+      for (let depth = 0; depth < 12 && current; depth += 1) {
+        try {
+          const rect = current.getBoundingClientRect();
+          const text = normalizeText(
+            current.innerText || current.textContent || ""
+          );
+          const wordCount = requiredWords.filter((word) =>
+            text.includes(normalizeText(word))
+          ).length;
+
+          if (
+            rect.width >= 300 &&
+            rect.height >= 100 &&
+            rect.height <= 1200 &&
+            (!requiredWords.length || wordCount >= Math.min(2, requiredWords.length))
+          ) {
+            candidates.push({
+              element: current,
+              score:
+                rect.width * rect.height +
+                depth * 5000 -
+                wordCount * 120000,
+            });
+          }
+        } catch (error) {
+          // 继续向上查找。
+        }
+
+        current = getParent(current);
+      }
+    }
+
+    candidates.sort((a, b) => a.score - b.score);
+    return candidates.length ? candidates[0].element : null;
+  };
+
+  const findClickableAncestor = (element) => {
+    let current = element;
+
+    for (let depth = 0; depth < 5 && current; depth += 1) {
+      const tag = String(current.tagName || "").toLowerCase();
+      const role = cleanText(current.getAttribute && current.getAttribute("role"));
+
+      if (
+        ["button", "a", "label", "li"].includes(tag) ||
+        ["button", "tab", "option"].includes(role) ||
+        typeof current.onclick === "function"
+      ) {
+        return current;
+      }
+
+      current = getParent(current);
+    }
+
+    return element;
+  };
+
+  const dispatchMouseLikeEvent = (target, type, clientX, clientY, view) => {
+    const common = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view,
+      clientX,
+      clientY,
+      screenX: clientX,
+      screenY: clientY,
+      button: 0,
+      buttons: type === "mouseup" || type === "pointerup" || type === "click" ? 0 : 1,
+    };
+
+    if (type.startsWith("pointer") && typeof view.PointerEvent === "function") {
+      target.dispatchEvent(
+        new view.PointerEvent(type, {
+          ...common,
+          pointerId: 1,
+          pointerType: "mouse",
+          isPrimary: true,
+        })
+      );
+      return;
+    }
+
+    target.dispatchEvent(new view.MouseEvent(type, common));
+  };
+
+  const clickElement = (element) => {
+    if (!element) {
+      return false;
+    }
+
+    let target = findClickableAncestor(element) || element;
+    const doc = target.ownerDocument || document;
+    const view = doc.defaultView || window;
+
+    try {
+      target.scrollIntoView({ block: "center", inline: "nearest", behavior: "auto" });
+    } catch (error) {
+      // 忽略。
+    }
+
+    let rect = null;
+    try {
+      rect = target.getBoundingClientRect();
+      const x = Math.max(rect.left + 2, Math.min(rect.right - 2, rect.left + rect.width / 2));
+      const y = Math.max(rect.top + 2, Math.min(rect.bottom - 2, rect.top + rect.height / 2));
+      const hit = doc.elementFromPoint ? doc.elementFromPoint(x, y) : null;
+
+      /* 虚拟列表常把点击事件绑在最上层命中节点或其行容器上。 */
+      if (hit && (elementContains(target, hit) || elementContains(element, hit))) {
+        target = findClickableAncestor(hit) || hit;
+        rect = target.getBoundingClientRect();
+      }
+    } catch (error) {
+      rect = null;
+    }
+
+    try {
+      if (typeof target.focus === "function") {
+        target.focus({ preventScroll: true });
+      }
+    } catch (error) {
+      // 忽略。
+    }
+
+    try {
+      const clientX = rect ? rect.left + rect.width / 2 : 0;
+      const clientY = rect ? rect.top + rect.height / 2 : 0;
+
+      ["mouseover", "mouseenter", "mousemove"].forEach((type) => {
+        dispatchMouseLikeEvent(target, type, clientX, clientY, view);
+      });
+      dispatchMouseLikeEvent(target, "pointerdown", clientX, clientY, view);
+      dispatchMouseLikeEvent(target, "mousedown", clientX, clientY, view);
+      dispatchMouseLikeEvent(target, "pointerup", clientX, clientY, view);
+      dispatchMouseLikeEvent(target, "mouseup", clientX, clientY, view);
+
+      /* 只触发一次 click，避免双击导致下拉框刚选中又重新打开。 */
+      if (typeof target.click === "function") {
+        target.click();
+      } else {
+        dispatchMouseLikeEvent(target, "click", clientX, clientY, view);
+      }
+
+      return true;
+    } catch (error) {
+      console.warn("[xm-export] 模拟点击失败", error, target);
+      return false;
+    }
+  };
+
+  const setNativeInputValue = (input, value) => {
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value"
+      );
+
+      if (descriptor && descriptor.set) {
+        descriptor.set.call(input, value);
+      } else {
+        input.value = value;
+      }
+
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    } catch (error) {
+      return false;
+    }
+  };
+
+  // ==================================================
+  // 核心数据扫描
+  // ==================================================
+
+  const metricCount = (text) => {
+    const compact = normalizeText(text);
+    return CORE_METRICS.filter((name) => compact.includes(normalizeText(name)))
+      .length;
+  };
+
+  const findMetricCard = (labelToken, label) => {
+    let current = labelToken.element;
+    let best = null;
+
+    for (let depth = 0; depth < 11 && current; depth += 1) {
+      try {
+        const rect = current.getBoundingClientRect();
+        const text = cleanText(current.innerText || current.textContent || "");
+        const count = metricCount(text);
+
+        if (
+          normalizeText(text).includes(normalizeText(label)) &&
+          count >= 1 &&
+          count <= 2 &&
+          rect.width >= 100 &&
+          rect.width <= 850 &&
+          rect.height >= 40 &&
+          rect.height <= 340
+        ) {
+          const score =
+            rect.width * rect.height +
+            (text.includes("环比") ? 0 : 130000) +
+            Math.max(0, count - 1) * 250000 +
+            depth * 5000;
+
+          if (!best || score < best.score) {
+            best = {
+              element: current,
+              rect,
+              text,
+              score,
+            };
+          }
+        }
+      } catch (error) {
+        // 继续向上查找。
+      }
+
+      current = getParent(current);
+    }
+
+    return best;
+  };
+
+  const parseCardLines = (rawText, label) => {
+    const lines = String(rawText == null ? "" : rawText)
+      .replace(/\u00a0/g, " ")
+      .split(/\n+/)
+      .map(cleanText)
+      .filter(Boolean);
+
+    for (let i = 0; i < lines.length; i += 1) {
+      if (!normalizeText(lines[i]).includes(normalizeText(label))) {
+        continue;
+      }
+
+      let value = "";
+      let comparison = "";
+
+      for (let j = i + 1; j < Math.min(lines.length, i + 15); j += 1) {
+        const line = cleanText(lines[j]).replace(/[?？ⓘℹ]/g, "").trim();
+
+        if (!line) {
+          continue;
+        }
+
+        const otherMetric = CORE_METRICS.some(
+          (name) =>
+            name !== label &&
+            normalizeText(line).includes(normalizeText(name))
+        );
+
+        if (otherMetric) {
+          break;
+        }
+
+        if (line === "环比") {
+          const next = cleanText(lines[j + 1] || "");
+          if (isValue(next)) {
+            comparison = next;
+          }
+          continue;
+        }
+
+        if (line.startsWith("环比")) {
+          const tail = cleanText(line.replace(/^环比\s*/, ""));
+          if (isValue(tail)) {
+            comparison = tail;
+          }
+          continue;
+        }
+
+        if (!value && isValue(line)) {
+          value = line;
+        }
+      }
+
+      if (value) {
+        return { value, comparison };
+      }
+    }
+
+    return null;
+  };
+
+  const parseCardCompact = (rawText, label) => {
+    const text = String(rawText == null ? "" : rawText)
+      .replace(/\u00a0/g, " ")
+      .replace(/[?？ⓘℹ]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const start = text.indexOf(label);
+    if (start < 0) {
+      return null;
+    }
+
+    let end = Math.min(text.length, start + 360);
+
+    for (const other of CORE_METRICS) {
+      if (other === label) {
+        continue;
+      }
+
+      const index = text.indexOf(other, start + label.length);
+      if (index >= 0 && index < end) {
+        end = index;
+      }
+    }
+
+    const segment = text.slice(start, end);
+    const afterLabel = segment.slice(label.length);
+    const valueMatch = afterLabel.match(
+      new RegExp(`^[^\\d+\\-—]{0,90}(${VALUE_SOURCE})`)
+    );
+    const comparisonMatch = segment.match(
+      new RegExp(`环比[^\\d+\\-—]{0,40}(${VALUE_SOURCE})`)
+    );
+
+    if (!valueMatch) {
+      return null;
+    }
+
+    return {
+      value: valueMatch[1],
+      comparison: comparisonMatch ? comparisonMatch[1] : "",
+    };
+  };
+
+  const readMetricFromTokens = (label, tokens) => {
+    const target = normalizeText(label);
+    const labels = tokens.filter(
+      (token) =>
+        token.normalized === target ||
+        (token.normalized.startsWith(target) &&
+          token.normalized.length <= target.length + 2)
+    );
+
+    let best = null;
+
+    for (const labelToken of labels) {
+      const card = findMetricCard(labelToken, label);
+      if (!card) {
+        continue;
+      }
+
+      const lineResult = parseCardLines(card.text, label);
+      const compactResult = parseCardCompact(card.text, label);
+      const parsed = lineResult || compactResult;
+
+      const inCard = tokens.filter((token) =>
+        elementContains(card.element, token.element)
+      );
+      const ringTokens = inCard.filter((token) => token.text.includes("环比"));
+      const ringY = ringTokens.length
+        ? Math.min(...ringTokens.map((token) => token.rect.top))
+        : Number.POSITIVE_INFINITY;
+
+      const valueCandidates = inCard.filter((token) => {
+        if (!isValue(token.text)) {
+          return false;
+        }
+        if (token.element === labelToken.element) {
+          return false;
+        }
+        if (token.rect.top < labelToken.rect.top - 5) {
+          return false;
+        }
+        if (token.rect.top > ringY + 3) {
+          return false;
+        }
+        return true;
+      });
+
+      valueCandidates.sort((a, b) => {
+        const score = (token) => {
+          let result = 0;
+          result += Math.abs(token.rect.top - labelToken.rect.top) * 4;
+          result += Math.abs(token.rect.left - labelToken.rect.left) * 0.25;
+          result -= token.fontSize * 18;
+          result -= token.fontWeight >= 600 ? 30 : 0;
+
+          if (label.includes("率") && token.text.includes("%")) {
+            result -= 120;
+          }
+          if (!label.includes("率") && token.text.includes("%")) {
+            result += 180;
+          }
+          return result;
+        };
+
+        return score(a) - score(b);
+      });
+
+      let value = parsed ? parsed.value : "";
+      if (valueCandidates.length) {
+        value = valueCandidates[0].text;
+      }
+
+      if (!value) {
+        continue;
+      }
+
+      const score =
+        card.score +
+        (lineResult ? -100000 : 0) +
+        (valueCandidates.length ? -70000 : 0);
+
+      if (!best || score < best.score) {
+        best = {
+          label,
+          value,
+          comparison: parsed ? parsed.comparison : "",
+          score,
+          source: "DOM卡片",
+          sourceText: card.text.slice(0, 500),
+        };
+      }
+    }
+
+    return best;
+  };
+
+  const readMetricFromBody = (label) => {
+    let text = "";
+
+    try {
+      text =
+        (document.body &&
+          (document.body.innerText || document.body.textContent)) ||
+        "";
+    } catch (error) {
+      return null;
+    }
+
+    if (!text.includes(label)) {
+      return null;
+    }
+
+    const parsed = parseCardLines(text, label) || parseCardCompact(text, label);
+
+    if (!parsed || !parsed.value) {
+      return null;
+    }
+
+    return {
+      label,
+      value: parsed.value,
+      comparison: parsed.comparison || "",
+      score: 999999999,
+      source: "页面文本后备",
+      sourceText: location.href,
+    };
+  };
+
+  const scanLocalCoreMetrics = () => {
+    const tokens = buildTokens();
+    const metrics = CORE_METRICS.map(
+      (label) =>
+        readMetricFromTokens(label, tokens) ||
+        readMetricFromBody(label) || {
+          label,
+          value: "",
+          comparison: "",
+          score: Number.POSITIVE_INFINITY,
+          source: "",
+          sourceText: "",
+        }
+    );
+
+    return {
+      metrics,
+      tokenCount: tokens.length,
+      url: location.href,
+      title: document.title || "",
+    };
+  };
+
+  // ==================================================
+  // 流量转化扫描
+  // ==================================================
+
+  const parseTrafficFromText = (rawText) => {
+    const text = cleanText(rawText).replace(/\s+/g, " ");
+
+    if (!text) {
+      return null;
+    }
+
+    /*
+     * 页面实际排列通常为：
+     * 数值 曝光 0.55% 转化率 数值 点击 0% 转化率 ...
+     * 不再依赖四个圆形节点必须处于同一个 DOM 容器，
+     * 只抓取紧邻“转化率”的三个百分比。
+     */
+    const beforeLabel = Array.from(
+      text.matchAll(/([+\-]?\d[\d,]*(?:\.\d+)?%)\s*转化率/g)
+    ).map((match) => match[1]);
+
+    if (beforeLabel.length >= 3) {
+      return {
+        exposureClick: beforeLabel[0] || "",
+        clickPlay: beforeLabel[1] || "",
+        playFinish: beforeLabel[2] || "",
+        score: 0,
+        source: "转化率文字顺序",
+      };
+    }
+
+    const afterLabel = Array.from(
+      text.matchAll(/转化率\s*([+\-]?\d[\d,]*(?:\.\d+)?%)/g)
+    ).map((match) => match[1]);
+
+    if (afterLabel.length >= 3) {
+      return {
+        exposureClick: afterLabel[0] || "",
+        clickPlay: afterLabel[1] || "",
+        playFinish: afterLabel[2] || "",
+        score: 10,
+        source: "转化率反向文字顺序",
+      };
+    }
+
+    return null;
+  };
+
+  const getTrafficTextCandidates = () => {
+    const texts = [];
+    const section = findSectionRoot(["流量转化", "流量转换"], [
+      "曝光",
+      "点击",
+      "播放",
+      "完播",
+    ]);
+
+    if (section) {
+      texts.push({
+        text: cleanText(section.innerText || section.textContent || ""),
+        source: "流量转化板块",
+        section,
+      });
+    }
+
+    try {
+      const bodyText = cleanText(
+        (document.body && (document.body.innerText || document.body.textContent)) || ""
+      );
+      const titleIndexes = [
+        bodyText.indexOf("流量转化"),
+        bodyText.indexOf("流量转换"),
+      ].filter((index) => index >= 0);
+
+      if (titleIndexes.length) {
+        const index = Math.min(...titleIndexes);
+        texts.push({
+          text: bodyText.slice(index, index + 2200),
+          source: "页面流量转化文本片段",
+          section: null,
+        });
+      }
+    } catch (error) {
+      // 忽略页面文本读取失败。
+    }
+
+    return texts;
+  };
+
+  const readTrafficByPosition = (container = null) => {
+    const tokens = buildTokens(container);
+    const labels = ["曝光", "点击", "播放", "完播"];
+    const labelTokens = labels.map((label) => {
+      const normalized = normalizeText(label);
+      return tokens
+        .filter((token) => token.normalized === normalized)
+        .sort((a, b) => a.rect.left - b.rect.left || a.rect.top - b.rect.top)[0] || null;
+    });
+
+    if (labelTokens.filter(Boolean).length < 4) {
+      return null;
+    }
+
+    const orderedLabels = labelTokens.slice().sort(
+      (a, b) => a.rect.left - b.rect.left || a.rect.top - b.rect.top
+    );
+
+    const rateTokens = tokens.filter((token) => RATE_RE.test(cleanText(token.text)));
+    const result = [];
+
+    for (let index = 0; index < 3; index += 1) {
+      const leftLabel = orderedLabels[index];
+      const rightLabel = orderedLabels[index + 1];
+      const leftCenter = leftLabel.rect.left + leftLabel.rect.width / 2;
+      const rightCenter = rightLabel.rect.left + rightLabel.rect.width / 2;
+      const top = Math.min(leftLabel.rect.top, rightLabel.rect.top) - 140;
+      const bottom = Math.max(leftLabel.rect.bottom, rightLabel.rect.bottom) + 30;
+
+      const candidates = rateTokens
+        .filter((token) => {
+          const center = token.rect.left + token.rect.width / 2;
+          return (
+            center > leftCenter &&
+            center < rightCenter &&
+            token.rect.top >= top &&
+            token.rect.top <= bottom
+          );
+        })
+        .sort((a, b) => {
+          const targetX = (leftCenter + rightCenter) / 2;
+          const da = Math.abs(a.rect.left + a.rect.width / 2 - targetX);
+          const db = Math.abs(b.rect.left + b.rect.width / 2 - targetX);
+          return da - db;
+        });
+
+      result.push(candidates[0] ? candidates[0].text : "");
+    }
+
+    if (result.filter(Boolean).length < 3) {
+      return null;
+    }
+
+    return {
+      exposureClick: result[0],
+      clickPlay: result[1],
+      playFinish: result[2],
+      score: 50,
+      source: "流量转化空间位置",
+    };
+  };
+
+  const scanLocalTraffic = () => {
+    const candidates = getTrafficTextCandidates();
+
+    for (const candidate of candidates) {
+      const parsed = parseTrafficFromText(candidate.text);
+      if (parsed) {
+        return {
+          ...parsed,
+          source: `${candidate.source}/${parsed.source}`,
+          url: location.href,
+          debugText: candidate.text.slice(0, 800),
+        };
+      }
+    }
+
+    for (const candidate of candidates) {
+      if (!candidate.section) {
+        continue;
+      }
+
+      const positioned = readTrafficByPosition(candidate.section);
+      if (positioned) {
+        return {
+          ...positioned,
+          url: location.href,
+          debugText: candidate.text.slice(0, 800),
+        };
+      }
+    }
+
+    const wholePagePositioned = readTrafficByPosition(null);
+    if (wholePagePositioned) {
+      return {
+        ...wholePagePositioned,
+        url: location.href,
+        debugText: "whole-page-position",
+      };
+    }
+
+    return {
+      exposureClick: "",
+      clickPlay: "",
+      playFinish: "",
+      score: Number.POSITIVE_INFINITY,
+      source: "",
+      url: location.href,
+      debugText: candidates.map((item) => item.text.slice(0, 500)).join(" || "),
+    };
+  };
+
+  // ==================================================
+  // 页面操作：统计周期、专辑切换
+  // ==================================================
+
+  const isActiveTab = (element) => {
+    if (!element) {
+      return false;
+    }
+
+    try {
+      const className = String(element.className || "");
+      const style = (element.ownerDocument.defaultView || window).getComputedStyle(
+        element
+      );
+
+      if (
+        element.getAttribute("aria-selected") === "true" ||
+        element.getAttribute("aria-pressed") === "true" ||
+        /(active|selected|checked|current)/i.test(className)
+      ) {
+        return true;
+      }
+
+      const rgb = (style.color.match(/\d+/g) || []).map(Number);
+      return (
+        rgb.length >= 3 &&
+        rgb[0] > rgb[1] + 20 &&
+        rgb[0] > rgb[2] + 20
+      );
+    } catch (error) {
+      return false;
+    }
+  };
+
+  const getPeriodSection = (sectionType) =>
+    sectionType === "traffic"
+      ? findSectionRoot(["流量转化", "流量转换"], ["曝光", "点击", "播放", "完播"])
+      : findSectionRoot(["核心数据"], CORE_METRICS.slice(0, 4));
+
+  const getOppositePeriodSection = (sectionType) =>
+    getPeriodSection(sectionType === "traffic" ? "core" : "traffic");
+
+  const getRectSafe = (element) => {
+    try {
+      return element && element.getBoundingClientRect
+        ? element.getBoundingClientRect()
+        : null;
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const findPeriodSectionAnchor = (sectionType, section = null) => {
+    const aliases = (sectionType === "traffic" ? ["流量转化", "流量转换"] : ["核心数据"])
+      .map(normalizeText);
+    const candidates = [];
+
+    for (const element of queryAllLocal("h1,h2,h3,h4,h5,p,span,div")) {
+      if (!isVisible(element) || isPanelElement(element)) continue;
+      const text = normalizeText(getOwnText(element));
+      if (!aliases.includes(text)) continue;
+      if (section && !elementContains(section, element)) continue;
+
+      const rect = getRectSafe(element);
+      if (!rect) continue;
+      candidates.push({ element, rect, area: rect.width * rect.height });
+    }
+
+    candidates.sort((a, b) => a.area - b.area || a.rect.top - b.rect.top);
+    return candidates.length ? candidates[0] : null;
+  };
+
+  const verticalDistanceToRect = (rect, anchorRect) => {
+    if (!rect || !anchorRect) return Number.POSITIVE_INFINITY;
+    const center = rect.top + rect.height / 2;
+    const anchorCenter = anchorRect.top + anchorRect.height / 2;
+    return Math.abs(center - anchorCenter);
+  };
+
+  /*
+   * v2.4.1 核心修复：周期按钮必须属于目标板块。
+   * 旧版虽然找到了“核心数据”板块，但随后仍扫描全页面，并用 active 状态大幅加权，
+   * 因此“流量转化”里已经激活的近7天可能压过真正的“核心数据-近7天”。
+   * 新版先做硬性板块隔离，再评分；跨板块按钮不再有资格成为候选。
+   */
+  const periodElementBelongsToSection = (
+    sectionType,
+    element,
+    section,
+    oppositeSection,
+    targetAnchor,
+    oppositeAnchor
+  ) => {
+    if (!section || !element || !elementContains(section, element)) {
+      return false;
+    }
+
+    const insideOpposite = Boolean(
+      oppositeSection && elementContains(oppositeSection, element)
+    );
+
+    if (!insideOpposite) {
+      return true;
+    }
+
+    /*
+     * 某些页面结构中两个 findSectionRoot 可能找到有重叠的祖先容器。
+     * 这时不能仅靠 contains，要比较候选按钮离两个板块标题哪个更近。
+     */
+    const rect = getRectSafe(element);
+    const targetRect = targetAnchor && targetAnchor.rect;
+    const oppositeRect = oppositeAnchor && oppositeAnchor.rect;
+
+    if (rect && targetRect && oppositeRect) {
+      const targetDistance = verticalDistanceToRect(rect, targetRect);
+      const oppositeDistance = verticalDistanceToRect(rect, oppositeRect);
+      return targetDistance + 12 < oppositeDistance;
+    }
+
+    /*
+     * 如果对方板块只是目标板块外层的宽泛祖先，仍允许目标板块内部元素；
+     * 反之若目标板块把对方板块包进来了，则拒绝对方板块内部候选。
+     */
+    if (oppositeSection && elementContains(oppositeSection, section)) {
+      return true;
+    }
+
+    return false;
+  };
+
+  const collectPeriodCandidatesLocal = (sectionType, aliases) => {
+    const section = getPeriodSection(sectionType);
+    const oppositeSection = getOppositePeriodSection(sectionType);
+    const targetAnchor = findPeriodSectionAnchor(sectionType, section);
+    const oppositeAnchor = findPeriodSectionAnchor(
+      sectionType === "traffic" ? "core" : "traffic",
+      oppositeSection
+    );
+    const normalizedAliases = aliases.map(normalizeText).filter(Boolean);
+    const candidates = [];
+
+    if (!section) {
+      return {
+        section: null,
+        oppositeSection,
+        targetAnchor,
+        oppositeAnchor,
+        candidates,
+        strictSectionFound: false,
+      };
+    }
+
+    for (const element of queryAllLocal(
+      "button,[role='tab'],[role='radio'],[role='menuitem'],[role='option'],div,span,label,li,a"
+    )) {
+      if (!isVisible(element) || isPanelElement(element)) continue;
+
+      const ownText = normalizeText(getOwnText(element));
+      const fullText = normalizeText(getElementText(element));
+      const matchedAlias = normalizedAliases.find((alias) =>
+        ownText === alias ||
+        fullText === alias ||
+        (ownText.startsWith(alias) && ownText.length <= alias.length + 4) ||
+        (fullText.startsWith(alias) && fullText.length <= alias.length + 4)
+      );
+      if (!matchedAlias) continue;
+
+      if (!periodElementBelongsToSection(
+        sectionType,
+        element,
+        section,
+        oppositeSection,
+        targetAnchor,
+        oppositeAnchor
+      )) {
+        continue;
+      }
+
+      const rect = getRectSafe(element);
+      if (!rect) continue;
+      if (rect.width < 18 || rect.height < 10 || rect.width > 700 || rect.height > 150) {
+        continue;
+      }
+
+      const clickTarget = findClickableAncestor(element) || element;
+      if (!periodElementBelongsToSection(
+        sectionType,
+        clickTarget,
+        section,
+        oppositeSection,
+        targetAnchor,
+        oppositeAnchor
+      )) {
+        continue;
+      }
+
+      const active = isActiveTab(clickTarget) || isActiveTab(element);
+      let score = rect.width * rect.height;
+
+      // 到板块标题越近越优先；active 只在“已严格确认属于本板块”以后参与排序。
+      if (targetAnchor && targetAnchor.rect) {
+        score += verticalDistanceToRect(rect, targetAnchor.rect) * 80;
+      }
+      if (active) score -= 180000;
+      if (String(element.getAttribute && element.getAttribute("role")) === "tab") score -= 80000;
+      if (String(element.tagName || "").toLowerCase() === "button") score -= 50000;
+
+      candidates.push({
+        element,
+        clickTarget,
+        active,
+        score,
+        text: cleanText(getOwnText(element) || getElementText(element)),
+        matchedAlias,
+        strictSection: true,
+        sectionType,
+      });
+    }
+
+    candidates.sort((a, b) => a.score - b.score);
+    return {
+      section,
+      oppositeSection,
+      targetAnchor,
+      oppositeAnchor,
+      candidates,
+      strictSectionFound: true,
+    };
+  };
+
+  const getPeriodActiveStateLocal = (sectionType, aliases) => {
+    if (!Array.isArray(aliases) || !aliases.length) {
+      return {
+        verified: false,
+        active: false,
+        activeText: "",
+        sectionFound: false,
+        candidateCount: 0,
+      };
+    }
+
+    const scanned = collectPeriodCandidatesLocal(sectionType, aliases);
+    const activeCandidate = scanned.candidates.find((item) => item.active) || null;
+    return {
+      verified: Boolean(scanned.strictSectionFound && activeCandidate),
+      active: Boolean(activeCandidate),
+      activeText: activeCandidate ? activeCandidate.text : "",
+      sectionFound: Boolean(scanned.section),
+      candidateCount: scanned.candidates.length,
+      strictSection: Boolean(activeCandidate),
+    };
+  };
+
+  const revealPeriodControlsLocal = async (sectionType) => {
+    const section = getPeriodSection(sectionType);
+    if (!section) {
+      await sleep(80);
+      return;
+    }
+    const roots = [];
+    let current = section;
+
+    for (let depth = 0; depth < 4 && current; depth += 1) {
+      roots.push(current);
+      current = getParent(current);
+    }
+
+    for (const root of roots) {
+      let nodes = [];
+      try {
+        nodes = [root, ...Array.from(root.querySelectorAll("*"))];
+      } catch (error) {
+        nodes = [root];
+      }
+
+      for (const node of nodes) {
+        try {
+          if (node.scrollWidth > node.clientWidth + 20) {
+            const oldLeft = node.scrollLeft;
+            node.scrollLeft = node.scrollWidth;
+            if (node.scrollLeft !== oldLeft) {
+              node.dispatchEvent(new Event("scroll", { bubbles: true }));
+            }
+          }
+        } catch (error) {
+          // 忽略不能横向滚动的节点。
+        }
+      }
+    }
+
+    const moreAliases = ["更多", "更多周期", "其他", "全部周期"].map(normalizeText);
+    const moreButtons = [];
+    for (const element of queryAllLocal("button,[role='button'],div,span,li,a")) {
+      if (!isVisible(element) || isPanelElement(element)) continue;
+      if (!elementContains(section, element)) continue;
+      const text = normalizeText(getOwnText(element) || getElementText(element));
+      if (!moreAliases.includes(text)) continue;
+      moreButtons.push(element);
+    }
+
+    if (moreButtons.length) {
+      clickElement(moreButtons[0]);
+      await sleep(420);
+    } else {
+      await sleep(100);
+    }
+  };
+
+  const clickPeriodLocal = async (sectionType, aliases) => {
+    if (!Array.isArray(aliases) || !aliases.length) {
+      return { success: false, verified: false, reason: "周期别名为空" };
+    }
+
+    let scanned = collectPeriodCandidatesLocal(sectionType, aliases);
+
+    if (!scanned.section) {
+      return {
+        success: false,
+        verified: false,
+        strictSection: false,
+        reason: `没有找到${sectionType === "traffic" ? "流量转化" : "核心数据"}板块`,
+        sectionFound: false,
+      };
+    }
+
+    if (!scanned.candidates.length) {
+      await revealPeriodControlsLocal(sectionType);
+      scanned = collectPeriodCandidatesLocal(sectionType, aliases);
+    }
+
+    if (!scanned.candidates.length) {
+      return {
+        success: false,
+        verified: false,
+        strictSection: true,
+        reason: `在${sectionType === "traffic" ? "流量转化" : "核心数据"}板块内没有找到周期按钮：${aliases.join("/")}`,
+        sectionFound: true,
+      };
+    }
+
+    const candidate = scanned.candidates[0];
+    const wasActive = candidate.active;
+
+    if (!wasActive) {
+      const clicked = clickElement(candidate.clickTarget || candidate.element);
+      if (!clicked) {
+        return {
+          success: false,
+          verified: false,
+          strictSection: true,
+          reason: `周期按钮点击失败：${candidate.text || aliases[0]}`,
+          sectionFound: true,
+        };
+      }
+      await sleep(720);
+    }
+
+    let verified = false;
+    let activeText = "";
+    let verifyCandidateCount = 0;
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const state = getPeriodActiveStateLocal(sectionType, aliases);
+      verifyCandidateCount = state.candidateCount;
+      if (state.verified) {
+        verified = true;
+        activeText = state.activeText;
+        break;
+      }
+      await sleep(180);
+    }
+
+    if (!verified) {
+      return {
+        success: false,
+        clicked: !wasActive,
+        verified: false,
+        active: false,
+        strictSection: true,
+        selected: candidate.text || aliases[0],
+        activeText: "",
+        sectionFound: true,
+        candidateCount: verifyCandidateCount,
+        reason: `已找到并尝试切换${sectionType === "traffic" ? "流量转化" : "核心数据"}周期，但目标按钮未在本板块内变为激活状态`,
+      };
+    }
+
+    console.log("[xm-export] 周期严格验证通过", {
+      sectionType,
+      aliases,
+      selected: candidate.text,
+      clicked: !wasActive,
+      activeText,
+      frameUrl: location.href,
+    });
+
+    return {
+      success: true,
+      clicked: !wasActive,
+      verified: true,
+      active: true,
+      strictSection: true,
+      selected: candidate.text || aliases[0],
+      activeText,
+      sectionFound: true,
+    };
+  };
+
+  const scrollLocalPageToTop = async () => {
+    try {
+      window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+    } catch (error) {
+      try {
+        window.scrollTo(0, 0);
+      } catch (innerError) {
+        // 忽略。
+      }
+    }
+
+    const scrollTargets = new Set([
+      document.scrollingElement,
+      document.documentElement,
+      document.body,
+    ]);
+
+    for (const element of queryAllLocal(
+      "main,[class*='scroll'],[class*='content'],[class*='layout'],[class*='container'],[style*='overflow']"
+    )) {
+      scrollTargets.add(element);
+    }
+
+    for (const element of scrollTargets) {
+      if (!element || isPanelElement(element)) {
+        continue;
+      }
+
+      try {
+        const rect = element.getBoundingClientRect();
+        const canScroll =
+          element.scrollHeight > element.clientHeight + 80 &&
+          rect.width >= 300 &&
+          rect.height >= 180;
+
+        if (canScroll && element.scrollTop !== 0) {
+          element.scrollTop = 0;
+          element.dispatchEvent(new Event("scroll", { bubbles: true }));
+        }
+      } catch (error) {
+        // 忽略不能滚动的节点。
+      }
+    }
+
+    await sleep(220);
+  };
+
+  const getLocalAlbumSelectorCandidates = (album = null) => {
+    const candidates = [];
+    const targetTitle = album ? normalizeText(album.title) : "";
+    const targetId = album ? String(album.id || "") : "";
+
+    for (const element of queryAllLocal(
+      [
+        "select",
+        "[role='combobox']",
+        ".ant-select-selector",
+        ".ant-select-selection-item",
+        ".ant-select-selection-search",
+        ".ant-select-selection-search-input",
+        "input[placeholder*='专辑']",
+        "input[aria-label*='专辑']",
+        "[class*='album'] [class*='select']",
+        "[class*='select'][class*='selector']",
+      ].join(",")
+    )) {
+      if (!isVisible(element) || isPanelElement(element)) {
+        continue;
+      }
+
+      let rect;
+      let style;
+
+      try {
+        rect = element.getBoundingClientRect();
+        style = (element.ownerDocument.defaultView || window).getComputedStyle(
+          element
+        );
+      } catch (error) {
+        continue;
+      }
+
+      if (
+        rect.width < 110 ||
+        rect.height < 8 ||
+        rect.height > 130 ||
+        style.pointerEvents === "none"
+      ) {
+        continue;
+      }
+
+      const text = normalizeText(getElementText(element));
+      const tag = String(element.tagName || "").toLowerCase();
+      const role = cleanText(element.getAttribute("role"));
+      const placeholder = normalizeText(
+        element.getAttribute("placeholder") ||
+          element.getAttribute("aria-label") ||
+          element.getAttribute("title") ||
+          ""
+      );
+      const value = cleanText(
+        element.value ||
+          element.getAttribute("data-value") ||
+          element.getAttribute("value") ||
+          ""
+      );
+
+      let contextText = "";
+      let parent = element;
+
+      for (let depth = 0; depth < 4 && parent; depth += 1) {
+        contextText += normalizeText(getOwnText(parent) || "");
+        parent = getParent(parent);
+      }
+
+      let score = Math.abs(rect.top - 120) * 0.2 + Math.abs(rect.width - 320) * 0.15;
+
+      if (tag === "select") {
+        score -= 700;
+      }
+      if (role === "combobox") {
+        score -= 450;
+      }
+      if (String(element.className || "").includes("ant-select")) {
+        score -= 320;
+      }
+      if (placeholder.includes("专辑") || contextText.includes("专辑")) {
+        score -= 900;
+      }
+      if (targetTitle && (text === targetTitle || text.includes(targetTitle))) {
+        score -= 3000;
+      }
+      if (targetId && value === targetId) {
+        score -= 3000;
+      }
+      if (text && text.length >= 4 && text.length <= 180) {
+        score -= 90;
+      }
+      if (
+        [
+          "昨日", "昨天", "近7日", "近7天", "最近7日", "最近7天",
+          "近30日", "近30天", "最近30日", "最近30天",
+          "近1年", "近一年", "近365日", "近365天", "最近1年", "最近一年", "累计"
+        ].includes(text)
+      ) {
+        score += 5000;
+      }
+      if (/^\d{4}-\d{2}-\d{2}/.test(text) || placeholder.includes("日期")) {
+        score += 4000;
+      }
+
+      candidates.push({
+        element,
+        text,
+        value,
+        score,
+      });
+    }
+
+    candidates.sort((a, b) => a.score - b.score);
+    return candidates;
+  };
+
+  const getAlbumElementValue = (element) => {
+    let current = element;
+
+    for (let depth = 0; depth < 5 && current; depth += 1) {
+      try {
+        const value = cleanText(
+          current.getAttribute("data-value") ||
+            current.getAttribute("value") ||
+            current.getAttribute("data-key") ||
+            current.getAttribute("data-id") ||
+            current.getAttribute("album-id") ||
+            current.getAttribute("data-album-id") ||
+            ""
+        );
+
+        if (value) {
+          return value;
+        }
+      } catch (error) {
+        // 继续向上查找。
+      }
+
+      current = getParent(current);
+    }
+
+    return "";
+  };
+
+  const getAlbumTextVariants = (element) => {
+    const values = [];
+
+    const add = (value) => {
+      const text = cleanText(value);
+      if (text && !values.includes(text)) {
+        values.push(text);
+      }
+    };
+
+    try {
+      add(element.getAttribute("title"));
+      add(element.getAttribute("aria-label"));
+      add(element.getAttribute("data-title"));
+      add(getOwnText(element));
+      add(getElementText(element));
+    } catch (error) {
+      // 忽略。
+    }
+
+    return values;
+  };
+
+  const findAlbumDropdownRoot = () => {
+    const inputs = queryAllLocal(
+      [
+        "input[placeholder*='搜索你想找的专辑']",
+        "input[placeholder*='专辑名称']",
+        "input[placeholder*='专辑名']",
+        "input[placeholder*='专辑']",
+      ].join(",")
+    ).filter((item) => isVisible(item) && !isPanelElement(item));
+
+    const roots = [];
+
+    for (const input of inputs) {
+      let current = input;
+
+      for (let depth = 0; depth < 9 && current; depth += 1) {
+        try {
+          const rect = current.getBoundingClientRect();
+          const text = cleanText(current.innerText || current.textContent || "");
+
+          if (
+            rect.width >= 240 &&
+            rect.width <= 900 &&
+            rect.height >= 120 &&
+            rect.height <= 1000 &&
+            (text.includes("加载更多") || text.length >= 10)
+          ) {
+            roots.push({
+              element: current,
+              area: rect.width * rect.height,
+              depth,
+            });
+          }
+        } catch (error) {
+          // 继续向上。
+        }
+
+        current = getParent(current);
+      }
+    }
+
+    roots.sort((a, b) => a.area - b.area || a.depth - b.depth);
+    return roots.length ? roots[0].element : null;
+  };
+
+  const resolveAlbumOptionClickTarget = (element, album) => {
+    let current = element;
+    let best = null;
+
+    for (let depth = 0; depth < 6 && current; depth += 1) {
+      if (!isVisible(current) || isPanelElement(current)) {
+        current = getParent(current);
+        continue;
+      }
+
+      let rect;
+      try {
+        rect = current.getBoundingClientRect();
+      } catch (error) {
+        current = getParent(current);
+        continue;
+      }
+
+      if (
+        rect.width >= 140 &&
+        rect.width <= 900 &&
+        rect.height >= 24 &&
+        rect.height <= 110
+      ) {
+        const matchScore = Math.max(
+          0,
+          ...getAlbumTextVariants(current).map((value) =>
+            albumTitleMatchScore(value, album.title)
+          )
+        );
+        const currentValue = getAlbumElementValue(current);
+        const idMatched = Boolean(
+          album.id && currentValue && String(currentValue) === String(album.id)
+        );
+
+        if (matchScore > 0 || idMatched) {
+          const score =
+            (idMatched ? -100000 : 0) -
+            matchScore * 10 +
+            rect.height * 20 +
+            depth * 200;
+
+          if (!best || score < best.score) {
+            best = { element: current, score };
+          }
+        }
+      }
+
+      current = getParent(current);
+    }
+
+    return best ? best.element : element;
+  };
+
+  const findVisibleAlbumOption = (album) => {
+    const targetId = String(album.id || "");
+    const dropdownRoot = findAlbumDropdownRoot();
+    const dropdownInput = queryAllLocal(
+      "input[placeholder*='搜索你想找的专辑'],input[placeholder*='专辑名称'],input[placeholder*='专辑名']"
+    ).find((item) => isVisible(item) && !isPanelElement(item));
+    let dropdownInputRect = null;
+    try {
+      dropdownInputRect = dropdownInput ? dropdownInput.getBoundingClientRect() : null;
+    } catch (error) {
+      dropdownInputRect = null;
+    }
+    const candidates = [];
+    const seen = new Set();
+
+    const selectors = [
+      "[role='option']",
+      ".ant-select-item-option",
+      ".ant-select-item-option-content",
+      "[class*='option']",
+      "[class*='dropdown-item']",
+      "[class*='select-item']",
+      "[class*='album-item']",
+      "li",
+      "div",
+      "span",
+      "p",
+    ].join(",");
+
+    for (const element of queryAllLocal(selectors)) {
+      if (!isVisible(element) || isPanelElement(element)) {
+        continue;
+      }
+
+      if (dropdownRoot && !elementContains(dropdownRoot, element)) {
+        continue;
+      }
+
+      let rect;
+      try {
+        rect = element.getBoundingClientRect();
+      } catch (error) {
+        continue;
+      }
+
+      if (
+        rect.width < 40 ||
+        rect.width > 1000 ||
+        rect.height < 14 ||
+        rect.height > 120
+      ) {
+        continue;
+      }
+
+      /* 只接受搜索框下方的下拉列表项，避免误点顶部当前专辑选择器。 */
+      if (dropdownInputRect && rect.top < dropdownInputRect.bottom - 2) {
+        continue;
+      }
+
+      try {
+        if (
+          element.matches(".ant-select-selection-item,[class*='selection-item']") ||
+          element.closest(".ant-select-selector") ||
+          (element.closest("[role='combobox']") && !element.closest("[role='option']"))
+        ) {
+          continue;
+        }
+      } catch (error) {
+        // 忽略选择器判断失败。
+      }
+
+      const variants = getAlbumTextVariants(element);
+      if (!variants.length) {
+        continue;
+      }
+
+      const value = getAlbumElementValue(element);
+      const exactId = Boolean(targetId && value && targetId === String(value));
+      const titleScore = Math.max(
+        0,
+        ...variants.map((candidateTitle) =>
+          albumTitleMatchScore(candidateTitle, album.title)
+        )
+      );
+
+      if (!exactId && titleScore <= 0) {
+        continue;
+      }
+
+      const combinedText = variants.join(" ");
+      if (
+        combinedText.includes("搜索你想找的专辑") ||
+        normalizeText(combinedText) === "加载更多"
+      ) {
+        continue;
+      }
+
+      const clickTarget = resolveAlbumOptionClickTarget(element, album);
+      if (!clickTarget || seen.has(clickTarget)) {
+        continue;
+      }
+      if (dropdownRoot && !elementContains(dropdownRoot, clickTarget)) {
+        continue;
+      }
+      try {
+        const targetRect = clickTarget.getBoundingClientRect();
+        if (dropdownInputRect && targetRect.top < dropdownInputRect.bottom - 2) {
+          continue;
+        }
+      } catch (error) {
+        // 忽略。
+      }
+      seen.add(clickTarget);
+
+      let clickRect = rect;
+      try {
+        clickRect = clickTarget.getBoundingClientRect();
+      } catch (error) {
+        // 使用原 rect。
+      }
+
+      candidates.push({
+        element: clickTarget,
+        exactId,
+        titleScore,
+        area: clickRect.width * clickRect.height,
+        top: clickRect.top,
+        text: variants[0],
+        value,
+      });
+    }
+
+    /* 找不到下拉根节点时，再做一次全页面兜底扫描。 */
+    if (!candidates.length && dropdownRoot) {
+      const originalRoot = dropdownRoot;
+      try {
+        originalRoot.setAttribute("data-xm-scan-fallback", "1");
+      } catch (error) {
+        // 忽略。
+      }
+
+      for (const element of queryAllLocal("[title],[aria-label],li,div,span")) {
+        if (!isVisible(element) || isPanelElement(element)) {
+          continue;
+        }
+
+        let rect;
+        try {
+          rect = element.getBoundingClientRect();
+        } catch (error) {
+          continue;
+        }
+
+        if (rect.height < 18 || rect.height > 100 || rect.width < 120) {
+          continue;
+        }
+
+        if (dropdownInputRect && rect.top < dropdownInputRect.bottom - 2) {
+          continue;
+        }
+
+        try {
+          if (
+            element.matches(".ant-select-selection-item,[class*='selection-item']") ||
+            element.closest(".ant-select-selector") ||
+            (element.closest("[role='combobox']") && !element.closest("[role='option']"))
+          ) {
+            continue;
+          }
+        } catch (error) {
+          // 忽略选择器判断失败。
+        }
+
+        const variants = getAlbumTextVariants(element);
+        const titleScore = Math.max(
+          0,
+          ...variants.map((candidateTitle) =>
+            albumTitleMatchScore(candidateTitle, album.title)
+          )
+        );
+
+        if (titleScore <= 0) {
+          continue;
+        }
+
+        const clickTarget = resolveAlbumOptionClickTarget(element, album);
+        if (!clickTarget || seen.has(clickTarget)) {
+          continue;
+        }
+        if (dropdownRoot && !elementContains(dropdownRoot, clickTarget)) {
+          continue;
+        }
+        try {
+          const targetRect = clickTarget.getBoundingClientRect();
+          if (dropdownInputRect && targetRect.top < dropdownInputRect.bottom - 2) {
+            continue;
+          }
+        } catch (error) {
+          // 忽略。
+        }
+        seen.add(clickTarget);
+
+        candidates.push({
+          element: clickTarget,
+          exactId: false,
+          titleScore,
+          area: rect.width * rect.height,
+          top: rect.top,
+          text: variants[0] || "",
+          value: "",
+        });
+      }
+    }
+
+    candidates.sort(
+      (a, b) =>
+        Number(b.exactId) - Number(a.exactId) ||
+        b.titleScore - a.titleScore ||
+        a.area - b.area ||
+        a.top - b.top
+    );
+
+    if (candidates.length) {
+      console.log("[xm-export] 找到目标专辑选项", {
+        album,
+        candidate: candidates[0],
+        candidateCount: candidates.length,
+      });
+    }
+
+    return candidates.length ? candidates[0].element : null;
+  };
+
+  const findAlbumSearchInput = (trigger = null) => {
+    const candidates = [];
+    const triggerRect = trigger && trigger.getBoundingClientRect
+      ? trigger.getBoundingClientRect()
+      : null;
+
+    for (const input of queryAllLocal(
+      [
+        "input[placeholder*='搜索你想找的专辑']",
+        "input[placeholder*='专辑名称']",
+        "input[placeholder*='专辑名']",
+        "input[placeholder*='专辑']",
+        "input[role='combobox']",
+        ".ant-select-selection-search-input",
+        "input[aria-controls]",
+      ].join(",")
+    )) {
+      if (!isVisible(input) || isPanelElement(input)) {
+        continue;
+      }
+
+      let rect;
+      try {
+        rect = input.getBoundingClientRect();
+      } catch (error) {
+        continue;
+      }
+
+      const placeholder = normalizeText(
+        input.getAttribute("placeholder") ||
+          input.getAttribute("aria-label") ||
+          input.getAttribute("title") ||
+          ""
+      );
+
+      let score = 0;
+      if (placeholder.includes("搜索") && placeholder.includes("专辑")) {
+        score -= 5000;
+      } else if (placeholder.includes("专辑")) {
+        score -= 2500;
+      }
+      if (input.getAttribute("role") === "combobox") {
+        score -= 500;
+      }
+      if (String(input.className || "").includes("selection-search")) {
+        score -= 400;
+      }
+      if (triggerRect) {
+        score += Math.abs(rect.left - triggerRect.left) * 0.2;
+        score += Math.abs(rect.top - triggerRect.bottom) * 0.15;
+      }
+
+      candidates.push({ input, score });
+    }
+
+    candidates.sort((a, b) => a.score - b.score);
+    return candidates.length ? candidates[0].input : null;
+  };
+
+  const typeAlbumSearchTerm = async (input, term) => {
+    try {
+      input.focus();
+    } catch (error) {
+      // 忽略。
+    }
+
+    setNativeInputValue(input, "");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Backspace",
+        code: "Backspace",
+        bubbles: true,
+      })
+    );
+    await sleep(180);
+
+    setNativeInputValue(input, term);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: term.slice(-1) || "a",
+        bubbles: true,
+      })
+    );
+    input.dispatchEvent(
+      new KeyboardEvent("keyup", {
+        key: term.slice(-1) || "a",
+        bubbles: true,
+      })
+    );
+
+    await sleep(450);
+  };
+
+  const isPossibleAlbumTitle = (value) => {
+    const text = normalizeText(value);
+
+    if (!text || text.length < 2) {
+      return false;
+    }
+
+    if (
+      [
+        "昨日",
+        "近7日",
+        "近7天",
+        "近30日",
+        "近30天",
+        "近1年",
+        "近一年",
+        "近365日",
+        "近365天",
+        "最近1年",
+        "最近一年",
+        "累计",
+        "请选择",
+        "请选择专辑",
+        "专辑",
+      ].includes(text)
+    ) {
+      return false;
+    }
+
+    if (/^\d{4}-\d{2}-\d{2}/.test(text)) {
+      return false;
+    }
+
+    if (text.includes("正在加载") || text.includes("手动输入albumId")) {
+      return false;
+    }
+
+    return true;
+  };
+
+  const getLocalCurrentAlbumIdentities = () => {
+    const candidates = [];
+    const selector = [
+      ".ant-select-selection-item",
+      "[class*='selection-item']",
+      ".ant-select-selector",
+      "select",
+      "[role='combobox']",
+    ].join(",");
+
+    for (const element of queryAllLocal(selector)) {
+      if (!isVisible(element) || isPanelElement(element)) {
+        continue;
+      }
+
+      let title = "";
+      let id = "";
+      let score = 0;
+      const tag = String(element.tagName || "").toLowerCase();
+      const className = String(element.className || "");
+
+      if (tag === "select") {
+        const option = element.options && element.options[element.selectedIndex];
+        title = cleanText(option ? option.textContent : "");
+        id = cleanText(option ? option.value : "");
+        score -= 700;
+      } else {
+        let selectedItem = null;
+        try {
+          selectedItem = element.matches(".ant-select-selection-item,[class*='selection-item']")
+            ? element
+            : element.querySelector(
+                ".ant-select-selection-item,[class*='selection-item']"
+              );
+        } catch (error) {
+          selectedItem = null;
+        }
+
+        const source = selectedItem || element;
+        title = cleanText(
+          source.getAttribute("title") ||
+            source.getAttribute("aria-label") ||
+            source.innerText ||
+            source.textContent ||
+            ""
+        );
+        id = cleanText(
+          source.getAttribute("data-value") ||
+            source.getAttribute("value") ||
+            element.getAttribute("data-value") ||
+            ""
+        );
+
+        if (selectedItem) {
+          score -= 900;
+        }
+        if (className.includes("ant-select")) {
+          score -= 350;
+        }
+        if (element.getAttribute("role") === "combobox") {
+          score -= 180;
+        }
+      }
+
+      if (!isPossibleAlbumTitle(title)) {
+        continue;
+      }
+
+      let contextText = "";
+      let parent = element;
+      for (let depth = 0; depth < 4 && parent; depth += 1) {
+        contextText += normalizeText(getOwnText(parent) || "");
+        parent = getParent(parent);
+      }
+
+      if (contextText.includes("专辑")) {
+        score -= 1200;
+      }
+
+      let rect;
+      try {
+        rect = element.getBoundingClientRect();
+        score += Math.abs(rect.top - 120) * 0.05;
+      } catch (error) {
+        rect = { top: 0 };
+      }
+
+      candidates.push({
+        title,
+        normalizedTitle: normalizeAlbumText(title),
+        id,
+        score,
+        source: `${tag || "node"}.${className}`,
+      });
+    }
+
+    candidates.sort((a, b) => a.score - b.score);
+
+    const unique = [];
+    const seen = new Set();
+
+    for (const item of candidates) {
+      const key = `${String(item.id || "")}|${normalizeAlbumText(item.title || "")}`;
+      if (!key || seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      unique.push(item);
+    }
+
+    return unique.slice(0, 20);
+  };
+
+  const getLocalCurrentAlbumIdentity = () =>
+    getLocalCurrentAlbumIdentities()[0] || {
+      title: "",
+      normalizedTitle: "",
+      id: "",
+      score: Number.POSITIVE_INFINITY,
+      source: "",
+    };
+
+  const albumIdentityMatches = (identity, album) => {
+    if (!identity || !album) {
+      return false;
+    }
+
+    const targetId = String(album.id || "");
+    const currentId = String(identity.id || "");
+    const currentTitle = identity.title || identity.normalizedTitle || "";
+
+    if (targetId && currentId && targetId === currentId) {
+      return true;
+    }
+
+    return Boolean(
+      album.title &&
+        currentTitle &&
+        albumTitlesMatch(currentTitle, album.title)
+    );
+  };
+
+  const albumIdentitiesMatch = (left, right) => {
+    if (!left || !right) {
+      return false;
+    }
+
+    const leftId = String(left.id || "");
+    const rightId = String(right.id || "");
+
+    if (leftId && rightId && leftId === rightId) {
+      return true;
+    }
+
+    return albumTitlesMatch(
+      left.title || left.normalizedTitle || "",
+      right.title || right.normalizedTitle || ""
+    );
+  };
+
+  const localSelectedAlbumMatches = (album) =>
+    albumIdentityMatches(getLocalCurrentAlbumIdentity(), album);
+
+  const waitForLocalAlbumSelection = async (album, beforeIdentity, timeoutMs = 15000) => {
+    const startedAt = Date.now();
+    let lastIdentity = getLocalCurrentAlbumIdentity();
+    let lastCandidates = getLocalCurrentAlbumIdentities();
+
+    while (Date.now() - startedAt < timeoutMs) {
+      lastCandidates = getLocalCurrentAlbumIdentities();
+      const matched = lastCandidates.find((item) => albumIdentityMatches(item, album));
+      lastIdentity = matched || lastCandidates[0] || getLocalCurrentAlbumIdentity();
+
+      if (matched) {
+        const targetWasAlreadySelected = albumIdentityMatches(beforeIdentity, album);
+        const changedFromBefore = !albumIdentitiesMatch(matched, beforeIdentity);
+
+        if (targetWasAlreadySelected || changedFromBefore || !beforeIdentity.title) {
+          return {
+            success: true,
+            current: matched,
+            candidates: lastCandidates,
+          };
+        }
+      }
+
+      await sleep(160);
+    }
+
+    return {
+      success: false,
+      current: lastIdentity,
+      candidates: lastCandidates,
+    };
+  };
+
+  const selectAlbumLocal = async (album) => {
+    if (!album || !album.id) {
+      return { success: false, reason: "专辑参数为空" };
+    }
+
+    const beforeIdentity = getLocalCurrentAlbumIdentity();
+
+    if (albumIdentityMatches(beforeIdentity, album)) {
+      return {
+        success: true,
+        alreadySelected: true,
+        before: beforeIdentity,
+        current: beforeIdentity,
+      };
+    }
+
+    await scrollLocalPageToTop();
+
+    const targetId = String(album.id);
+    const selectors = getLocalAlbumSelectorCandidates(album);
+    const debugAttempts = [];
+
+    for (const candidate of selectors.slice(0, 20)) {
+      const element = candidate.element;
+      const tag = String(element.tagName || "").toLowerCase();
+
+      if (tag === "select") {
+        const options = Array.from(element.options || []);
+        const match = options.find(
+          (option) =>
+            String(option.value) === targetId ||
+            albumTitlesMatch(option.textContent, album.title)
+        );
+
+        if (match) {
+          element.value = match.value;
+          element.dispatchEvent(new Event("input", { bubbles: true }));
+          element.dispatchEvent(new Event("change", { bubbles: true }));
+
+          const waited = await waitForLocalAlbumSelection(album, beforeIdentity);
+          if (waited.success) {
+            return {
+              success: true,
+              method: "native-select",
+              before: beforeIdentity,
+              current: waited.current,
+            };
+          }
+        }
+
+        continue;
+      }
+
+      const trigger =
+        element.closest && element.closest(".ant-select-selector")
+          ? element.closest(".ant-select-selector")
+          : element.closest && element.closest("[role='combobox']")
+            ? element.closest("[role='combobox']")
+            : element;
+
+      debugAttempts.push({
+        selectorText: candidate.text,
+        selectorValue: candidate.value,
+        selectorScore: candidate.score,
+      });
+
+      clickElement(trigger);
+      await sleep(350);
+
+      /* 第一优先：目标专辑已在当前展开列表中，直接点击。 */
+      let option = findVisibleAlbumOption(album);
+      if (option) {
+        clickElement(option);
+        const waited = await waitForLocalAlbumSelection(album, beforeIdentity);
+
+        if (waited.success) {
+          return {
+            success: true,
+            method: "visible-option-fuzzy",
+            before: beforeIdentity,
+            current: waited.current,
+          };
+        }
+
+        /* 点击后未切换成功，重新打开下拉框，再尝试搜索。 */
+        clickElement(trigger);
+        await sleep(280);
+      }
+
+      const input = findAlbumSearchInput(trigger);
+
+      if (input) {
+        /* 搜索框明确支持名称或 ID，先用 ID 可避免标题截断和符号差异。 */
+        const terms = [targetId, album.title]
+          .map(cleanText)
+          .filter((value, index, list) => value && list.indexOf(value) === index);
+
+        for (const term of terms) {
+          await typeAlbumSearchTerm(input, term);
+          option = findVisibleAlbumOption(album);
+
+          if (!option) {
+            continue;
+          }
+
+          clickElement(option);
+          const waited = await waitForLocalAlbumSelection(album, beforeIdentity);
+
+          if (waited.success) {
+            return {
+              success: true,
+              method: term === targetId ? "search-by-id" : "search-by-title",
+              searchTerm: term,
+              before: beforeIdentity,
+              current: waited.current,
+            };
+          }
+
+          /* 搜索结果被点击但页面未变，重新打开下拉框继续下一种搜索。 */
+          clickElement(trigger);
+          await sleep(280);
+        }
+      }
+
+      try {
+        document.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key: "Escape",
+            code: "Escape",
+            bubbles: true,
+          })
+        );
+      } catch (error) {
+        // 忽略。
+      }
+
+      await sleep(250);
+    }
+
+    const currentIdentity = getLocalCurrentAlbumIdentity();
+
+    return {
+      success: false,
+      reason: `页面专辑下拉框中未能选中：${album.title}`,
+      before: beforeIdentity,
+      current: currentIdentity,
+      selectorCount: selectors.length,
+      selectorTexts: selectors.slice(0, 10).map((item) => item.text || "(无文本)"),
+      debugAttempts,
+      dropdownRootFound: Boolean(findAlbumDropdownRoot()),
+      searchInputFound: Boolean(findAlbumSearchInput()),
+    };
+  };
+
+  // ==================================================
+  // iframe 通信
+  // ==================================================
+
+  const forwardToChildren = (message) => {
+    let count = 0;
+
+    try {
+      for (let i = 0; i < window.frames.length; i += 1) {
+        try {
+          window.frames[i].postMessage(message, "*");
+          count += 1;
+        } catch (error) {
+          // 忽略不可访问的框架。
+        }
+      }
+    } catch (error) {
+      // 忽略。
+    }
+
+    return count;
+  };
+
+  const executeLocalCommand = async (command, payload) => {
+    switch (command) {
+      case "SCAN_CORE": {
+        const scan = scanLocalCoreMetrics();
+        const aliases = Array.isArray(payload.aliases) ? payload.aliases : [];
+        const periodState = aliases.length
+          ? getPeriodActiveStateLocal("core", aliases)
+          : { verified: true, active: true, activeText: "", sectionFound: true };
+        return {
+          ...scan,
+          periodVerified: Boolean(periodState.verified),
+          periodActiveText: periodState.activeText || "",
+          periodSectionFound: Boolean(periodState.sectionFound),
+        };
+      }
+
+      case "SCAN_TRAFFIC": {
+        const scan = scanLocalTraffic();
+        const aliases = Array.isArray(payload.aliases) ? payload.aliases : [];
+        const periodState = aliases.length
+          ? getPeriodActiveStateLocal("traffic", aliases)
+          : { verified: true, active: true, activeText: "", sectionFound: true };
+        return {
+          ...scan,
+          periodVerified: Boolean(periodState.verified),
+          periodActiveText: periodState.activeText || "",
+          periodSectionFound: Boolean(periodState.sectionFound),
+        };
+      }
+
+      case "SELECT_CORE_PERIOD":
+        return clickPeriodLocal("core", payload.aliases || []);
+
+      case "SELECT_TRAFFIC_PERIOD":
+        return clickPeriodLocal("traffic", payload.aliases || []);
+
+      case "SELECT_ALBUM":
+        return selectAlbumLocal(payload.album);
+
+      case "CHECK_ALBUM": {
+        const current = getLocalCurrentAlbumIdentity();
+        return {
+          success: albumIdentityMatches(current, payload.album),
+          current,
+        };
+      }
+
+      case "GET_CURRENT_ALBUM": {
+        const currents = getLocalCurrentAlbumIdentities();
+        return {
+          success: true,
+          current: currents[0] || getLocalCurrentAlbumIdentity(),
+          currents,
+        };
+      }
+
+      default:
+        return {
+          success: false,
+          reason: `未知命令：${command}`,
+        };
+    }
+  };
+
+  window.addEventListener("message", (event) => {
+    const data = event.data;
+
+    if (!data || data.flag !== MSG_FLAG) {
+      return;
+    }
+
+    if (data.type === MSG_COMMAND) {
+      (async () => {
+        let result;
+
+        try {
+          result = await executeLocalCommand(data.command, data.payload || {});
+        } catch (error) {
+          result = {
+            success: false,
+            error: error.message,
+          };
+        }
+
+        try {
+          event.source.postMessage(
+            {
+              flag: MSG_FLAG,
+              type: MSG_RESULT,
+              requestId: data.requestId,
+              command: data.command,
+              payload: {
+                ...result,
+                frameUrl: location.href,
+                frameTitle: document.title || "",
+              },
+            },
+            "*"
+          );
+        } catch (error) {
+          // 忽略。
+        }
+
+        forwardToChildren(data);
+      })();
+
+      return;
+    }
+
+    if (data.type === MSG_RESULT && window.self !== window.top) {
+      try {
+        window.parent.postMessage(data, "*");
+      } catch (error) {
+        // 忽略。
+      }
+    }
+  });
+
+  if (window.self !== window.top) {
+    return;
+  }
+
+  const executeAcrossFrames = async (command, payload = {}, options = {}) => {
+    const {
+      minWaitMs = 220,
+      quietWaitMs = 160,
+      maxWaitMs = 1400,
+      stopWhen = null,
+    } = options;
+    const requestId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const results = [];
+    let lastChangeAt = Date.now();
+    let localFinished = false;
+
+    const pushResult = (payloadValue) => {
+      if (!payloadValue) return;
+      results.push(payloadValue);
+      lastChangeAt = Date.now();
+    };
+
+    const listener = (event) => {
+      const data = event.data;
+      if (!data || data.flag !== MSG_FLAG || data.type !== MSG_RESULT ||
+          data.requestId !== requestId || data.command !== command) return;
+      pushResult(data.payload);
+    };
+
+    window.addEventListener("message", listener);
+
+    // 先通知 iframe，再并行执行顶层页面，避免原版先等顶层执行完才开始 iframe。
+    forwardToChildren({ flag: MSG_FLAG, type: MSG_COMMAND, requestId, command, payload });
+
+    Promise.resolve()
+      .then(() => executeLocalCommand(command, payload))
+      .then((localResult) => pushResult({
+        ...localResult,
+        frameUrl: location.href,
+        frameTitle: document.title || "",
+      }))
+      .catch((error) => pushResult({
+        success: false,
+        error: error.message,
+        frameUrl: location.href,
+      }))
+      .finally(() => { localFinished = true; });
+
+    const startedAt = Date.now();
+    try {
+      while (Date.now() - startedAt < maxWaitMs) {
+        const elapsed = Date.now() - startedAt;
+        if (elapsed >= minWaitMs && typeof stopWhen === "function" && stopWhen(results)) break;
+        if (elapsed >= minWaitMs && localFinished && Date.now() - lastChangeAt >= quietWaitMs) break;
+        await sleep(45);
+      }
+    } finally {
+      window.removeEventListener("message", listener);
+    }
+    return results;
+  };
+
+  const mergeCoreResults = (sources) => CORE_METRICS.map((label) => {
+    const candidates = [];
+    for (const source of sources) {
+      if (!source || !Array.isArray(source.metrics)) continue;
+      const item = source.metrics.find((metric) => metric.label === label && metric.value !== "");
+      if (item) candidates.push({ ...item, frameUrl: source.frameUrl || source.url || "" });
+    }
+    candidates.sort((a, b) => (Number.isFinite(a.score) ? a.score : Number.MAX_SAFE_INTEGER) -
+      (Number.isFinite(b.score) ? b.score : Number.MAX_SAFE_INTEGER));
+    return candidates[0] || { label, value: "", comparison: "", score: Number.POSITIVE_INFINITY };
+  });
+
+  const readCoreAcrossFrames = async (expectedAliases = []) => {
+    const aliases = Array.isArray(expectedAliases) ? expectedAliases.filter(Boolean) : [];
+    const requirePeriodVerification = aliases.length > 0;
+    const sources = await executeAcrossFrames("SCAN_CORE", { aliases }, {
+      minWaitMs: 180,
+      quietWaitMs: 130,
+      maxWaitMs: 1100,
+      stopWhen: (items) => items.some((item) =>
+        item &&
+        (!requirePeriodVerification || item.periodVerified) &&
+        Array.isArray(item.metrics) &&
+        item.metrics.filter((m) => m.value !== "").length === CORE_METRICS.length
+      ),
+    });
+
+    const usableSources = requirePeriodVerification
+      ? sources.filter((item) => item && item.periodVerified)
+      : sources;
+
+    if (requirePeriodVerification && !usableSources.length) {
+      return CORE_METRICS.map((label) => ({
+        label,
+        value: "",
+        comparison: "",
+        score: Number.POSITIVE_INFINITY,
+      }));
+    }
+
+    return mergeCoreResults(usableSources);
+  };
+
+  const readTrafficAcrossFrames = async (expectedAliases = []) => {
+    const aliases = Array.isArray(expectedAliases) ? expectedAliases.filter(Boolean) : [];
+    const requirePeriodVerification = aliases.length > 0;
+    const sources = await executeAcrossFrames("SCAN_TRAFFIC", { aliases }, {
+      minWaitMs: 180,
+      quietWaitMs: 130,
+      maxWaitMs: 1100,
+      stopWhen: (items) => items.some((item) =>
+        item &&
+        (!requirePeriodVerification || item.periodVerified) &&
+        [item.exposureClick, item.clickPlay, item.playFinish].filter(Boolean).length === 3
+      ),
+    });
+
+    const usableSources = requirePeriodVerification
+      ? sources.filter((item) => item && item.periodVerified)
+      : sources;
+
+    const candidates = usableSources
+      .filter((item) => item && (item.exposureClick || item.clickPlay || item.playFinish))
+      .sort((a, b) =>
+        [b.exposureClick, b.clickPlay, b.playFinish].filter(Boolean).length -
+          [a.exposureClick, a.clickPlay, a.playFinish].filter(Boolean).length ||
+        (a.score || 0) - (b.score || 0)
+      );
+    return candidates[0] || { exposureClick: "", clickPlay: "", playFinish: "" };
+  };
+
+  const selectPeriodAcrossFrames = async (type, aliases) => {
+    const command = type === "traffic" ? "SELECT_TRAFFIC_PERIOD" : "SELECT_CORE_PERIOD";
+    const results = await executeAcrossFrames(command, { aliases }, {
+      minWaitMs: 220,
+      quietWaitMs: 160,
+      maxWaitMs: 3600,
+      stopWhen: (items) => items.some((item) =>
+        item && item.success && item.verified && item.strictSection
+      ),
+    });
+    const verifiedResults = results.filter((item) =>
+      item && item.success && item.verified && item.strictSection
+    );
+    return {
+      success: verifiedResults.length > 0,
+      verified: verifiedResults.length > 0,
+      strictVerified: verifiedResults.length > 0,
+      results,
+    };
+  };
+
+  const getCurrentAlbumAcrossFrames = async () => {
+    const results = await executeAcrossFrames("GET_CURRENT_ALBUM", {}, {
+      minWaitMs: 180, quietWaitMs: 130, maxWaitMs: 900,
+    });
+    const identities = [];
+    for (const item of results) {
+      const frameUrl = item && item.frameUrl ? item.frameUrl : "";
+      const currents = item && Array.isArray(item.currents) && item.currents.length ? item.currents : item && item.current ? [item.current] : [];
+      for (const current of currents) if (current && current.title) identities.push({ current, frameUrl });
+    }
+    const seen = new Set();
+    return identities.filter((item) => {
+      const key = `${item.frameUrl}|${String(item.current.id || "")}|${normalizeAlbumText(item.current.title || "")}`;
+      if (seen.has(key)) return false;
+      seen.add(key); return true;
+    });
+  };
+
+  const verifyCurrentAlbumAcrossFrames = async (album) => {
+    const identities = await getCurrentAlbumAcrossFrames();
+    const matched = identities.find((item) => albumIdentityMatches(item.current, album));
+    return { success: Boolean(matched), matched: matched || null, identities };
+  };
+
+  const selectAlbumAcrossFrames = async (album) => {
+    const before = await getCurrentAlbumAcrossFrames();
+    if (before.some((item) => albumIdentityMatches(item.current, album))) {
+      return { success: true, attempt: 0, before, current: before.find((item) => albumIdentityMatches(item.current, album)), results: [] };
+    }
+    let lastResults = [];
+    let lastVerification = null;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const results = await executeAcrossFrames("SELECT_ALBUM", { album }, {
+        minWaitMs: 300, quietWaitMs: 180, maxWaitMs: 16000,
+        stopWhen: (items) => items.some((item) => item && item.success),
+      });
+      lastResults = results;
+      await sleep(260);
+      const verification = await verifyCurrentAlbumAcrossFrames(album);
+      lastVerification = verification;
+      if (verification.success) return { success: true, attempt, before, current: verification.matched, results };
+      await sleep(380 * attempt);
+    }
+    console.warn("[xm-export] 专辑切换失败详情", { album, before, results: lastResults, verification: lastVerification });
+    return { success: false, before, results: lastResults, verification: lastVerification };
+  };
+
+  const readStableCore = async (
+    statusPrefix,
+    previousSignature = "",
+    periodVerified = false,
+    expectedAliases = []
+  ) => {
+    let best = null;
+    let bestCount = -1;
+    let bestSignature = "";
+    let lastSignature = "";
+    let sameSignatureReads = 0;
+
+    for (let attempt = 1; attempt <= 8; attempt += 1) {
+      const metrics = await readCoreAcrossFrames(expectedAliases);
+      const count = metrics.filter((item) => item.value !== "").length;
+      const signature = metrics.map((item) => `${item.label}:${item.value}`).join("|");
+
+      if (count > bestCount) {
+        best = metrics;
+        bestCount = count;
+        bestSignature = signature;
+      }
+
+      sameSignatureReads = signature && signature === lastSignature
+        ? sameSignatureReads + 1
+        : 1;
+      const changedFromPrevious = !previousSignature || signature !== previousSignature;
+      const stableEnough = sameSignatureReads >= 2;
+
+      if (count === CORE_METRICS.length && changedFromPrevious && stableEnough) {
+        return metrics;
+      }
+
+      // 两个周期的数据确实可能完全相同；v2.4.1 只有“同一数据来源 frame 内、目标板块的目标周期严格激活”时才允许接收。
+      if (
+        count === CORE_METRICS.length &&
+        periodVerified &&
+        stableEnough &&
+        attempt >= 3
+      ) {
+        return metrics;
+      }
+
+      if (
+        count >= 7 &&
+        changedFromPrevious &&
+        stableEnough &&
+        attempt >= 4
+      ) {
+        return metrics;
+      }
+
+      lastSignature = signature;
+      if (attempt < 8) {
+        setStatus(
+          `${statusPrefix}，核心数据已识别 ${count}/9，正在确认页面已刷新（${attempt}/8）…`
+        );
+        await sleep(360);
+      }
+    }
+
+    if (
+      best &&
+      bestCount >= 7 &&
+      (!previousSignature || bestSignature !== previousSignature || periodVerified)
+    ) {
+      return best;
+    }
+
+    throw new Error("核心数据目标周期未在对应板块内完成刷新/验证，为防止把上一周期旧数据重复保存，本周期已停止并保留断点");
+  };
+
+  const readStableTraffic = async (
+    statusPrefix,
+    previousSignature = "",
+    periodVerified = false,
+    expectedAliases = []
+  ) => {
+    let best = { exposureClick: "", clickPlay: "", playFinish: "" };
+    let bestCount = 0;
+    let bestSignature = "";
+    let lastSignature = "";
+    let sameSignatureReads = 0;
+
+    for (let attempt = 1; attempt <= 8; attempt += 1) {
+      const traffic = await readTrafficAcrossFrames(expectedAliases);
+      const values = [traffic.exposureClick, traffic.clickPlay, traffic.playFinish];
+      const count = values.filter(Boolean).length;
+      const signature = values.join("|");
+
+      if (count > bestCount) {
+        best = traffic;
+        bestCount = count;
+        bestSignature = signature;
+      }
+
+      sameSignatureReads = signature && signature === lastSignature
+        ? sameSignatureReads + 1
+        : 1;
+      const changedFromPrevious = !previousSignature || signature !== previousSignature;
+      const stableEnough = sameSignatureReads >= 2;
+
+      if (count === 3 && changedFromPrevious && stableEnough) return traffic;
+      if (count === 3 && periodVerified && stableEnough && attempt >= 3) return traffic;
+
+      lastSignature = signature;
+      if (attempt < 8) {
+        setStatus(
+          `${statusPrefix}，流量转化已识别 ${count}/3，正在确认页面已刷新（${attempt}/8）…`
+        );
+        await sleep(340);
+      }
+    }
+
+    if (
+      bestCount === 3 &&
+      (!previousSignature || bestSignature !== previousSignature || periodVerified)
+    ) {
+      return best;
+    }
+
+    throw new Error("流量转化目标周期未在对应板块内完成刷新/验证，为防止保存重复旧数据，本周期已停止并保留断点");
+  };
+
+  // ==================================================
+  // API 与专辑列表
+  // ==================================================
+
+  const safeStore = (key, value) => {
+    try {
+      localStorage.setItem(key, value);
+      return true;
+    } catch (error) {
+      console.warn("[xm-export] 保存设置失败", error);
+      return false;
+    }
+  };
+
+  const safeLoad = (key) => {
+    try {
+      return localStorage.getItem(key);
+    } catch (error) {
+      return null;
+    }
+  };
+
+  let selectedConcurrencyLevel = (() => {
+    const saved = cleanText(safeLoad(CONCURRENCY_PROFILE_KEY));
+    return CONCURRENCY_PROFILES[saved] ? saved : DEFAULT_CONCURRENCY_LEVEL;
+  })();
+
+  const getConcurrencyProfile = () =>
+    CONCURRENCY_PROFILES[selectedConcurrencyLevel] ||
+    CONCURRENCY_PROFILES[DEFAULT_CONCURRENCY_LEVEL];
+
+  const getAlbumConcurrency = () => getConcurrencyProfile().album;
+  const getHttpConcurrency = () => getConcurrencyProfile().http;
+  const getRetentionPageConcurrency = () => getConcurrencyProfile().retentionPages;
+
+  let activeHttpRequests = 0;
+  const httpWaitQueue = [];
+
+  const withHttpSlot = (task) =>
+    new Promise((resolve, reject) => {
+      const run = () => {
+        activeHttpRequests += 1;
+        Promise.resolve()
+          .then(task)
+          .then(resolve, reject)
+          .finally(() => {
+            activeHttpRequests = Math.max(0, activeHttpRequests - 1);
+            const next = httpWaitQueue.shift();
+            if (next) next();
+          });
+      };
+
+      if (activeHttpRequests < getHttpConcurrency()) run();
+      else httpWaitQueue.push(run);
+    });
+
+  const gmGetOnce = (url, label) =>
+    withHttpSlot(
+      () =>
+        new Promise((resolve, reject) => {
+          if (typeof GM_xmlhttpRequest !== "function") {
+            reject(new Error("GM_xmlhttpRequest 不可用，请检查 Tampermonkey 权限"));
+            return;
+          }
+          GM_xmlhttpRequest({
+            method: "GET",
+            url,
+            headers: { Accept: "application/json, text/plain, */*" },
+            timeout: 20000,
+            anonymous: false,
+            onload: (response) => {
+              if (response.status === 401 || response.status === 403) {
+                reject(
+                  new Error(
+                    `${label}返回 HTTP ${response.status}，请重新登录并刷新页面`
+                  )
+                );
+                return;
+              }
+              if (response.status < 200 || response.status >= 300) {
+                reject(new Error(`${label}返回 HTTP ${response.status}`));
+                return;
+              }
+              try {
+                resolve(JSON.parse(response.responseText));
+              } catch (error) {
+                reject(new Error(`${label} JSON 解析失败：${error.message}`));
+              }
+            },
+            onerror: () => reject(new Error(`${label}网络请求失败`)),
+            ontimeout: () => reject(new Error(`${label}请求超时`)),
+          });
+        })
+    );
+
+  const mapWithConcurrency = async (items, concurrency, worker) => {
+    const list = Array.from(items || []);
+    if (!list.length) return [];
+    const results = new Array(list.length);
+    let cursor = 0;
+    const workerCount = Math.max(1, Math.min(Number(concurrency) || 1, list.length));
+
+    const runners = Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const index = cursor;
+        cursor += 1;
+        if (index >= list.length) return;
+        results[index] = await worker(list[index], index);
+      }
+    });
+
+    await Promise.all(runners);
+    return results;
+  };
+
+  const waitForOnline = async (label = "网络") => {
+    while (navigator.onLine === false) {
+      setStatus(`${label}已断开，进度已保存；恢复联网后将自动继续…`, true);
+      await sleep(1000);
+    }
+  };
+
+  const gmGet = async (url, label) => {
+    let lastError = null;
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      await waitForOnline(label);
+      try { return await gmGetOnce(url, label); }
+      catch (error) {
+        lastError = error;
+        if (/HTTP (401|403)/.test(error.message)) throw error;
+        if (attempt < 4) {
+          setStatus(`${label}失败，正在第 ${attempt + 1}/4 次重试：${error.message}`, true);
+          await sleep(700 * attempt);
+        }
+      }
+    }
+    throw lastError || new Error(`${label}请求失败`);
+  };
+
+  const getApiData = async (url, label) => {
+    const response = await gmGet(url, label);
+
+    if (!response || typeof response !== "object") {
+      throw new Error(`${label}没有返回有效对象`);
+    }
+
+    if (
+      response.code != null &&
+      response.code !== 0 &&
+      response.code !== 200
+    ) {
+      throw new Error(
+        `${label}返回异常：${response.msg || `code ${response.code}`}`
+      );
+    }
+
+    if (!response.data || typeof response.data !== "object") {
+      throw new Error(`${label}没有返回 data`);
+    }
+
+    return response.data;
+  };
+
+  const albumUrl = (page) => {
+    const params = new URLSearchParams({
+      pageSize: String(PAGE_SIZE),
+      currentPage: String(page),
+      realId: "",
+    });
+
+    return `${BASE_ALBUM}/ts-${Date.now()}?${params.toString()}`;
+  };
+
+  const retentionUrl = (albumId, page) => {
+    const params = new URLSearchParams({
+      pageSize: String(PAGE_SIZE),
+      currentPage: String(page),
+      totalPage: "0",
+      albumId: String(albumId),
+      realId: "",
+      isCopyright: "",
+    });
+
+    return `${BASE_RETENTION}/ts-${Date.now()}?${params.toString()}`;
+  };
+
+
+  const kpiTotalUrl = (albumId) => {
+    const params = new URLSearchParams({
+      albumId: String(albumId),
+      realId: "",
+      isCopyright: "",
+    });
+    return `${BASE_KPI_TOTAL}/ts-${Date.now()}?${params.toString()}`;
+  };
+
+  const pad2 = (value) => String(value).padStart(2, "0");
+
+  const formatLocalYmd = (date) =>
+    `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+
+  const dateFromParts = (parts) => {
+    if (Array.isArray(parts) && parts.length >= 3) {
+      const year = Number(parts[0]);
+      const month = Number(parts[1]);
+      const day = Number(parts[2]);
+      if (Number.isFinite(year) && Number.isFinite(month) && Number.isFinite(day)) {
+        const now = new Date();
+        return new Date(
+          year,
+          month - 1,
+          day,
+          now.getHours(),
+          now.getMinutes(),
+          now.getSeconds(),
+          now.getMilliseconds()
+        );
+      }
+    }
+    const fallback = new Date();
+    fallback.setDate(fallback.getDate() - 1);
+    return fallback;
+  };
+
+  const resolveKpiEndDate = (kpiItems) => {
+    const dates = (Array.isArray(kpiItems) ? kpiItems : [])
+      .map((item) => dateFromParts(item && item.lastUpdateTime))
+      .filter((date) => date instanceof Date && Number.isFinite(date.getTime()));
+
+    if (!dates.length) {
+      const fallback = new Date();
+      fallback.setDate(fallback.getDate() - 1);
+      return fallback;
+    }
+
+    return new Date(Math.max(...dates.map((date) => date.getTime())));
+  };
+
+  const conversionUrl = (albumId, days, endDate) => {
+    const safeDays = Math.max(1, Number(days) || 1);
+    const end = new Date(endDate);
+    const start = new Date(endDate);
+    start.setDate(start.getDate() - (safeDays - 1));
+
+    const params = new URLSearchParams({
+      albumId: String(albumId),
+      startStamp: String(start.getTime()),
+      endStamp: String(end.getTime()),
+      startDate: formatLocalYmd(start),
+      endDate: formatLocalYmd(end),
+      searchType: CONVERSION_SEARCH_TYPE,
+    });
+
+    return `${BASE_CONVERSION}/ts-${Date.now()}?${params.toString()}`;
+  };
+
+  const KPI_TITLE_TO_METRIC = Object.freeze({
+    "曝光": "曝光数",
+    "点击": "点击数",
+    "播放量": "播放数",
+    "完播率": "完播率",
+    "次日留存率": "次日留存率",
+    "7日留存率": "7日留存率",
+    "订阅": "订阅数",
+    "月票": "月票数",
+    "分享": "分享数",
+  });
+
+  const PERIOD_API_KEYS = Object.freeze({
+    "昨日": "latest1d",
+    "近7天": "latest7d",
+    "近30天": "latest30d",
+    "近1年": "latest1y",
+    "累计": "total",
+  });
+
+  const formatCoreApiValue = (metricName, value) => {
+    // 页面无数据时通常显示“-”；接口则返回 null。保持与旧版 DOM 导出语义一致。
+    if (value == null || value === "") return "-";
+    if (String(metricName).includes("率")) return formatRate(value);
+    return cleanText(value);
+  };
+
+  const parseKpiTotalToCores = (kpiItems) => {
+    const result = {};
+    for (const period of EXPORT_PERIODS) {
+      result[period.outputName] = Object.fromEntries(
+        CORE_METRICS.map((name) => [name, "-"])
+      );
+    }
+
+    for (const item of Array.isArray(kpiItems) ? kpiItems : []) {
+      for (const [periodName, apiKey] of Object.entries(PERIOD_API_KEYS)) {
+        const cell = item && item[apiKey];
+        if (!cell || !cell.title) continue;
+        const metricName = KPI_TITLE_TO_METRIC[cleanText(cell.title)];
+        if (!metricName || !result[periodName]) continue;
+        result[periodName][metricName] = formatCoreApiValue(
+          metricName,
+          cell.current
+        );
+      }
+    }
+
+    return result;
+  };
+
+  const fetchKpiTotalBundle = async (album) => {
+    const data = await getApiData(
+      kpiTotalUrl(album.id),
+      `核心数据API：${album.title}`
+    );
+
+    if (!Array.isArray(data)) {
+      throw new Error("核心数据接口没有返回数组");
+    }
+
+    return {
+      cores: parseKpiTotalToCores(data),
+      endDate: resolveKpiEndDate(data),
+      raw: data,
+    };
+  };
+
+  const fetchConversionTraffic = async (album, days, endDate) => {
+    const data = await getApiData(
+      conversionUrl(album.id, days, endDate),
+      `流量转化API(${days}天)：${album.title}`
+    );
+
+    return {
+      exposureClick: formatRate(data.exposureClickRate),
+      clickPlay: formatRate(data.clickToPlayRate),
+      playFinish: formatRate(data.completePlayRate),
+    };
+  };
+
+  let cachedAlbums = [];
+
+  const loadAlbums = async (onProgress) => {
+    const albums = new Map();
+    let page = 1;
+    let totalPages = 1;
+
+    do {
+      const data = await getApiData(albumUrl(page), `专辑列表第${page}页`);
+
+      if (!Array.isArray(data.result)) {
+        throw new Error(`专辑列表第${page}页没有返回 data.result`);
+      }
+
+      for (const item of data.result) {
+        if (!item || item.id == null) {
+          continue;
+        }
+
+        const id = String(item.id);
+        const title = cleanText(item.title || item.albumTitle || id) || id;
+        albums.set(id, { id, title });
+      }
+
+      totalPages = Number(data.totalPage || data.totalPages || 1);
+      if (!Number.isFinite(totalPages) || totalPages < 1) {
+        totalPages = 1;
+      }
+
+      if (typeof onProgress === "function") {
+        onProgress(page, totalPages, albums.size);
+      }
+
+      page += 1;
+    } while (page <= totalPages && page <= MAX_ALBUM_PAGES);
+
+    return Array.from(albums.values());
+  };
+
+  // ==================================================
+  // 创建操作面板
+  // ==================================================
+
+  document
+    .querySelectorAll('[id^="xm-export-panel"]')
+    .forEach((element) => element.remove());
+
+  const panel = document.createElement("div");
+  panel.id = PANEL_ID;
+  panel.style.cssText = [
+    "position:fixed",
+    "right:16px",
+    "bottom:16px",
+    "z-index:2147483647",
+    "width:320px",
+    "box-sizing:border-box",
+    "padding:12px",
+    "border:2px solid #ff7a00",
+    "border-radius:10px",
+    "background:#1e1e1e",
+    "color:#eee",
+    "font:13px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",
+    "box-shadow:0 6px 24px rgba(0,0,0,.4)",
+  ].join(";");
+
+  panel.innerHTML = `
+    <div id="xm-title" style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;">
+      <strong style="color:#ffb266;cursor:move;user-select:none;">
+        喜马拉雅数据导出 v${VERSION}
+      </strong>
+      <button id="xm-min" type="button" style="width:28px;height:24px;padding:0;border:1px solid #555;border-radius:4px;background:#333;color:#fff;cursor:pointer;">－</button>
+    </div>
+
+    <div id="xm-body" style="display:flex;flex-direction:column;gap:8px;">
+      <select id="xm-album" style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #555;border-radius:5px;background:#2b2b2b;color:#eee;">
+        <option value="">正在加载专辑列表…</option>
+      </select>
+
+      <input id="xm-album-id" type="text" placeholder="或手动输入 albumId（仅用于留存导出）" style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #555;border-radius:5px;background:#2b2b2b;color:#eee;">
+
+      <div style="display:grid;grid-template-columns:82px 1fr;align-items:center;gap:7px;">
+        <label for="xm-concurrency" style="font-size:12px;color:#ddd;">并发档位</label>
+        <select id="xm-concurrency" style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #6b5d4f;border-radius:5px;background:#2b2b2b;color:#eee;">
+          <option value="4">4 路 · 保守（HTTP 8）</option>
+          <option value="8">8 路 · 标准（HTTP 12）</option>
+          <option value="12">12 路 · 快速（HTTP 18）</option>
+          <option value="16">16 路 · 激进（HTTP 24）</option>
+        </select>
+      </div>
+      <div id="xm-concurrency-hint" style="margin-top:-4px;font-size:11px;color:#b9b9b9;">
+        推荐先用 8 或 12 路；遇到 HTTP 429/超时请降低档位。
+      </div>
+
+      <button id="xm-all" type="button" style="padding:9px 8px;border:0;border-radius:5px;background:#ff6a00;color:#fff;cursor:pointer;font-weight:700;">
+        极速导出全部专辑（API并发）
+      </button>
+
+      <button id="xm-retention" type="button" style="padding:7px 8px;border:0;border-radius:5px;background:#d85b00;color:#fff;cursor:pointer;font-weight:700;">
+        导出当前专辑留存
+      </button>
+
+      <button id="xm-progress" type="button" style="padding:7px 8px;border:1px solid #b76825;border-radius:5px;background:#4a3424;color:#fff;cursor:pointer;">
+        导出当前已保存进度
+      </button>
+
+      <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:6px;">
+        <button id="xm-export-yesterday" type="button" style="padding:7px 4px;border:1px solid #4f7898;border-radius:5px;background:#263f52;color:#fff;cursor:pointer;font-size:12px;">
+          单独导出昨日
+        </button>
+        <button id="xm-export-week" type="button" style="padding:7px 4px;border:1px solid #4f7898;border-radius:5px;background:#263f52;color:#fff;cursor:pointer;font-size:12px;">
+          单独导出7日
+        </button>
+        <button id="xm-export-month" type="button" style="padding:7px 4px;border:1px solid #4f7898;border-radius:5px;background:#263f52;color:#fff;cursor:pointer;font-size:12px;">
+          单独导出30日
+        </button>
+        <button id="xm-export-year" type="button" style="padding:7px 4px;border:1px solid #4f7898;border-radius:5px;background:#263f52;color:#fff;cursor:pointer;font-size:12px;">
+          单独导出近1年
+        </button>
+        <button id="xm-export-total" type="button" style="grid-column:1/-1;padding:7px 4px;border:1px solid #4f7898;border-radius:5px;background:#263f52;color:#fff;cursor:pointer;font-size:12px;">
+          单独导出累计
+        </button>
+      </div>
+
+      <button id="xm-import" type="button" style="padding:7px 8px;border:1px solid #3c7f9e;border-radius:5px;background:#243f4a;color:#fff;cursor:pointer;">
+        导入阶段备份并续传
+      </button>
+      <input id="xm-import-file" type="file" accept=".xlsx,.xls" style="display:none;">
+
+      <button id="xm-clear-progress" type="button" style="padding:6px 8px;border:1px solid #875050;border-radius:5px;background:#4a2929;color:#fff;cursor:pointer;">
+        清空断点（重新开始）
+      </button>
+
+      <button id="xm-reload" type="button" style="padding:6px 8px;border:1px solid #666;border-radius:5px;background:#333;color:#fff;cursor:pointer;">
+        重新加载专辑列表
+      </button>
+
+      <div id="xm-status" style="min-height:36px;font-size:12px;color:#9cdcfe;word-break:break-word;">
+        脚本已运行。请停留在“专辑数据”页面。
+      </div>
+    </div>
+  `;
+
+  const titleBar = panel.querySelector("#xm-title strong");
+  const minButton = panel.querySelector("#xm-min");
+  const panelBody = panel.querySelector("#xm-body");
+  const albumSelect = panel.querySelector("#xm-album");
+  const albumInput = panel.querySelector("#xm-album-id");
+  const concurrencySelect = panel.querySelector("#xm-concurrency");
+  const concurrencyHint = panel.querySelector("#xm-concurrency-hint");
+  const allButton = panel.querySelector("#xm-all");
+  const retentionButton = panel.querySelector("#xm-retention");
+  const progressButton = panel.querySelector("#xm-progress");
+  const exportYesterdayButton = panel.querySelector("#xm-export-yesterday");
+  const exportWeekButton = panel.querySelector("#xm-export-week");
+  const exportMonthButton = panel.querySelector("#xm-export-month");
+  const exportYearButton = panel.querySelector("#xm-export-year");
+  const exportTotalButton = panel.querySelector("#xm-export-total");
+  const importButton = panel.querySelector("#xm-import");
+  const importFileInput = panel.querySelector("#xm-import-file");
+  const clearProgressButton = panel.querySelector("#xm-clear-progress");
+  const reloadButton = panel.querySelector("#xm-reload");
+  const status = panel.querySelector("#xm-status");
+
+  const setStatus = (message, isError = false) => {
+    status.textContent = String(message || "");
+    status.style.color = isError ? "#ff8b7f" : "#9cdcfe";
+  };
+
+  const renderConcurrencyChoice = (announce = false) => {
+    const profile = getConcurrencyProfile();
+    if (concurrencySelect) concurrencySelect.value = profile.level;
+    if (concurrencyHint) {
+      concurrencyHint.textContent =
+        `${profile.label}档：专辑 ${profile.album} 路｜HTTP ${profile.http}｜留存分页 ${profile.retentionPages} 路` +
+        (profile.level === "16" ? "；激进档更容易触发平台限流。" : "");
+    }
+    if (announce) {
+      setStatus(
+        `并发档位已切换为 ${profile.level} 路·${profile.label}：HTTP ${profile.http}，留存分页 ${profile.retentionPages} 路。`
+      );
+    }
+  };
+
+  if (concurrencySelect) {
+    concurrencySelect.value = selectedConcurrencyLevel;
+    concurrencySelect.addEventListener("change", () => {
+      const nextLevel = cleanText(concurrencySelect.value);
+      if (!CONCURRENCY_PROFILES[nextLevel]) {
+        concurrencySelect.value = selectedConcurrencyLevel;
+        return;
+      }
+      selectedConcurrencyLevel = nextLevel;
+      safeStore(CONCURRENCY_PROFILE_KEY, selectedConcurrencyLevel);
+      renderConcurrencyChoice(true);
+    });
+  }
+  renderConcurrencyChoice(false);
+
+  const mountPanel = () => {
+    const host = document.body || document.documentElement;
+
+    if (!host) {
+      setTimeout(mountPanel, 100);
+      return;
+    }
+
+    if (!document.getElementById(PANEL_ID)) {
+      host.appendChild(panel);
+    }
+  };
+
+  mountPanel();
+  setTimeout(mountPanel, 800);
+  setTimeout(mountPanel, 2000);
+
+  const panelObserver = new MutationObserver(() => {
+    if (!document.getElementById(PANEL_ID)) {
+      mountPanel();
+    }
+  });
+
+  panelObserver.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+  });
+
+  let minimized = false;
+
+  minButton.addEventListener("click", () => {
+    minimized = !minimized;
+    panelBody.style.display = minimized ? "none" : "flex";
+    minButton.textContent = minimized ? "＋" : "－";
+  });
+
+  let dragging = false;
+  let offsetX = 0;
+  let offsetY = 0;
+
+  titleBar.addEventListener("mousedown", (event) => {
+    dragging = true;
+    const rect = panel.getBoundingClientRect();
+    offsetX = event.clientX - rect.left;
+    offsetY = event.clientY - rect.top;
+    event.preventDefault();
+  });
+
+  document.addEventListener("mousemove", (event) => {
+    if (!dragging) {
+      return;
+    }
+
+    const left = Math.min(
+      Math.max(0, event.clientX - offsetX),
+      Math.max(0, innerWidth - panel.offsetWidth)
+    );
+    const top = Math.min(
+      Math.max(0, event.clientY - offsetY),
+      Math.max(0, innerHeight - panel.offsetHeight)
+    );
+
+    panel.style.left = `${left}px`;
+    panel.style.top = `${top}px`;
+    panel.style.right = "auto";
+    panel.style.bottom = "auto";
+  });
+
+  document.addEventListener("mouseup", () => {
+    dragging = false;
+  });
+
+  // ==================================================
+  // 专辑列表面板加载
+  // ==================================================
+
+  let loadingAlbums = false;
+
+  const refreshAlbumList = async () => {
+    if (loadingAlbums) {
+      return;
+    }
+
+    loadingAlbums = true;
+    reloadButton.disabled = true;
+    albumSelect.disabled = true;
+    reloadButton.textContent = "加载中…";
+    setStatus("正在加载全部专辑列表…");
+
+    try {
+      const lastId = safeLoad(STORAGE_KEY) || "";
+
+      cachedAlbums = await loadAlbums((page, pages, count) => {
+        setStatus(`加载专辑列表 ${page}/${pages}，已获取 ${count} 个`);
+      });
+
+      albumSelect.innerHTML = "";
+
+      if (!cachedAlbums.length) {
+        albumSelect.innerHTML =
+          '<option value="">未获取到专辑，请重新登录后刷新页面</option>';
+        setStatus("专辑列表为空", true);
+        return;
+      }
+
+      let selectedIndex = 0;
+
+      cachedAlbums.forEach((album, index) => {
+        const option = document.createElement("option");
+        option.value = album.id;
+        option.textContent = album.title;
+        albumSelect.appendChild(option);
+
+        if (album.id === lastId) {
+          selectedIndex = index;
+        }
+      });
+
+      albumSelect.selectedIndex = selectedIndex;
+      setStatus(`已加载 ${cachedAlbums.length} 个专辑，可开始高速接口导出`);
+    } catch (error) {
+      albumSelect.innerHTML =
+        '<option value="">专辑加载失败，请重新登录后刷新页面</option>';
+      setStatus(`专辑列表加载失败：${error.message}`, true);
+      console.error("[xm-export] album list failed", error);
+    } finally {
+      loadingAlbums = false;
+      reloadButton.disabled = false;
+      albumSelect.disabled = false;
+      reloadButton.textContent = "重新加载专辑列表";
+    }
+  };
+
+  albumSelect.addEventListener("change", () => {
+    albumInput.value = "";
+    safeStore(STORAGE_KEY, albumSelect.value);
+  });
+
+  reloadButton.addEventListener("click", refreshAlbumList);
+
+  // ==================================================
+  // 单专辑留存导出
+  // ==================================================
+
+  const fetchRetentionPage = async (albumId, page) => {
+    const data = await getApiData(
+      retentionUrl(albumId, page),
+      `留存数据第${page}页`
+    );
+
+    if (!Array.isArray(data.result)) {
+      throw new Error(`留存数据第${page}页没有返回 data.result`);
+    }
+
+    return data;
+  };
+
+  const fetchAllRetentionRows = async (albumId, onProgress = null) => {
+    const firstPage = await fetchRetentionPage(albumId, 1);
+    const allRows = [...firstPage.result];
+    const totalCount = Number(firstPage.totalCount || firstPage.total || 0);
+    let totalPages = Number(firstPage.totalPage || firstPage.totalPages || 0);
+
+    if ((!Number.isFinite(totalPages) || totalPages < 1) && totalCount > 0) {
+      totalPages = Math.ceil(
+        totalCount / Math.max(1, Number(firstPage.pageSize || PAGE_SIZE))
+      );
+    }
+    if (!Number.isFinite(totalPages) || totalPages < 1) totalPages = 1;
+    totalPages = Math.min(Math.floor(totalPages), MAX_RETENTION_PAGES);
+
+    if (typeof onProgress === "function") {
+      onProgress(1, totalPages, allRows.length);
+    }
+
+    if (totalPages > 1) {
+      const pages = Array.from({ length: totalPages - 1 }, (_, index) => index + 2);
+      let finishedPages = 1;
+      let finishedRows = allRows.length;
+      const pageResults = await mapWithConcurrency(
+        pages,
+        getRetentionPageConcurrency(),
+        async (page) => {
+          const data = await fetchRetentionPage(albumId, page);
+          finishedPages += 1;
+          finishedRows += data.result.length;
+          if (typeof onProgress === "function") {
+            onProgress(finishedPages, totalPages, finishedRows);
+          }
+          return { page, rows: data.result };
+        }
+      );
+
+      pageResults
+        .sort((a, b) => a.page - b.page)
+        .forEach((item) => allRows.push(...item.rows));
+    }
+
+    return allRows;
+  };
+
+  const retentionApiItemToRecord = (album, item) => {
+    const week = item && item.week ? item.week : {};
+    const rates = Array.isArray(item && item.weekRates) ? item.weekRates : [];
+    return sanitizeRetentionRecord({
+      albumId: String(album.id || ""),
+      albumName: album.title || String(album.id || ""),
+      weekIndex: week.index != null ? week.index : "",
+      startDate: week.startDate || "",
+      endDate: week.endDate || "",
+      added: item && item.added != null ? item.added : "",
+      rates: Array.from({ length: WEEK_SLOTS }, (_, index) =>
+        normalizeRetentionRate(rates[index])
+      ),
+    });
+  };
+
+  let exportingRetention = false;
+
+  const runRetentionExport = async (albumId, knownTitle = "") => {
+    if (exportingRetention) {
+      setStatus("已有留存导出任务正在执行", true);
+      return;
+    }
+
+    albumId = cleanText(albumId);
+
+    if (!albumId) {
+      setStatus("请选择专辑或输入 albumId", true);
+      return;
+    }
+
+    exportingRetention = true;
+    retentionButton.disabled = true;
+    reloadButton.disabled = true;
+    retentionButton.textContent = "导出中…";
+    safeStore(STORAGE_KEY, albumId);
+
+    try {
+      const albumName = cleanText(knownTitle) || albumId;
+      setStatus(`正在读取留存数据：${albumName}`);
+
+      const allRows = await fetchAllRetentionRows(albumId, (page, totalPages, count) => {
+        setStatus(`留存第 ${page}/${totalPages} 页，累计 ${count} 条`);
+      });
+
+      if (!allRows.length) {
+        throw new Error("该专辑没有返回留存数据，或当前账号没有查看权限");
+      }
+
+      const rows = [
+        [
+          "周序",
+          "开始日期",
+          "结束日期",
+          "新增听众",
+          ...Array.from({ length: WEEK_SLOTS }, (_, index) =>
+            `留存率_${index + 1}周后`
+          ),
+        ],
+      ];
+
+      for (const item of allRows) {
+        const week = item && item.week ? item.week : {};
+        const rates = Array.isArray(item && item.weekRates) ? item.weekRates : [];
+
+        rows.push([
+          week.index != null ? `第${week.index}周` : "",
+          week.startDate || "",
+          week.endDate || "",
+          item && item.added != null ? item.added : "",
+          ...Array.from({ length: WEEK_SLOTS }, (_, index) =>
+            formatRate(rates[index])
+          ),
+        ]);
+      }
+
+      downloadCsv(`${safeName(albumName)}.csv`, rows);
+      setStatus(`✅ 留存导出完成：${allRows.length} 行`);
+    } catch (error) {
+      console.error("[xm-export] retention export failed", error);
+      setStatus(`留存导出失败：${error.message}`, true);
+    } finally {
+      exportingRetention = false;
+      retentionButton.disabled = false;
+      reloadButton.disabled = false;
+      retentionButton.textContent = "导出当前专辑留存";
+    }
+  };
+
+  // ==================================================
+  // 一键导出全部专辑核心数据 + 流量转化
+  // ==================================================
+
+  let exportingAll = false;
+  let activeProgressSnapshot = null;
+
+  const openProgressDb = () =>
+    new Promise((resolve, reject) => {
+      if (typeof indexedDB === "undefined") {
+        reject(new Error("当前浏览器不支持 IndexedDB"));
+        return;
+      }
+
+      const request = indexedDB.open(PROGRESS_DB_NAME, 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(PROGRESS_DB_STORE)) {
+          db.createObjectStore(PROGRESS_DB_STORE);
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error("IndexedDB 打开失败"));
+    });
+
+  const idbLoadProgress = async () => {
+    const db = await openProgressDb();
+    try {
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction(PROGRESS_DB_STORE, "readonly");
+        const request = tx.objectStore(PROGRESS_DB_STORE).get(PROGRESS_DB_KEY);
+        request.onsuccess = () => resolve(request.result || null);
+        request.onerror = () => reject(request.error || new Error("IndexedDB 读取失败"));
+      });
+    } finally {
+      db.close();
+    }
+  };
+
+  const idbSaveProgress = async (progress) => {
+    const db = await openProgressDb();
+    try {
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(PROGRESS_DB_STORE, "readwrite");
+        tx.objectStore(PROGRESS_DB_STORE).put(progress, PROGRESS_DB_KEY);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error("IndexedDB 保存失败"));
+        tx.onabort = () => reject(tx.error || new Error("IndexedDB 保存被中止"));
+      });
+    } finally {
+      db.close();
+    }
+  };
+
+  const idbClearProgress = async () => {
+    const db = await openProgressDb();
+    try {
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(PROGRESS_DB_STORE, "readwrite");
+        tx.objectStore(PROGRESS_DB_STORE).delete(PROGRESS_DB_KEY);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error("IndexedDB 清除失败"));
+      });
+    } finally {
+      db.close();
+    }
+  };
+
+  const progressScore = (progress) => {
+    if (!progress || !Array.isArray(progress.records)) return -1;
+    const recordCount = progress.records.length;
+    const retentionCompletedCount = Array.isArray(progress.retentionCompletedAlbumIds)
+      ? progress.retentionCompletedAlbumIds.length
+      : 0;
+    const retentionRowCount = Array.isArray(progress.retentionRecords)
+      ? progress.retentionRecords.length
+      : 0;
+    const updatedAt = Date.parse(progress.updatedAt || "") || 0;
+    return (
+      recordCount * 1000000000 +
+      retentionCompletedCount * 1000000 +
+      Math.min(retentionRowCount, 999999) * 100 +
+      Math.floor(updatedAt / 100000000)
+    );
+  };
+
+  const loadAllExportProgress = async () => {
+    const candidates = [];
+
+    if (activeProgressSnapshot) candidates.push(activeProgressSnapshot);
+
+    for (const key of LEGACY_PROGRESS_KEYS) {
+      const raw = safeLoad(key);
+      if (!raw) continue;
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") candidates.push(parsed);
+      } catch (error) {
+        console.warn(`[xm-export] 读取断点 ${key} 失败`, error);
+      }
+    }
+
+    try {
+      const idbProgress = await idbLoadProgress();
+      if (idbProgress) candidates.push(idbProgress);
+    } catch (error) {
+      console.warn("[xm-export] IndexedDB 断点读取失败，将使用 localStorage", error);
+    }
+
+    candidates.sort((a, b) => progressScore(b) - progressScore(a));
+    const best = candidates[0] || null;
+    const sanitizedBest = best ? sanitizeProgressTraffic(best) : null;
+    if (sanitizedBest) activeProgressSnapshot = sanitizedBest;
+    return sanitizedBest;
+  };
+
+  const saveAllExportProgress = async (progress) => {
+    const snapshot = JSON.parse(
+      JSON.stringify(sanitizeProgressTraffic(progress))
+    );
+    activeProgressSnapshot = snapshot;
+    const json = JSON.stringify(snapshot);
+    const localOk = safeStore(ALL_EXPORT_PROGRESS_KEY, json);
+    let idbOk = false;
+
+    try {
+      await idbSaveProgress(snapshot);
+      idbOk = true;
+    } catch (error) {
+      console.warn("[xm-export] IndexedDB 保存失败", error);
+    }
+
+    // 同时写回旧键，保证从旧版本脚本切换回来也能继续。
+    safeStore("xm_export_all_progress_v206", json);
+
+    if (!localOk && !idbOk) {
+      throw new Error("浏览器双重存储均保存失败，请立即点击“导出当前已保存进度”");
+    }
+  };
+
+  const clearAllExportProgress = async () => {
+    activeProgressSnapshot = null;
+    for (const key of LEGACY_PROGRESS_KEYS) {
+      try {
+        localStorage.removeItem(key);
+      } catch (error) {
+        console.warn(`[xm-export] 清除断点 ${key} 失败`, error);
+      }
+    }
+    try {
+      await idbClearProgress();
+    } catch (error) {
+      console.warn("[xm-export] 清除 IndexedDB 断点失败", error);
+    }
+  };
+
+  const recordKey = (albumId, period) => `${String(albumId)}::${period}`;
+
+  const normalizePeriodName = (value) => {
+    const text = normalizeText(value);
+    if (["昨日", "昨天"].includes(text)) return "昨日";
+    if (["近7日", "近7天", "最近7日", "最近7天"].includes(text)) return "近7天";
+    if (["近30日", "近30天", "最近30日", "最近30天"].includes(text)) return "近30天";
+    if (["近1年", "近一年", "近365日", "近365天", "最近1年", "最近一年"].includes(text)) return "近1年";
+    if (["累计"].includes(text)) return "累计";
+    return cleanText(value);
+  };
+
+  const exportSavedProgressNow = async () => {
+    const progress = activeProgressSnapshot || await loadAllExportProgress();
+    if (!progress || !Array.isArray(progress.records) || !progress.records.length) {
+      setStatus("当前没有可导出的已保存进度", true);
+      return;
+    }
+    const stamp = new Date().toISOString().replace(/[:T]/g, "-").slice(0, 16);
+    downloadAllAlbumsXlsx(
+      progress.records,
+      Array.isArray(progress.failures) ? progress.failures : [],
+      `全部专辑数据_阶段备份_${stamp}.xlsx`,
+      Array.isArray(progress.retentionRecords) ? progress.retentionRecords : []
+    );
+    setStatus(
+      `✅ 已导出阶段备份：核心 ${progress.records.length} 行，留存 ${Array.isArray(progress.retentionRecords) ? progress.retentionRecords.length : 0} 行；文件内含隐藏断点恢复表`
+    );
+  };
+
+  /*
+   * 从当前断点中筛选指定周期并单独导出。
+   * 不会重新抓取页面，也不会修改或清空现有断点。
+   */
+  const exportSavedPeriodNow = async (periodName) => {
+    const normalizedPeriod = normalizePeriodName(periodName);
+    const allowedPeriods = EXPORT_PERIODS.map((item) => item.outputName);
+
+    if (!allowedPeriods.includes(normalizedPeriod)) {
+      setStatus(`不支持单独导出的周期：${periodName}`, true);
+      return;
+    }
+
+    const progress = activeProgressSnapshot || await loadAllExportProgress();
+    if (!progress || !Array.isArray(progress.records) || !progress.records.length) {
+      setStatus("当前没有可导出的已保存进度，请先抓取数据或导入阶段备份", true);
+      return;
+    }
+
+    const periodRecords = progress.records
+      .map(sanitizeRecordTraffic)
+      .filter(
+        (record) =>
+          record && normalizePeriodName(record.period) === normalizedPeriod
+      );
+
+    if (!periodRecords.length) {
+      setStatus(
+        `当前断点中没有“${normalizedPeriod}”数据，请先点击“导出全部专辑”抓取该周期`,
+        true
+      );
+      return;
+    }
+
+    const periodFailures = Array.isArray(progress.failures)
+      ? progress.failures.filter((item) => {
+          const stage = cleanText(item && item.stage);
+          return stage === "切换专辑" || stage === `${normalizedPeriod}数据`;
+        })
+      : [];
+
+    const stamp = new Date().toISOString().replace(/[:T]/g, "-").slice(0, 16);
+    downloadAllAlbumsXlsx(
+      periodRecords,
+      periodFailures,
+      `全部专辑核心数据_${normalizedPeriod}_${stamp}.xlsx`,
+      [],
+      false
+    );
+
+    setStatus(
+      `✅ 已单独导出${normalizedPeriod}：${periodRecords.length} 个专辑周期` +
+        (periodFailures.length ? `，另有 ${periodFailures.length} 个相关失败项` : "")
+    );
+  };
+
+  const findAlbumForImportedName = (albumName) => {
+    const exact = cachedAlbums.find(
+      (album) => normalizeAlbumText(album.title) === normalizeAlbumText(albumName)
+    );
+    if (exact) return exact;
+
+    const scored = cachedAlbums
+      .map((album) => ({ album, score: albumTitleMatchScore(album.title, albumName) }))
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score);
+    return scored.length ? scored[0].album : null;
+  };
+
+  const importProgressWorkbook = async (file) => {
+    if (!file) return;
+    if (typeof XLSX === "undefined") throw new Error("XLSX 组件未加载");
+
+    if (!cachedAlbums.length) {
+      setStatus("正在加载专辑列表，用于匹配备份文件…");
+      cachedAlbums = await loadAlbums();
+    }
+
+    const buffer = await file.arrayBuffer();
+    const workbook = XLSX.read(buffer, { type: "array" });
+    const importedRecords = [];
+    const importedRetentionRecords = [];
+    const importedRetentionCompletedAlbumIds = new Set();
+    const importedFailures = [];
+
+    if (workbook.Sheets["断点恢复"]) {
+      const rows = XLSX.utils.sheet_to_json(workbook.Sheets["断点恢复"], { defval: "" });
+      for (const row of rows) {
+        const period = normalizePeriodName(row.period);
+        if (!row.albumId || !EXPORT_PERIODS.some((item) => item.outputName === period)) continue;
+        const core = {};
+        for (const name of CORE_METRICS) core[name] = cleanText(row[name]);
+        importedRecords.push(
+          sanitizeRecordTraffic({
+            albumId: String(row.albumId),
+            albumName: cleanText(row.albumName) || String(row.albumId),
+            period,
+            core,
+            traffic: {
+              exposureClick: cleanText(row.exposureClick),
+              clickPlay: cleanText(row.clickPlay),
+              playFinish: cleanText(row.playFinish),
+            },
+          })
+        );
+      }
+    } else {
+      const sheet = workbook.Sheets["核心数据汇总"] || workbook.Sheets[workbook.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+      const headerIndex = rows.findIndex(
+        (row) => row.includes("曝光数") && row.includes("点击数") && row.includes("播放数")
+      );
+      if (headerIndex < 0) throw new Error("备份表中没有识别到核心数据表头");
+
+      let currentAlbumName = "";
+      for (let index = headerIndex + 1; index < rows.length; index += 1) {
+        const row = rows[index];
+        if (cleanText(row[0])) currentAlbumName = cleanText(row[0]);
+        const period = normalizePeriodName(row[1]);
+        if (!currentAlbumName || !EXPORT_PERIODS.some((item) => item.outputName === period)) continue;
+
+        const album = findAlbumForImportedName(currentAlbumName);
+        if (!album) continue;
+        const core = {};
+        CORE_METRICS.forEach((name, metricIndex) => {
+          core[name] = cleanText(row[metricIndex + 2]);
+        });
+        importedRecords.push(
+          sanitizeRecordTraffic({
+            albumId: album.id,
+            albumName: album.title,
+            period,
+            core,
+            traffic: {
+              exposureClick: cleanText(row[11]),
+              clickPlay: cleanText(row[12]),
+              playFinish: cleanText(row[13]),
+            },
+          })
+        );
+      }
+    }
+
+    if (workbook.Sheets["留存断点恢复"]) {
+      const rows = XLSX.utils.sheet_to_json(workbook.Sheets["留存断点恢复"], { defval: "" });
+      for (const row of rows) {
+        const albumId = String(row.albumId || "");
+        if (!albumId) continue;
+        const record = sanitizeRetentionRecord({
+          albumId,
+          albumName: cleanText(row.albumName) || albumId,
+          weekIndex: row.weekIndex,
+          startDate: row.startDate,
+          endDate: row.endDate,
+          added: row.added,
+          rates: Array.from({ length: WEEK_SLOTS }, (_, index) => row[`rate${index + 1}`]),
+        });
+        if (!record) continue;
+        importedRetentionRecords.push(record);
+        importedRetentionCompletedAlbumIds.add(albumId);
+      }
+    } else if (workbook.Sheets["留存分析"]) {
+      const rows = XLSX.utils.sheet_to_json(workbook.Sheets["留存分析"], { header: 1, defval: "" });
+      const headerIndex = rows.findIndex(
+        (row) => row.includes("首次收听时间") && row.includes("新增听众") && row.includes("1周后")
+      );
+      if (headerIndex >= 0) {
+        let currentAlbumName = "";
+        for (let index = headerIndex + 1; index < rows.length; index += 1) {
+          const row = rows[index];
+          if (cleanText(row[0])) currentAlbumName = cleanText(row[0]);
+          if (!currentAlbumName || !cleanText(row[1])) continue;
+          const album = findAlbumForImportedName(currentAlbumName);
+          if (!album) continue;
+          const timeText = cleanText(row[1]);
+          const match = timeText.match(/第\s*(\d+)\s*周\s*(\d{4}-\d{2}-\d{2})\s*[~～-]\s*(\d{4}-\d{2}-\d{2})/);
+          const record = sanitizeRetentionRecord({
+            albumId: album.id,
+            albumName: album.title,
+            weekIndex: match ? match[1] : "",
+            startDate: match ? match[2] : "",
+            endDate: match ? match[3] : "",
+            added: row[2],
+            rates: Array.from({ length: WEEK_SLOTS }, (_, rateIndex) => row[rateIndex + 3]),
+          });
+          if (!record) continue;
+          importedRetentionRecords.push(record);
+          importedRetentionCompletedAlbumIds.add(String(album.id));
+        }
+      }
+    }
+
+    const failureSheet = workbook.Sheets["失败专辑"];
+    if (failureSheet) {
+      const rows = XLSX.utils.sheet_to_json(failureSheet, { defval: "" });
+      for (const row of rows) {
+        importedFailures.push({
+          albumId: String(row["专辑ID"] || ""),
+          albumName: cleanText(row["专辑名称"]),
+          stage: cleanText(row["失败阶段"]),
+          reason: cleanText(row["失败原因"]),
+        });
+      }
+    }
+
+    if (!importedRecords.length) throw new Error("备份文件中没有识别到可恢复的数据行");
+
+    const existing = await loadAllExportProgress();
+    const merged = new Map();
+    for (const record of existing && Array.isArray(existing.records) ? existing.records : []) {
+      const sanitizedRecord = sanitizeRecordTraffic(record);
+      merged.set(
+        recordKey(sanitizedRecord.albumId, sanitizedRecord.period),
+        sanitizedRecord
+      );
+    }
+    for (const record of importedRecords) {
+      const sanitizedRecord = sanitizeRecordTraffic(record);
+      merged.set(
+        recordKey(sanitizedRecord.albumId, sanitizedRecord.period),
+        sanitizedRecord
+      );
+    }
+
+    const mergedRetention = new Map();
+    for (const record of existing && Array.isArray(existing.retentionRecords) ? existing.retentionRecords : []) {
+      const sanitized = sanitizeRetentionRecord(record);
+      if (sanitized) mergedRetention.set(retentionRecordKey(sanitized), sanitized);
+    }
+    for (const record of importedRetentionRecords) {
+      const sanitized = sanitizeRetentionRecord(record);
+      if (sanitized) mergedRetention.set(retentionRecordKey(sanitized), sanitized);
+    }
+
+    const retentionCompletedAlbumIds = new Set(
+      existing && Array.isArray(existing.retentionCompletedAlbumIds)
+        ? existing.retentionCompletedAlbumIds.map(String)
+        : []
+    );
+    for (const albumId of importedRetentionCompletedAlbumIds) {
+      retentionCompletedAlbumIds.add(String(albumId));
+    }
+
+    const progress = {
+      version: VERSION,
+      signature: cachedAlbums.map((item) => String(item.id)).join("|"),
+      records: Array.from(merged.values()),
+      retentionRecords: Array.from(mergedRetention.values()),
+      retentionCompletedAlbumIds: Array.from(retentionCompletedAlbumIds),
+      failures: importedFailures.length
+        ? importedFailures
+        : existing && Array.isArray(existing.failures)
+          ? existing.failures
+          : [],
+      updatedAt: new Date().toISOString(),
+      importedFrom: file.name,
+    };
+    await saveAllExportProgress(progress);
+    setStatus(
+      `✅ 已导入 ${importedRecords.length} 个核心周期、${importedRetentionRecords.length} 行留存；当前断点共 ${progress.records.length} 个周期、${progress.retentionRecords.length} 行留存；点击“极速导出全部专辑（API并发）”只补抓缺失数据`
+    );
+  };
+
+  window.addEventListener("pagehide", () => {
+    if (activeProgressSnapshot) {
+      safeStore(ALL_EXPORT_PROGRESS_KEY, JSON.stringify(activeProgressSnapshot));
+    }
+  });
+
+  const runAllAlbumsExport = async () => {
+    if (exportingAll) {
+      setStatus("极速并发接口抓取正在执行，请不要重复点击", true);
+      return;
+    }
+
+    exportingAll = true;
+    const concurrencyProfile = getConcurrencyProfile();
+    [allButton, retentionButton, reloadButton, albumSelect, concurrencySelect].forEach((item) => {
+      if (item) item.disabled = true;
+    });
+    allButton.textContent = `极速并发抓取中（${concurrencyProfile.album}路）…`;
+
+    let records = [];
+    let retentionRecords = [];
+    let retentionCompletedAlbumIds = new Set();
+    let failures = [];
+    let forcePersistProgress = async () => {};
+
+    try {
+      if (!cachedAlbums.length) {
+        setStatus("正在通过接口获取全部专辑列表…");
+        cachedAlbums = await loadAlbums((page, pages, count) =>
+          setStatus(`专辑列表 ${page}/${pages}，已获取 ${count} 个`)
+        );
+      }
+      if (!cachedAlbums.length) throw new Error("没有获取到任何专辑");
+
+      const allAlbums = cachedAlbums.slice();
+      const currentAlbumIds = new Set(allAlbums.map((item) => String(item.id)));
+      const signature = allAlbums.map((item) => String(item.id)).join("|");
+      const savedProgress = await loadAllExportProgress();
+
+      if (savedProgress && Array.isArray(savedProgress.records)) {
+        const dedupe = new Map();
+        for (const item of savedProgress.records) {
+          if (!item || !currentAlbumIds.has(String(item.albumId)) || !item.period) {
+            continue;
+          }
+          const sanitized = sanitizeRecordTraffic({
+            ...item,
+            period: normalizePeriodName(item.period),
+          });
+          dedupe.set(recordKey(sanitized.albumId, sanitized.period), sanitized);
+        }
+        records = Array.from(dedupe.values());
+
+        failures = Array.isArray(savedProgress.failures)
+          ? savedProgress.failures.filter((item) =>
+              currentAlbumIds.has(String(item.albumId))
+            )
+          : [];
+
+        const retentionDedupe = new Map();
+        for (const item of Array.isArray(savedProgress.retentionRecords)
+          ? savedProgress.retentionRecords
+          : []) {
+          const sanitized = sanitizeRetentionRecord(item);
+          if (!sanitized || !currentAlbumIds.has(String(sanitized.albumId))) {
+            continue;
+          }
+          retentionDedupe.set(retentionRecordKey(sanitized), sanitized);
+        }
+        retentionRecords = Array.from(retentionDedupe.values());
+
+        retentionCompletedAlbumIds = new Set(
+          (Array.isArray(savedProgress.retentionCompletedAlbumIds)
+            ? savedProgress.retentionCompletedAlbumIds
+            : [])
+            .map(String)
+            .filter((albumId) => currentAlbumIds.has(albumId))
+        );
+      }
+
+      // v3.2.0：沿用 Map 索引，避免并发运行时反复线性扫描。
+      const recordMap = new Map();
+      for (const item of records) {
+        recordMap.set(recordKey(item.albumId, item.period), item);
+      }
+
+      const getRecord = (albumId, period) =>
+        recordMap.get(recordKey(albumId, period)) || null;
+
+      const coreIsComplete = (record) =>
+        Boolean(
+          record &&
+          record.core &&
+          CORE_METRICS.every((name) => cleanText(record.core[name]) !== "")
+        );
+
+      const trafficIsComplete = (record) => {
+        if (!record) return false;
+        if (isTrafficDisabledPeriod(record.period)) return true;
+        return Boolean(
+          record.traffic &&
+          cleanText(record.traffic.exposureClick) !== "" &&
+          cleanText(record.traffic.clickPlay) !== "" &&
+          cleanText(record.traffic.playFinish) !== ""
+        );
+      };
+
+      const periodIsComplete = (albumId, periodName) => {
+        const record = getRecord(albumId, periodName);
+        return coreIsComplete(record) && trafficIsComplete(record);
+      };
+
+      const isCoreAlbumComplete = (albumId) =>
+        EXPORT_PERIODS.every((period) =>
+          periodIsComplete(String(albumId), period.outputName)
+        );
+
+      const isRetentionComplete = (albumId) =>
+        retentionCompletedAlbumIds.has(String(albumId));
+
+      const isAlbumComplete = (albumId) =>
+        isCoreAlbumComplete(albumId) && isRetentionComplete(albumId);
+
+      const completedAlbumCount = () =>
+        allAlbums.filter((album) => isAlbumComplete(album.id)).length;
+
+      const upsertRecord = (record) => {
+        const sanitized = sanitizeRecordTraffic(record);
+        const key = recordKey(sanitized.albumId, sanitized.period);
+        const existing = recordMap.get(key);
+        if (existing) {
+          const index = records.indexOf(existing);
+          if (index >= 0) records[index] = sanitized;
+        } else {
+          records.push(sanitized);
+        }
+        recordMap.set(key, sanitized);
+      };
+
+      const clearFailure = (albumId, stage) => {
+        failures = failures.filter(
+          (item) =>
+            !(
+              String(item.albumId) === String(albumId) &&
+              cleanText(item.stage) === cleanText(stage)
+            )
+        );
+      };
+
+      const addFailure = (album, stage, error) => {
+        clearFailure(album.id, stage);
+        failures.push({
+          albumId: String(album.id),
+          albumName: album.title,
+          stage,
+          reason: error && error.message ? error.message : String(error || "未知错误"),
+        });
+      };
+
+      const buildProgressPayload = () => {
+        const completedPeriodKeys = [];
+        for (const album of allAlbums) {
+          for (const period of EXPORT_PERIODS) {
+            if (periodIsComplete(String(album.id), period.outputName)) {
+              completedPeriodKeys.push(recordKey(album.id, period.outputName));
+            }
+          }
+        }
+
+        return {
+          version: VERSION,
+          mode: "api-turbo",
+          signature,
+          records,
+          retentionRecords,
+          retentionCompletedAlbumIds: Array.from(retentionCompletedAlbumIds),
+          completedAlbumIds: allAlbums
+            .filter((album) => isAlbumComplete(album.id))
+            .map((album) => String(album.id)),
+          completedPeriodKeys,
+          failures,
+          updatedAt: new Date().toISOString(),
+        };
+      };
+
+      // v3.1.0：断点不再每个 API 小步骤都写整份 JSON。
+      // 状态先留在内存，每 1.2 秒或每完成 5 张专辑批量写一次；最终导出前强制落盘。
+      let progressDirty = false;
+      let checkpointTimer = null;
+      let checkpointChain = Promise.resolve();
+      let albumsSinceCheckpoint = 0;
+
+      const flushProgress = async (force = false) => {
+        if (!progressDirty && !force) return checkpointChain;
+        progressDirty = false;
+        albumsSinceCheckpoint = 0;
+        if (checkpointTimer) {
+          clearTimeout(checkpointTimer);
+          checkpointTimer = null;
+        }
+        const payload = buildProgressPayload();
+        checkpointChain = checkpointChain
+          .catch(() => {})
+          .then(() => saveAllExportProgress(payload));
+        await checkpointChain;
+        if (progressDirty && !checkpointTimer) {
+          checkpointTimer = setTimeout(() => {
+            checkpointTimer = null;
+            flushProgress(false).catch((error) =>
+              console.warn("[xm-export] 批量断点保存失败", error)
+            );
+          }, CHECKPOINT_INTERVAL_MS);
+        }
+        return checkpointChain;
+      };
+
+      const markProgressDirty = (albumFinished = false) => {
+        progressDirty = true;
+        if (albumFinished) albumsSinceCheckpoint += 1;
+
+        if (albumsSinceCheckpoint >= CHECKPOINT_ALBUM_BATCH) {
+          if (checkpointTimer) {
+            clearTimeout(checkpointTimer);
+            checkpointTimer = null;
+          }
+          Promise.resolve().then(() =>
+            flushProgress(false).catch((error) =>
+              console.warn("[xm-export] 批量断点保存失败", error)
+            )
+          );
+          return;
+        }
+
+        if (!checkpointTimer) {
+          checkpointTimer = setTimeout(() => {
+            checkpointTimer = null;
+            flushProgress(false).catch((error) =>
+              console.warn("[xm-export] 批量断点保存失败", error)
+            );
+          }, CHECKPOINT_INTERVAL_MS);
+        }
+      };
+
+      forcePersistProgress = async () => {
+        progressDirty = true;
+        await flushProgress(true);
+        // 如果保存过程中又有 worker 更新，继续补一次，直到完全干净。
+        while (progressDirty) await flushProgress(true);
+      };
+
+      await forcePersistProgress();
+
+      if (records.length || retentionRecords.length) {
+        setStatus(
+          `已恢复断点：核心 ${records.length} 行，留存 ${retentionRecords.length} 行；将以 ${concurrencyProfile.album} 路·${concurrencyProfile.label}档并发只补抓缺失部分…`
+        );
+      }
+
+      const pendingAlbums = allAlbums
+        .map((album, albumIndex) => ({ album, albumIndex }))
+        .filter(({ album }) => !isAlbumComplete(String(album.id)));
+
+      // 平台的数据截止日通常全账号统一。先只预取 1 次 KPI 确定截止日，
+      // 后续专辑即可让 KPI / 7天流量 / 30天流量 / 留存同时起跑。
+      // 若某张专辑返回的 KPI 截止日不同，会自动用该专辑真实截止日重抓流量。
+      let sharedDataEndDate = null;
+      const prefetchedKpiBundles = new Map();
+      const preflightTarget = pendingAlbums.find(({ album }) => {
+        const albumId = String(album.id);
+        const missingCorePeriods = EXPORT_PERIODS.some(
+          (period) => !coreIsComplete(getRecord(albumId, period.outputName))
+        );
+        const missingTraffic =
+          !trafficIsComplete(getRecord(albumId, "近7天")) ||
+          !trafficIsComplete(getRecord(albumId, "近30天"));
+        return missingCorePeriods || missingTraffic;
+      });
+
+      if (preflightTarget) {
+        try {
+          setStatus(`正在预取数据截止日：${preflightTarget.album.title}…`);
+          const bundle = await fetchKpiTotalBundle(preflightTarget.album);
+          prefetchedKpiBundles.set(String(preflightTarget.album.id), bundle);
+          sharedDataEndDate = bundle.endDate;
+        } catch (error) {
+          console.warn("[xm-export] 截止日预取失败，将自动降级为逐专辑确认", error);
+        }
+      }
+
+      let finishedJobs = 0;
+      let activeJobs = 0;
+
+      const renderTurboStatus = (message = "") => {
+        const done = completedAlbumCount();
+        setStatus(
+          `并发 ${concurrencyProfile.album} 路·${concurrencyProfile.label}｜HTTP ${activeHttpRequests}/${concurrencyProfile.http}｜` +
+            `完整 ${done}/${allAlbums.length}｜任务 ${finishedJobs}/${pendingAlbums.length}` +
+            (message ? `｜${message}` : "")
+        );
+      };
+
+      const fetchTrafficPair = async (
+        album,
+        endDate,
+        missing7dTraffic,
+        missing30dTraffic
+      ) => {
+        const jobs = [];
+        if (missing7dTraffic) {
+          jobs.push(
+            fetchConversionTraffic(album, 7, endDate)
+              .then((traffic) => ({ period: "近7天", traffic }))
+              .catch((error) => ({ period: "近7天", error }))
+          );
+        }
+        if (missing30dTraffic) {
+          jobs.push(
+            fetchConversionTraffic(album, 30, endDate)
+              .then((traffic) => ({ period: "近30天", traffic }))
+              .catch((error) => ({ period: "近30天", error }))
+          );
+        }
+        return Promise.all(jobs);
+      };
+
+      const applyTrafficResults = (album, albumId, kpiBundle, results) => {
+        for (const result of Array.isArray(results) ? results : []) {
+          const stage = `${result.period}流量转化API`;
+          if (result.error) {
+            console.warn(`[xm-export] ${stage}失败`, {
+              album,
+              error: result.error,
+            });
+            addFailure(album, stage, result.error);
+            continue;
+          }
+
+          const existing = getRecord(albumId, result.period);
+          upsertRecord({
+            albumId,
+            albumName: album.title,
+            period: result.period,
+            core:
+              existing && existing.core
+                ? existing.core
+                : kpiBundle && kpiBundle.cores
+                  ? kpiBundle.cores[result.period]
+                  : {},
+            traffic: result.traffic,
+          });
+          clearFailure(albumId, stage);
+        }
+      };
+
+      const processAlbum = async ({ album, albumIndex }) => {
+        const albumId = String(album.id);
+        const prefix = `[${albumIndex + 1}/${allAlbums.length}] ${album.title}`;
+        activeJobs += 1;
+        renderTurboStatus(`${prefix} 开始`);
+
+        try {
+          await waitForOnline(prefix);
+
+          const missingCorePeriods = EXPORT_PERIODS.filter((period) => {
+            const record = getRecord(albumId, period.outputName);
+            return !coreIsComplete(record);
+          });
+          const missing7dTraffic = !trafficIsComplete(getRecord(albumId, "近7天"));
+          const missing30dTraffic = !trafficIsComplete(getRecord(albumId, "近30天"));
+          const needKpi =
+            missingCorePeriods.length > 0 || missing7dTraffic || missing30dTraffic;
+          const needRetention = !isRetentionComplete(albumId);
+
+          const cachedBundle = prefetchedKpiBundles.get(albumId) || null;
+          const kpiPromise = needKpi
+            ? cachedBundle
+              ? Promise.resolve({ bundle: cachedBundle, error: null })
+              : fetchKpiTotalBundle(album)
+                  .then((bundle) => ({ bundle, error: null }))
+                  .catch((error) => ({ bundle: null, error }))
+            : Promise.resolve({ bundle: null, error: null });
+
+          // 有共享截止日时，流量不再等待本专辑 KPI，直接和 KPI 同时发送。
+          const earlyTrafficPromise =
+            sharedDataEndDate && (missing7dTraffic || missing30dTraffic)
+              ? fetchTrafficPair(
+                  album,
+                  sharedDataEndDate,
+                  missing7dTraffic,
+                  missing30dTraffic
+                )
+              : Promise.resolve(null);
+
+          const retentionPromise = needRetention
+            ? fetchAllRetentionRows(albumId)
+                .then((rawRows) => ({ rawRows, error: null }))
+                .catch((error) => ({ rawRows: null, error }))
+            : Promise.resolve({ rawRows: null, error: null });
+
+          // 三大分支同步推进：KPI、提前流量、留存。
+          const [{ bundle: kpiBundle, error: kpiError }, earlyTraffic, retentionResult] =
+            await Promise.all([kpiPromise, earlyTrafficPromise, retentionPromise]);
+
+          if (needKpi) {
+            if (kpiError || !kpiBundle) {
+              const error = kpiError || new Error("核心数据API未返回有效结果");
+              console.warn("[xm-export] 核心数据API失败", { album, error });
+              addFailure(album, "核心数据API", error);
+            } else {
+              for (const period of EXPORT_PERIODS) {
+                const existing = getRecord(albumId, period.outputName);
+                const core = kpiBundle.cores[period.outputName];
+                if (!core) continue;
+                upsertRecord({
+                  albumId,
+                  albumName: album.title,
+                  period: period.outputName,
+                  core,
+                  traffic:
+                    existing && existing.traffic
+                      ? existing.traffic
+                      : { ...EMPTY_TRAFFIC },
+                });
+              }
+              clearFailure(albumId, "核心数据API");
+
+              const actualEndDate = kpiBundle.endDate;
+              const sharedYmd = sharedDataEndDate
+                ? formatLocalYmd(sharedDataEndDate)
+                : "";
+              const actualYmd = actualEndDate ? formatLocalYmd(actualEndDate) : "";
+
+              let trafficResults = earlyTraffic;
+
+              // 无共享截止日：此处才补发流量；有共享截止日但该专辑日期不同：重抓一次纠偏。
+              if (
+                (missing7dTraffic || missing30dTraffic) &&
+                (!trafficResults || (sharedYmd && actualYmd && sharedYmd !== actualYmd))
+              ) {
+                trafficResults = await fetchTrafficPair(
+                  album,
+                  actualEndDate,
+                  missing7dTraffic,
+                  missing30dTraffic
+                );
+              }
+
+              if (trafficResults) {
+                applyTrafficResults(
+                  album,
+                  albumId,
+                  kpiBundle,
+                  trafficResults
+                );
+              }
+            }
+          }
+
+          if (needRetention) {
+            if (retentionResult.error) {
+              console.warn("[xm-export] 留存API失败", {
+                album,
+                error: retentionResult.error,
+              });
+              addFailure(album, "留存分析", retentionResult.error);
+            } else {
+              const normalizedRows = (retentionResult.rawRows || [])
+                .map((item) => retentionApiItemToRecord(album, item))
+                .filter(Boolean);
+
+              retentionRecords = retentionRecords.filter(
+                (item) => String(item.albumId) !== albumId
+              );
+              retentionRecords.push(...normalizedRows);
+              retentionCompletedAlbumIds.add(albumId);
+              clearFailure(albumId, "留存分析");
+            }
+          }
+
+          markProgressDirty(false);
+
+          if (isAlbumComplete(albumId)) {
+            failures = failures.filter((item) => String(item.albumId) !== albumId);
+          }
+          markProgressDirty(true);
+        } finally {
+          activeJobs = Math.max(0, activeJobs - 1);
+          finishedJobs += 1;
+          renderTurboStatus(`${prefix} 完成`);
+        }
+      };
+
+      await mapWithConcurrency(
+        pendingAlbums,
+        concurrencyProfile.album,
+        processAlbum
+      );
+
+      await forcePersistProgress();
+      downloadAllAlbumsXlsx(records, failures, "", retentionRecords);
+      const done = completedAlbumCount();
+      await forcePersistProgress();
+
+      if (!failures.length && done === allAlbums.length) {
+        setStatus(
+          `✅ 极速并发导出完成：${done}/${allAlbums.length} 个专辑；核心 ${records.length} 行，留存 ${retentionRecords.length} 行。使用 ${concurrencyProfile.album} 路·${concurrencyProfile.label}档（HTTP ${concurrencyProfile.http}），核心/留存并行、7/30天流量并行。`
+        );
+      } else {
+        setStatus(
+          `⚠️ 极速并发导出完成：完整专辑 ${done}/${allAlbums.length}，核心 ${records.length} 行，留存 ${retentionRecords.length} 行，失败 ${failures.length} 项。再次点击只补抓缺失项。`,
+          true
+        );
+      }
+    } catch (error) {
+      console.error("[xm-export] 极速并发接口导出失败", error);
+      try {
+        await forcePersistProgress();
+      } catch (persistError) {
+        console.warn("[xm-export] 异常前强制断点保存失败", persistError);
+      }
+      try {
+        const progress = activeProgressSnapshot || (await loadAllExportProgress());
+        if (progress && Array.isArray(progress.records) && progress.records.length) {
+          downloadAllAlbumsXlsx(
+            progress.records,
+            Array.isArray(progress.failures) ? progress.failures : [],
+            "全部专辑数据_API极速并发版_异常中断自动备份.xlsx",
+            Array.isArray(progress.retentionRecords)
+              ? progress.retentionRecords
+              : []
+          );
+          setStatus(
+            `任务异常：${error.message}。已自动保存并导出中断前备份；再次点击可从断点继续。`,
+            true
+          );
+        } else {
+          setStatus(`极速并发接口导出失败：${error.message}`, true);
+        }
+      } catch (backupError) {
+        setStatus(
+          `极速并发接口导出失败：${error.message}；自动备份也失败：${backupError.message}`,
+          true
+        );
+      }
+    } finally {
+      exportingAll = false;
+      [allButton, retentionButton, reloadButton, albumSelect, concurrencySelect].forEach((item) => {
+        if (item) item.disabled = false;
+      });
+      allButton.textContent = "极速导出全部专辑（API并发）";
+      renderConcurrencyChoice(false);
+    }
+  };
+
+  // ==================================================
+  // 按钮与菜单
+  // ==================================================
+
+  const getChosenAlbum = () => {
+    const manual = cleanText(albumInput.value);
+
+    if (manual) {
+      return {
+        id: manual,
+        title: "",
+      };
+    }
+
+    const option = albumSelect.options[albumSelect.selectedIndex];
+
+    return {
+      id: albumSelect.value,
+      title: option ? cleanText(option.textContent) : "",
+    };
+  };
+
+  allButton.addEventListener("click", runAllAlbumsExport);
+  progressButton.addEventListener("click", exportSavedProgressNow);
+  exportYesterdayButton.addEventListener("click", () =>
+    exportSavedPeriodNow("昨日")
+  );
+  exportWeekButton.addEventListener("click", () =>
+    exportSavedPeriodNow("近7天")
+  );
+  exportMonthButton.addEventListener("click", () =>
+    exportSavedPeriodNow("近30天")
+  );
+  exportYearButton.addEventListener("click", () =>
+    exportSavedPeriodNow("近1年")
+  );
+  exportTotalButton.addEventListener("click", () =>
+    exportSavedPeriodNow("累计")
+  );
+
+  importButton.addEventListener("click", () => importFileInput.click());
+  importFileInput.addEventListener("change", async () => {
+    const file = importFileInput.files && importFileInput.files[0];
+    if (!file) return;
+    importButton.disabled = true;
+    try {
+      setStatus(`正在导入阶段备份：${file.name}…`);
+      await importProgressWorkbook(file);
+    } catch (error) {
+      console.error("[xm-export] 导入阶段备份失败", error);
+      setStatus(`导入阶段备份失败：${error.message}`, true);
+    } finally {
+      importButton.disabled = false;
+      importFileInput.value = "";
+    }
+  });
+
+  clearProgressButton.addEventListener("click", async () => {
+    const confirmed = window.confirm(
+      "确定清空全部断点吗？清空后将从第一个专辑重新抓取。建议先导出当前已保存进度。"
+    );
+    if (!confirmed) return;
+    await clearAllExportProgress();
+    setStatus("已清空断点，下次将从第一个专辑重新开始");
+  });
+
+  retentionButton.addEventListener("click", () => {
+    const chosen = getChosenAlbum();
+    runRetentionExport(chosen.id, chosen.title);
+  });
+
+  if (typeof GM_registerMenuCommand === "function") {
+    GM_registerMenuCommand("📊 极速导出全部专辑（API并发）", runAllAlbumsExport);
+
+    GM_registerMenuCommand("💾 导出当前已保存进度", exportSavedProgressNow);
+
+    GM_registerMenuCommand("📅 单独导出昨日数据", () =>
+      exportSavedPeriodNow("昨日")
+    );
+
+    GM_registerMenuCommand("📅 单独导出近7天数据", () =>
+      exportSavedPeriodNow("近7天")
+    );
+
+    GM_registerMenuCommand("📅 单独导出近30天数据", () =>
+      exportSavedPeriodNow("近30天")
+    );
+
+    GM_registerMenuCommand("📅 单独导出近1年数据", () =>
+      exportSavedPeriodNow("近1年")
+    );
+
+    GM_registerMenuCommand("📅 单独导出累计数据", () =>
+      exportSavedPeriodNow("累计")
+    );
+
+    GM_registerMenuCommand("🧹 清空全部断点", async () => {
+      await clearAllExportProgress();
+      setStatus("已清空断点，下次将从第一个专辑重新开始");
+    });
+
+    GM_registerMenuCommand("📋 导出当前专辑留存", () => {
+      const chosen = getChosenAlbum();
+      runRetentionExport(chosen.id, chosen.title);
+    });
+
+    GM_registerMenuCommand("🔄 重新加载专辑列表", refreshAlbumList);
+  }
+
+  document.addEventListener("keydown", (event) => {
+    if (
+      event.altKey &&
+      event.shiftKey &&
+      String(event.key).toLowerCase() === "e"
+    ) {
+      event.preventDefault();
+      runAllAlbumsExport();
+    }
+  });
+
+  console.log(`[xm-export] v${VERSION} loaded on`, location.href);
+  refreshAlbumList();
+  loadAllExportProgress().then((progress) => {
+    if (progress && Array.isArray(progress.records) && progress.records.length) {
+      setStatus(`检测到已保存断点：${progress.records.length} 个周期。点击“极速导出全部专辑（API并发）”将自动续传。`);
+    }
+  }).catch(() => {});
+})();

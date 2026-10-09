@@ -1,0 +1,986 @@
+// ==UserScript==
+// @name         微信听书批量改名助手
+// @namespace    openai-wehear-batch-renamer
+// @version      1.0.0
+// @description  在微信听书创作平台按“搜索专辑 -> 进入专辑 -> 重新编辑 -> 修改专辑名称 -> 提交审核”的流程批量改名。
+// @match        *://at.qq.com/*
+// @match        *://*.qq.com/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const APP_ID = 'wxhear-batch-renamer';
+  const PANEL_ID = APP_ID + '-panel';
+  const STORE_KEY = APP_ID + '-state-v1';
+  const INPUT_KEY = APP_ID + '-input-v1';
+  const TICK_MS = 900;
+  const SEARCH_WAIT_MS = 900;
+  const SEARCH_TIMEOUT_MS = 9000;
+  const PAGE_TIMEOUT_MS = 15000;
+  const SUBMIT_TIMEOUT_MS = 20000;
+
+  // 避免脚本在其它 qq.com 页面误运行。
+  function looksLikeWeHearPage() {
+    if (location.hostname === 'at.qq.com') return true;
+    const text = ((document.title || '') + ' ' + (document.body?.innerText || '').slice(0, 2500));
+    return /微信听书|创作平台|创建专辑|搜索我的专辑|返回专辑列表/.test(text);
+  }
+
+  if (!looksLikeWeHearPage()) return;
+
+  const defaultState = () => ({
+    active: false,
+    paused: false,
+    index: 0,
+    phase: 'idle',
+    phaseAt: Date.now(),
+    listUrl: '',
+    jobs: [],
+    logs: [],
+    lastError: '',
+    startedAt: 0
+  });
+
+  let state = loadState();
+  let busy = false;
+
+  function loadState() {
+    try {
+      const raw = localStorage.getItem(STORE_KEY);
+      if (!raw) return defaultState();
+      const parsed = JSON.parse(raw);
+      return Object.assign(defaultState(), parsed);
+    } catch (e) {
+      return defaultState();
+    }
+  }
+
+  function saveState() {
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify(state));
+    } catch (e) {}
+    updatePanel();
+  }
+
+  function norm(s) {
+    return String(s ?? '')
+      .replace(/\u00a0/g, ' ')
+      .replace(/[ \t\r\n]+/g, ' ')
+      .trim();
+  }
+
+  function isVisible(el) {
+    if (!el || !el.isConnected) return false;
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 1 && r.height > 1;
+  }
+
+  function inOurPanel(el) {
+    const panel = document.getElementById(PANEL_ID);
+    return !!(panel && el && panel.contains(el));
+  }
+
+  function phaseAge() {
+    return Date.now() - (state.phaseAt || 0);
+  }
+
+  function setPhase(phase, message) {
+    state.phase = phase;
+    state.phaseAt = Date.now();
+    if (message) addLog(message);
+    saveState();
+  }
+
+  function addLog(message) {
+    const t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    state.logs = state.logs || [];
+    state.logs.push(`[${t}] ${message}`);
+    if (state.logs.length > 120) state.logs = state.logs.slice(-120);
+  }
+
+  function currentJob() {
+    return state.jobs?.[state.index] || null;
+  }
+
+  function setNativeValue(el, value) {
+    if (!el) return;
+    const oldValue = el.value;
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (descriptor?.set) descriptor.set.call(el, value);
+    else el.value = value;
+
+    // 兼容部分 React 受控输入框。
+    if (el._valueTracker) {
+      try { el._valueTracker.setValue(oldValue); } catch (e) {}
+    }
+
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function pressEnter(el) {
+    if (!el) return;
+    for (const type of ['keydown', 'keypress', 'keyup']) {
+      el.dispatchEvent(new KeyboardEvent(type, {
+        key: 'Enter',
+        code: 'Enter',
+        keyCode: 13,
+        which: 13,
+        bubbles: true,
+        cancelable: true
+      }));
+    }
+  }
+
+  function clickElement(el) {
+    if (!el) return false;
+    try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+    try {
+      el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+      el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      return true;
+    } catch (e) {
+      try { el.click(); return true; } catch (e2) { return false; }
+    }
+  }
+
+  function queryVisible(selector, root = document) {
+    return [...root.querySelectorAll(selector)].filter(el => isVisible(el) && !inOurPanel(el));
+  }
+
+  function findSearchInput() {
+    const selectors = [
+      'input[placeholder*="搜索我的专辑"]',
+      'input[placeholder*="搜索"][placeholder*="专辑"]'
+    ];
+    for (const sel of selectors) {
+      const found = queryVisible(sel);
+      if (found.length) return found[0];
+    }
+    return null;
+  }
+
+  function exactTextElements(text, root = document) {
+    const target = norm(text);
+    if (!target) return [];
+
+    const all = [...root.querySelectorAll('a,button,[role="button"],h1,h2,h3,h4,h5,div,span,p')].filter(el => {
+      if (!isVisible(el) || inOurPanel(el)) return false;
+      return norm(el.textContent) === target;
+    });
+
+    // 去掉“父元素和子元素文字相同”造成的重复，只保留更靠里的元素。
+    const leaves = all.filter(el => {
+      return ![...el.children].some(ch => norm(ch.textContent) === target && isVisible(ch));
+    });
+
+    return leaves.length ? leaves : all;
+  }
+
+  function containsTextElements(text, root = document) {
+    const target = norm(text);
+    if (!target) return [];
+    return [...root.querySelectorAll('a,button,[role="button"],h1,h2,h3,h4,h5,div,span,p')].filter(el => {
+      if (!isVisible(el) || inOurPanel(el)) return false;
+      const s = norm(el.textContent);
+      return s && s.includes(target);
+    });
+  }
+
+  function findClickable(el) {
+    if (!el) return null;
+    let cur = el;
+    for (let i = 0; i < 7 && cur && cur !== document.body; i++, cur = cur.parentElement) {
+      if (inOurPanel(cur)) return null;
+      const tag = cur.tagName?.toLowerCase();
+      const role = cur.getAttribute?.('role');
+      const style = getComputedStyle(cur);
+      if (
+        tag === 'a' ||
+        tag === 'button' ||
+        role === 'button' ||
+        cur.hasAttribute?.('onclick') ||
+        cur.hasAttribute?.('tabindex') ||
+        style.cursor === 'pointer'
+      ) {
+        return cur;
+      }
+    }
+    return el;
+  }
+
+  function findButtonByText(text, root = document) {
+    const target = norm(text);
+    const candidates = [...root.querySelectorAll('button,a,[role="button"],div,span')].filter(el => {
+      if (!isVisible(el) || inOurPanel(el)) return false;
+      return norm(el.textContent) === target;
+    });
+    if (!candidates.length) return null;
+
+    candidates.sort((a, b) => {
+      const aTag = /^(BUTTON|A)$/.test(a.tagName) || a.getAttribute('role') === 'button' ? 0 : 1;
+      const bTag = /^(BUTTON|A)$/.test(b.tagName) || b.getAttribute('role') === 'button' ? 0 : 1;
+      return aTag - bTag;
+    });
+
+    return findClickable(candidates[0]);
+  }
+
+  function findReturnListControl() {
+    return findButtonByText('返回专辑列表') || findButtonByText('返回专辑') || null;
+  }
+
+  function getListUrlFromPage() {
+    const ret = findReturnListControl();
+    if (ret?.href) return ret.href;
+    const search = findSearchInput();
+    return search ? location.href : '';
+  }
+
+  function findDialog() {
+    const titleMatches = exactTextElements('修改专辑信息');
+    const title = titleMatches[0];
+    if (!title) return null;
+
+    let cur = title;
+    for (let i = 0; i < 10 && cur; i++, cur = cur.parentElement) {
+      if (!cur || cur === document.body) break;
+      const txt = norm(cur.textContent);
+      if (
+        txt.includes('修改专辑信息') &&
+        txt.includes('专辑名称') &&
+        txt.includes('提交审核') &&
+        isVisible(cur)
+      ) {
+        const role = cur.getAttribute?.('role');
+        const cls = String(cur.className || '');
+        if (
+          role === 'dialog' ||
+          /dialog|modal|popup|layer|mask/i.test(cls) ||
+          i >= 3
+        ) {
+          return cur;
+        }
+      }
+    }
+
+    return title.parentElement?.parentElement?.parentElement || null;
+  }
+
+  function findAlbumNameInput(dialog, oldName) {
+    if (!dialog) return null;
+    const inputs = [...dialog.querySelectorAll('input:not([type="hidden"])')].filter(isVisible);
+    if (!inputs.length) return null;
+
+    const oldNorm = norm(oldName);
+    return (
+      inputs.find(i => norm(i.value) === oldNorm) ||
+      inputs.find(i => (i.getAttribute('placeholder') || '').includes('专辑')) ||
+      inputs[0]
+    );
+  }
+
+  function findSubmitButton(dialog) {
+    if (!dialog) return null;
+    const btn = findButtonByText('提交审核', dialog);
+    if (!btn) return null;
+    const disabled =
+      btn.disabled ||
+      btn.getAttribute?.('aria-disabled') === 'true' ||
+      String(btn.className || '').toLowerCase().includes('disabled');
+    return disabled ? null : btn;
+  }
+
+  function findAlbumTitleMatches(title) {
+    const matches = exactTextElements(title);
+
+    // 只保留位于首页内容区附近的标题，排除顶部/侧栏里可能出现的同名文本。
+    const filtered = matches.filter(el => {
+      const r = el.getBoundingClientRect();
+      return r.width > 5 && r.height > 5;
+    });
+
+    // 同一张卡片的多层元素可能被重复识别，按“可点击祖先”去重。
+    const unique = [];
+    const seen = new Set();
+    for (const el of filtered) {
+      const click = findClickable(el) || el;
+      let keyEl = click;
+      // 如果可点击祖先过小，则再向上一层尝试归并。
+      if (keyEl.parentElement && keyEl.getBoundingClientRect().width < 80) keyEl = keyEl.parentElement;
+      const key = keyEl;
+      if (!seen.has(key)) {
+        seen.add(key);
+        unique.push({ textEl: el, clickEl: click });
+      }
+    }
+    return unique;
+  }
+
+  function parseJobs(text) {
+    const lines = String(text || '').split(/\r?\n/);
+    const jobs = [];
+    const errors = [];
+
+    lines.forEach((raw, idx) => {
+      const line = raw.trim();
+      if (!line) return;
+
+      let oldName = '';
+      let newName = '';
+
+      if (line.includes('\t')) {
+        const parts = line.split(/\t+/);
+        oldName = (parts.shift() || '').trim();
+        newName = parts.join('\t').trim();
+      } else if (line.includes('=>')) {
+        const at = line.indexOf('=>');
+        oldName = line.slice(0, at).trim();
+        newName = line.slice(at + 2).trim();
+      } else if (line.includes('→')) {
+        const at = line.indexOf('→');
+        oldName = line.slice(0, at).trim();
+        newName = line.slice(at + 1).trim();
+      } else {
+        errors.push(`第 ${idx + 1} 行缺少分隔符（请用 Tab、=> 或 →）`);
+        return;
+      }
+
+      if (!oldName || !newName) {
+        errors.push(`第 ${idx + 1} 行原标题或新标题为空`);
+        return;
+      }
+
+      jobs.push({
+        oldName,
+        newName,
+        status: 'pending',
+        message: ''
+      });
+    });
+
+    return { jobs, errors };
+  }
+
+  function finishJob(status, message, needReturnToList) {
+    const job = currentJob();
+    if (!job) return;
+
+    job.status = status;
+    job.message = message || '';
+    addLog(`${statusLabel(status)}：${job.oldName} -> ${job.newName}${message ? `（${message}）` : ''}`);
+
+    state.index += 1;
+    const allDone = state.index >= state.jobs.length;
+
+    if (allDone) {
+      state.active = false;
+      state.paused = false;
+      state.phase = 'done';
+      state.phaseAt = Date.now();
+      addLog(`全部处理结束：共 ${state.jobs.length} 条。`);
+      saveState();
+      return;
+    }
+
+    if (needReturnToList) {
+      state.phase = 'return_list';
+      state.phaseAt = Date.now();
+    } else {
+      state.phase = 'search';
+      state.phaseAt = Date.now();
+    }
+    saveState();
+  }
+
+  function statusLabel(status) {
+    return ({
+      pending: '待处理',
+      success: '已提交',
+      notfound: '未找到',
+      duplicate: '重复',
+      failed: '失败'
+    })[status] || status;
+  }
+
+  function goBackToList() {
+    const search = findSearchInput();
+    if (search) {
+      setPhase('search');
+      return true;
+    }
+
+    const ret = findReturnListControl();
+    if (ret) {
+      addLog('返回专辑列表。');
+      saveState();
+      clickElement(ret);
+      return true;
+    }
+
+    if (state.listUrl && location.href !== state.listUrl) {
+      addLog('未找到“返回专辑列表”，使用已记录的首页地址返回。');
+      saveState();
+      location.href = state.listUrl;
+      return true;
+    }
+
+    return false;
+  }
+
+  async function workflowTick() {
+    if (busy) return;
+    busy = true;
+    try {
+      ensurePanel();
+      updatePanel();
+
+      if (!state.active || state.paused) return;
+
+      const job = currentJob();
+      if (!job) {
+        state.active = false;
+        state.phase = 'done';
+        saveState();
+        return;
+      }
+
+      // 用户在处理过程中手动回到了列表页时，优先允许状态机恢复。
+      const searchInput = findSearchInput();
+      const dialog = findDialog();
+      const reeditBtn = findButtonByText('重新编辑');
+
+      switch (state.phase) {
+        case 'idle':
+        case 'need_list': {
+          if (searchInput) {
+            if (!state.listUrl) state.listUrl = location.href;
+            setPhase('search', `开始处理第 ${state.index + 1}/${state.jobs.length} 条。`);
+          } else {
+            const ret = findReturnListControl();
+            if (ret) {
+              addLog('正在返回专辑列表。');
+              saveState();
+              clickElement(ret);
+              setPhase('wait_list');
+            } else if (state.listUrl && location.href !== state.listUrl) {
+              location.href = state.listUrl;
+            } else {
+              if (phaseAge() > PAGE_TIMEOUT_MS) {
+                state.paused = true;
+                state.lastError = '没有找到专辑首页的搜索框，请手动回到“我的专辑”首页后点继续。';
+                addLog(state.lastError);
+                saveState();
+              }
+            }
+          }
+          break;
+        }
+
+        case 'wait_list': {
+          if (searchInput) {
+            setPhase('search');
+          } else if (phaseAge() > PAGE_TIMEOUT_MS) {
+            state.paused = true;
+            state.lastError = '返回专辑列表超时，请手动回到首页后点继续。';
+            addLog(state.lastError);
+            saveState();
+          }
+          break;
+        }
+
+        case 'search': {
+          if (!searchInput) {
+            setPhase('need_list');
+            break;
+          }
+
+          if (!state.listUrl) state.listUrl = location.href;
+
+          setNativeValue(searchInput, '');
+          searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+          await new Promise(r => setTimeout(r, 120));
+
+          setNativeValue(searchInput, job.oldName);
+          searchInput.focus();
+          pressEnter(searchInput);
+
+          setPhase('wait_search', `搜索原标题：${job.oldName}`);
+          break;
+        }
+
+        case 'wait_search': {
+          if (!searchInput) {
+            // 可能已经点入详情页。
+            if (reeditBtn) {
+              setPhase('open_edit');
+            }
+            break;
+          }
+
+          if (phaseAge() < SEARCH_WAIT_MS) break;
+
+          const matches = findAlbumTitleMatches(job.oldName);
+
+          if (matches.length === 1) {
+            addLog(`找到专辑：${job.oldName}，正在进入。`);
+            saveState();
+            clickElement(matches[0].clickEl);
+            setPhase('wait_detail');
+            break;
+          }
+
+          if (matches.length > 1) {
+            finishJob('duplicate', `搜索后发现 ${matches.length} 个同名结果，为避免改错已跳过`, false);
+            break;
+          }
+
+          if (phaseAge() > SEARCH_TIMEOUT_MS) {
+            finishJob('notfound', '搜索后未找到完全一致的专辑标题', false);
+          }
+          break;
+        }
+
+        case 'wait_detail': {
+          if (reeditBtn) {
+            setPhase('open_edit');
+            break;
+          }
+
+          if (searchInput && phaseAge() > 2500) {
+            // 可能第一次点击没有触发，重新找一次标题并点击。
+            const matches = findAlbumTitleMatches(job.oldName);
+            if (matches.length === 1) {
+              clickElement(matches[0].clickEl);
+            }
+          }
+
+          if (phaseAge() > PAGE_TIMEOUT_MS) {
+            finishJob('failed', '进入专辑详情页超时', false);
+          }
+          break;
+        }
+
+        case 'open_edit': {
+          if (dialog) {
+            setPhase('fill_name');
+            break;
+          }
+
+          if (!reeditBtn) {
+            if (phaseAge() > PAGE_TIMEOUT_MS) {
+              finishJob('failed', '没有找到“重新编辑”按钮', true);
+            }
+            break;
+          }
+
+          addLog('点击“重新编辑”。');
+          saveState();
+          clickElement(reeditBtn);
+          setPhase('wait_dialog');
+          break;
+        }
+
+        case 'wait_dialog': {
+          if (dialog) {
+            setPhase('fill_name');
+          } else if (phaseAge() > PAGE_TIMEOUT_MS) {
+            finishJob('failed', '“修改专辑信息”窗口打开超时', true);
+          }
+          break;
+        }
+
+        case 'fill_name': {
+          if (!dialog) {
+            if (phaseAge() > PAGE_TIMEOUT_MS) {
+              finishJob('failed', '修改窗口意外消失', true);
+            }
+            break;
+          }
+
+          const input = findAlbumNameInput(dialog, job.oldName);
+          if (!input) {
+            if (phaseAge() > PAGE_TIMEOUT_MS) {
+              finishJob('failed', '没有找到“专辑名称”输入框', true);
+            }
+            break;
+          }
+
+          setNativeValue(input, job.newName);
+          input.focus();
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+          input.blur();
+
+          addLog(`已填写新标题：${job.newName}`);
+          saveState();
+          setPhase('submit');
+          break;
+        }
+
+        case 'submit': {
+          const liveDialog = findDialog();
+          if (!liveDialog) {
+            // 某些页面填写后可能自动关闭，按失败处理更安全。
+            finishJob('failed', '提交前修改窗口已关闭，未确认是否提交', true);
+            break;
+          }
+
+          const input = findAlbumNameInput(liveDialog, job.oldName);
+          if (input && norm(input.value) !== norm(job.newName)) {
+            // 受控输入框可能被框架回写，再补一次。
+            setNativeValue(input, job.newName);
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            break;
+          }
+
+          const submit = findSubmitButton(liveDialog);
+          if (!submit) {
+            if (phaseAge() > PAGE_TIMEOUT_MS) {
+              finishJob('failed', '“提交审核”按钮不可点击或未找到', true);
+            }
+            break;
+          }
+
+          if (phaseAge() < 450) break;
+
+          addLog('点击“提交审核”。');
+          saveState();
+          clickElement(submit);
+          setPhase('wait_submit');
+          break;
+        }
+
+        case 'wait_submit': {
+          const liveDialog = findDialog();
+
+          // 提交后窗口关闭，视为提交动作成功。
+          if (!liveDialog && phaseAge() > 700) {
+            finishJob('success', '已点击提交审核，修改窗口已关闭', true);
+            break;
+          }
+
+          // 若出现二次确认弹窗，自动点击“确定”。
+          if (phaseAge() > 900) {
+            const confirm = findButtonByText('确定');
+            if (confirm) {
+              const parentText = norm(confirm.parentElement?.parentElement?.textContent || '');
+              if (/提交|审核|确认/.test(parentText)) {
+                clickElement(confirm);
+              }
+            }
+          }
+
+          if (phaseAge() > SUBMIT_TIMEOUT_MS) {
+            finishJob('failed', '提交审核后窗口长时间未关闭，请人工检查', true);
+          }
+          break;
+        }
+
+        case 'return_list': {
+          if (searchInput) {
+            setPhase('search', `继续处理第 ${state.index + 1}/${state.jobs.length} 条。`);
+            break;
+          }
+
+          if (!goBackToList() && phaseAge() > PAGE_TIMEOUT_MS) {
+            state.paused = true;
+            state.lastError = '自动返回专辑列表失败，请手动点击“返回专辑列表”，然后点继续。';
+            addLog(state.lastError);
+            saveState();
+          }
+          break;
+        }
+
+        case 'done':
+        default:
+          break;
+      }
+    } catch (err) {
+      state.lastError = String(err?.message || err || '未知错误');
+      addLog(`脚本异常：${state.lastError}`);
+      state.paused = true;
+      saveState();
+    } finally {
+      busy = false;
+    }
+  }
+
+  function startBatch() {
+    const textarea = document.getElementById(APP_ID + '-input');
+    if (!textarea) return;
+
+    const text = textarea.value;
+    localStorage.setItem(INPUT_KEY, text);
+
+    const parsed = parseJobs(text);
+    if (parsed.errors.length) {
+      alert('格式有问题：\n' + parsed.errors.slice(0, 10).join('\n'));
+      return;
+    }
+    if (!parsed.jobs.length) {
+      alert('请先粘贴“原标题 + Tab + 新标题”。');
+      return;
+    }
+
+    const search = findSearchInput();
+    if (!search) {
+      alert('请先回到微信听书“我的专辑”首页，确保能看到“搜索我的专辑”搜索框，再点击开始。');
+      return;
+    }
+
+    state = defaultState();
+    state.active = true;
+    state.paused = false;
+    state.index = 0;
+    state.phase = 'search';
+    state.phaseAt = Date.now();
+    state.listUrl = location.href;
+    state.jobs = parsed.jobs;
+    state.startedAt = Date.now();
+    addLog(`新批次共 ${state.jobs.length} 条，开始执行。`);
+    saveState();
+  }
+
+  function pauseBatch() {
+    if (!state.active) return;
+    state.paused = true;
+    addLog('已暂停。');
+    saveState();
+  }
+
+  function continueBatch() {
+    if (!state.jobs?.length || state.index >= state.jobs.length) return;
+    state.active = true;
+    state.paused = false;
+    state.lastError = '';
+
+    // 根据当前页面重建一个安全的阶段。
+    if (findDialog()) state.phase = 'fill_name';
+    else if (findButtonByText('重新编辑')) state.phase = 'open_edit';
+    else if (findSearchInput()) state.phase = 'search';
+    else state.phase = 'need_list';
+
+    state.phaseAt = Date.now();
+    addLog('继续执行。');
+    saveState();
+  }
+
+  function stopBatch() {
+    if (!state.jobs?.length) return;
+    state.active = false;
+    state.paused = false;
+    state.phase = 'idle';
+    addLog('已停止。已完成的结果会保留。');
+    saveState();
+  }
+
+  function clearBatch() {
+    if (!confirm('确定清空当前批次、日志和结果吗？')) return;
+    const oldInput = localStorage.getItem(INPUT_KEY) || '';
+    state = defaultState();
+    localStorage.setItem(STORE_KEY, JSON.stringify(state));
+    localStorage.setItem(INPUT_KEY, oldInput);
+    updatePanel();
+  }
+
+  function downloadText(filename, content) {
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function exportResults(onlyProblems) {
+    const jobs = state.jobs || [];
+    const rows = [['原标题', '新标题', '状态', '说明']];
+
+    for (const j of jobs) {
+      if (onlyProblems && !['notfound', 'duplicate', 'failed'].includes(j.status)) continue;
+      rows.push([j.oldName, j.newName, statusLabel(j.status), j.message || '']);
+    }
+
+    if (rows.length === 1) {
+      alert(onlyProblems ? '目前没有“未找到 / 重复 / 失败”的条目。' : '目前没有可导出的结果。');
+      return;
+    }
+
+    const tsv = rows
+      .map(row => row.map(v => String(v ?? '').replace(/\t/g, ' ').replace(/\r?\n/g, ' ')).join('\t'))
+      .join('\n');
+
+    const suffix = onlyProblems ? '异常' : '全部结果';
+    downloadText(`微信听书批量改名_${suffix}_${new Date().toISOString().slice(0,10)}.txt`, '\uFEFF' + tsv);
+  }
+
+  function ensurePanel() {
+    if (document.getElementById(PANEL_ID)) return;
+
+    const panel = document.createElement('div');
+    panel.id = PANEL_ID;
+    panel.innerHTML = `
+      <div class="${APP_ID}-header">
+        <div>
+          <div class="${APP_ID}-title">微信听书批量改名</div>
+          <div class="${APP_ID}-sub">搜索 → 进入 → 重新编辑 → 提交审核</div>
+        </div>
+        <button id="${APP_ID}-min" class="${APP_ID}-icon" title="收起/展开">−</button>
+      </div>
+
+      <div id="${APP_ID}-body">
+        <div class="${APP_ID}-hint">每行一条，推荐直接从 Excel 复制两列：<b>原标题[TAB]新标题</b></div>
+        <textarea id="${APP_ID}-input" placeholder="神仙小学生：哪吒悟空变形记&#9;神仙小学生：哪吒悟空校园记&#10;原标题2&#9;新标题2"></textarea>
+
+        <div class="${APP_ID}-buttons">
+          <button id="${APP_ID}-start" class="b-start">开始批量</button>
+          <button id="${APP_ID}-pause" class="b-pause">暂停</button>
+          <button id="${APP_ID}-continue" class="b-continue">继续</button>
+          <button id="${APP_ID}-stop" class="b-stop">停止</button>
+        </div>
+
+        <div class="${APP_ID}-status">
+          <div><span>进度</span><strong id="${APP_ID}-progress">0/0</strong></div>
+          <div><span>状态</span><strong id="${APP_ID}-status-text">空闲</strong></div>
+          <div><span>当前</span><strong id="${APP_ID}-current">-</strong></div>
+        </div>
+
+        <div class="${APP_ID}-buttons small">
+          <button id="${APP_ID}-export-all" class="b-export">导出全部结果</button>
+          <button id="${APP_ID}-export-bad" class="b-export-bad">导出未找到/重复/失败</button>
+          <button id="${APP_ID}-clear" class="b-clear">清空结果</button>
+        </div>
+
+        <div class="${APP_ID}-log-title">运行日志</div>
+        <div id="${APP_ID}-logs" class="${APP_ID}-logs"></div>
+      </div>
+    `;
+
+    const style = document.createElement('style');
+    style.textContent = `
+      #${PANEL_ID}{
+        position:fixed;right:18px;top:105px;width:390px;z-index:2147483647;
+        background:#fff;border:1px solid #d9d9d9;border-radius:14px;
+        box-shadow:0 12px 36px rgba(0,0,0,.18);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
+        color:#1f2329;overflow:hidden;
+      }
+      #${PANEL_ID} *{box-sizing:border-box}
+      .${APP_ID}-header{display:flex;align-items:center;justify-content:space-between;padding:13px 14px;background:linear-gradient(135deg,#ff5a48,#ff2d75);color:#fff}
+      .${APP_ID}-title{font-size:17px;font-weight:800}
+      .${APP_ID}-sub{font-size:11px;opacity:.9;margin-top:2px}
+      .${APP_ID}-icon{border:0;background:rgba(255,255,255,.2);color:#fff;width:28px;height:28px;border-radius:8px;font-size:18px;cursor:pointer}
+      #${APP_ID}-body{padding:12px}
+      .${APP_ID}-hint{font-size:12px;line-height:1.55;color:#6b7280;margin-bottom:8px}
+      #${APP_ID}-input{width:100%;height:118px;resize:vertical;border:1px solid #d6d9de;border-radius:9px;padding:9px;font-size:12px;outline:none;line-height:1.45}
+      #${APP_ID}-input:focus{border-color:#ff4d6d;box-shadow:0 0 0 2px rgba(255,77,109,.10)}
+      .${APP_ID}-buttons{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:9px}
+      .${APP_ID}-buttons.small{grid-template-columns:1fr 1.4fr .8fr}
+      .${APP_ID}-buttons button{border:0;border-radius:8px;padding:8px 6px;font-size:12px;font-weight:700;cursor:pointer}
+      .b-start{background:#16a34a;color:#fff}.b-pause{background:#f59e0b;color:#fff}.b-continue{background:#2563eb;color:#fff}.b-stop{background:#dc2626;color:#fff}
+      .b-export{background:#0f766e;color:#fff}.b-export-bad{background:#7c3aed;color:#fff}.b-clear{background:#e5e7eb;color:#374151}
+      .${APP_ID}-status{margin-top:10px;border:1px solid #eceef2;border-radius:9px;padding:7px 9px;background:#fafafa}
+      .${APP_ID}-status>div{display:grid;grid-template-columns:46px 1fr;gap:8px;align-items:start;font-size:12px;padding:3px 0}
+      .${APP_ID}-status span{color:#8a9099}. ${APP_ID}-status strong{word-break:break-all}
+      #${APP_ID}-current{font-weight:600}
+      .${APP_ID}-log-title{font-size:12px;font-weight:800;margin:10px 0 6px}
+      .${APP_ID}-logs{height:132px;overflow:auto;background:#111827;color:#d1fae5;border-radius:8px;padding:8px;font:11px/1.55 Consolas,Monaco,monospace;white-space:pre-wrap;word-break:break-all}
+      #${PANEL_ID}.minimized #${APP_ID}-body{display:none}
+    `;
+
+    document.documentElement.appendChild(style);
+    document.body.appendChild(panel);
+
+    const savedInput = localStorage.getItem(INPUT_KEY);
+    if (savedInput) document.getElementById(APP_ID + '-input').value = savedInput;
+
+    document.getElementById(APP_ID + '-input').addEventListener('input', e => {
+      localStorage.setItem(INPUT_KEY, e.target.value);
+    });
+
+    document.getElementById(APP_ID + '-start').addEventListener('click', startBatch);
+    document.getElementById(APP_ID + '-pause').addEventListener('click', pauseBatch);
+    document.getElementById(APP_ID + '-continue').addEventListener('click', continueBatch);
+    document.getElementById(APP_ID + '-stop').addEventListener('click', stopBatch);
+    document.getElementById(APP_ID + '-clear').addEventListener('click', clearBatch);
+    document.getElementById(APP_ID + '-export-all').addEventListener('click', () => exportResults(false));
+    document.getElementById(APP_ID + '-export-bad').addEventListener('click', () => exportResults(true));
+    document.getElementById(APP_ID + '-min').addEventListener('click', () => {
+      panel.classList.toggle('minimized');
+      document.getElementById(APP_ID + '-min').textContent = panel.classList.contains('minimized') ? '+' : '−';
+    });
+
+    updatePanel();
+  }
+
+  function updatePanel() {
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) return;
+
+    const total = state.jobs?.length || 0;
+    const done = state.jobs?.filter(j => j.status !== 'pending').length || 0;
+    const job = currentJob();
+
+    const progress = document.getElementById(APP_ID + '-progress');
+    const statusText = document.getElementById(APP_ID + '-status-text');
+    const current = document.getElementById(APP_ID + '-current');
+    const logs = document.getElementById(APP_ID + '-logs');
+
+    if (progress) progress.textContent = `${done}/${total}`;
+
+    let s = '空闲';
+    if (state.active && state.paused) s = '已暂停';
+    else if (state.active) s = '运行中';
+    else if (state.phase === 'done') s = '已完成';
+    else if (total) s = '已停止';
+
+    if (statusText) {
+      const extra = state.phase && state.phase !== 'idle' ? ` · ${state.phase}` : '';
+      statusText.textContent = s + extra;
+    }
+
+    if (current) {
+      current.textContent = job ? `${state.index + 1}. ${job.oldName} → ${job.newName}` : '-';
+    }
+
+    if (logs) {
+      logs.textContent = (state.logs || []).slice(-30).join('\n') || '等待开始……';
+      logs.scrollTop = logs.scrollHeight;
+    }
+  }
+
+  function boot() {
+    ensurePanel();
+    updatePanel();
+
+    // 如果上次刷新前正在执行，则自动继续。
+    if (state.active && !state.paused) {
+      addLog('页面已加载，自动恢复批量任务。');
+      saveState();
+    }
+
+    setInterval(workflowTick, TICK_MS);
+
+    // SPA 跳转时部分页面会重绘，定期确保面板存在。
+    setInterval(() => {
+      if (!document.getElementById(PANEL_ID) && looksLikeWeHearPage()) ensurePanel();
+    }, 2500);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot, { once: true });
+  } else {
+    boot();
+  }
+})();

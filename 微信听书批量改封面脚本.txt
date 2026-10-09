@@ -1,0 +1,1534 @@
+// ==UserScript==
+// @name         微信听书 - 批量修改封面并提交审核
+// @namespace    local.wechat.listen.cover.batch
+// @version      0.6.2
+// @description  微信听书批量换封面：审核中自动跳过，成功/待审核/失败三分类；自动续跑；新增控制面板最小化。
+// @author       ChatGPT
+// @match        https://*.qq.com/*
+// @match        https://*.weixin.qq.com/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_addStyle
+// @run-at       document-idle
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  /******************************************************************
+   * 0. 只需要优先看这里：页面改版后，可修改这些文字/选择器
+   ******************************************************************/
+  const CONFIG = {
+    // 封面文件名去掉扩展名后，直接作为搜索书名。
+    // 例：三体.jpg -> 搜索“三体”
+    imageExtensions: ['jpg', 'jpeg', 'png', 'webp'],
+
+    // 是否自动点击“提交审核”。用户当前需求为自动提交，因此默认 true。
+    autoSubmit: true,
+
+    timeout: 30000,
+    pollInterval: 250,
+    afterSearchMs: 800,
+    afterClickMs: 700,
+    afterUploadMs: 1200,
+    afterCoverConfirmMs: 700,
+    coverEditorTimeout: 15000,
+    afterSubmitMs: 1800,
+
+    text: {
+      edit: ['重新编辑'],
+      cover: ['封面'],
+      coverEditorTitle: ['编辑封面'],
+      coverEditorConfirm: ['确定'],
+      coverEditorCancel: ['取消'],
+      coverEditorUpload: ['上传封面'],
+      submit: ['提交审核'],
+      confirm: ['确认提交', '确定', '确认'],
+      success: ['提交成功', '已提交', '审核中'],
+      reviewStatus: ['审核中'],
+      submitFailure: ['申请失败', '提交失败', '审核失败', '请重试'],
+    },
+
+    // 候选搜索框。会按顺序尝试；找不到时再做“placeholder 含搜索”的兜底。
+    searchSelectors: [
+      'input[placeholder*="搜索书"]',
+      'input[placeholder*="搜索作品"]',
+      'input[placeholder*="搜索"]',
+      '[role="searchbox"]',
+      '.search input',
+      '.search-input input',
+    ],
+
+    // 候选封面上传 input。实际页面经常是隐藏的 input[type=file]。
+    fileSelectors: [
+      'input[type="file"][accept*="image"]',
+      'input[type="file"][accept*="jpg"]',
+      'input[type="file"][accept*="jpeg"]',
+      'input[type="file"][accept*="png"]',
+      'input[type="file"]',
+    ],
+  };
+
+  const STATE_KEY = 'WXTS_COVER_BATCH_STATE_V4';
+  const DB_NAME = 'WXTS_COVER_BATCH_FILES_V1';
+  const DB_STORE = 'covers';
+  const DEBUG_LOG_KEY = 'WXTS_COVER_BATCH_DEBUG_LOG_V1';
+  const PANEL_MINIMIZED_KEY = 'WXTS_COVER_BATCH_PANEL_MINIMIZED_V1';
+  const MAX_DEBUG_LINES = 1200;
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const now = () => new Date().toLocaleTimeString();
+  const normalizeText = (s) => String(s || '').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
+  const compactText = (s) => normalizeText(s).replace(/\s+/g, '');
+  const escapeHtml = (s) => String(s || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+
+  function isPanelMinimized() {
+    return !!GM_getValue(PANEL_MINIMIZED_KEY, false);
+  }
+
+  function setPanelMinimized(value) {
+    GM_setValue(PANEL_MINIMIZED_KEY, !!value);
+    renderPanel();
+  }
+
+  function safeDebugValue(value, depth = 0) {
+    if (depth > 3) return '[max-depth]';
+    if (value == null || typeof value === 'number' || typeof value === 'boolean' || typeof value === 'string') return value;
+    if (value instanceof Error) return { name: value.name, message: value.message, stack: value.stack };
+    if (value && value.nodeType === 1) return describeElement(value);
+    if (Array.isArray(value)) return value.slice(0, 50).map((v) => safeDebugValue(v, depth + 1));
+    if (typeof value === 'object') {
+      const out = {};
+      for (const [k, v] of Object.entries(value).slice(0, 50)) {
+        if (k === 'blob' || k === 'file' || k === 'files') continue;
+        try { out[k] = safeDebugValue(v, depth + 1); } catch (_) { out[k] = '[unserializable]'; }
+      }
+      return out;
+    }
+    return String(value);
+  }
+
+  function debugLog(message, data) {
+    let suffix = '';
+    if (data !== undefined) {
+      try { suffix = ' ' + JSON.stringify(safeDebugValue(data)); }
+      catch (_) { suffix = ' [data stringify failed]'; }
+    }
+    const line = `[${new Date().toLocaleTimeString()}] ${message}${suffix}`;
+    const lines = GM_getValue(DEBUG_LOG_KEY, []);
+    lines.push(line);
+    if (lines.length > MAX_DEBUG_LINES) lines.splice(0, lines.length - MAX_DEBUG_LINES);
+    GM_setValue(DEBUG_LOG_KEY, lines);
+    console.log('[微信听书批量封面·诊断]', message, data ?? '');
+  }
+
+  function clearDebugLog() {
+    GM_setValue(DEBUG_LOG_KEY, []);
+    debugLog('诊断日志已清空');
+  }
+
+  function getDebugLogText() {
+    const st = getState();
+    const lines = GM_getValue(DEBUG_LOG_KEY, []);
+    return [
+      '微信听书批量换封面 - 诊断日志',
+      `脚本版本: 0.6.2`,
+      `导出时间: ${new Date().toISOString()}`,
+      `页面: ${location.href}`,
+      `UA: ${navigator.userAgent}`,
+      `窗口: ${window.innerWidth}x${window.innerHeight}, DPR=${window.devicePixelRatio}`,
+      `任务状态: ${JSON.stringify(safeDebugValue(st))}`,
+      '------------------------------------------------------------',
+      ...lines,
+    ].join('\n');
+  }
+
+  function downloadDebugLog() {
+    const blob = new Blob([getDebugLogText()], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    a.href = url;
+    a.download = `微信听书封面诊断-${stamp}.txt`;
+    document.documentElement.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  }
+
+
+  function downloadTextFile(fileName, text) {
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.documentElement.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  }
+
+  function resultEntryTitle(x) {
+    return typeof x === 'string' ? x : String(x?.title || '');
+  }
+
+  function resultEntryReason(x) {
+    return typeof x === 'string' ? '' : String(x?.reason || '');
+  }
+
+  function exportWaitingList() {
+    const st = getState();
+    const rows = st.results.waiting;
+    if (!rows.length) return alert('当前没有“待审核”书籍。');
+    const stamp = new Date().toISOString().slice(0, 10);
+    const text = [
+      '微信听书批量换封面 - 待审核名单',
+      `导出时间：${new Date().toLocaleString()}`,
+      `共 ${rows.length} 本`,
+      '----------------------------------------',
+      ...rows.map((x, i) => `${i + 1}. ${resultEntryTitle(x)}	${resultEntryReason(x) || '审核中'}`),
+    ].join('\n');
+    downloadTextFile(`微信听书-待审核-${stamp}.txt`, text);
+  }
+
+  function exportAllResults() {
+    const st = getState();
+    const groups = [
+      ['成功', st.results.success],
+      ['待审核', st.results.waiting],
+      ['失败', st.results.failed],
+    ];
+    const lines = [
+      '微信听书批量换封面 - 执行结果',
+      `导出时间：${new Date().toLocaleString()}`,
+      `总数：${st.queue.length}；成功：${st.results.success.length}；待审核：${st.results.waiting.length}；失败：${st.results.failed.length}`,
+      '',
+    ];
+    for (const [name, rows] of groups) {
+      lines.push(`【${name}】${rows.length} 本`);
+      if (!rows.length) lines.push('（无）');
+      else rows.forEach((x, i) => lines.push(`${i + 1}. ${resultEntryTitle(x)}${resultEntryReason(x) ? `	${resultEntryReason(x)}` : ''}`));
+      lines.push('');
+    }
+    const stamp = new Date().toISOString().slice(0, 10);
+    downloadTextFile(`微信听书-批量换封面结果-${stamp}.txt`, lines.join('\n'));
+  }
+
+  function getOwnerWindow(el) {
+    return el?.ownerDocument?.defaultView || window;
+  }
+
+  function getComputed(el, pseudo = null) {
+    try { return getOwnerWindow(el).getComputedStyle(el, pseudo); }
+    catch (_) { return null; }
+  }
+
+  function describeElement(el) {
+    if (!el) return null;
+    const r = (() => { try { return el.getBoundingClientRect(); } catch (_) { return null; } })();
+    const style = getComputed(el);
+    const root = (() => {
+      try {
+        const x = el.getRootNode();
+        if (x && x.nodeType === 11 && x.host) return `shadow:${x.host?.tagName || '?'}#${x.host?.id || ''}.${x.host?.className || ''}`;
+        return x === el.ownerDocument ? 'document' : String(x?.nodeName || 'unknown');
+      } catch (_) { return 'unknown'; }
+    })();
+    return {
+      tag: el.tagName,
+      id: el.id || '',
+      class: typeof el.className === 'string' ? el.className.slice(0, 220) : '',
+      role: el.getAttribute?.('role') || '',
+      text: normalizeText(el.innerText || el.textContent || el.value || '').slice(0, 220),
+      aria: el.getAttribute?.('aria-label') || '',
+      title: el.getAttribute?.('title') || '',
+      disabled: !!el.disabled,
+      root,
+      rect: r ? { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) } : null,
+      style: style ? {
+        display: style.display,
+        visibility: style.visibility,
+        opacity: style.opacity,
+        pointerEvents: style.pointerEvents,
+        cursor: style.cursor,
+        zIndex: style.zIndex,
+        position: style.position,
+      } : null,
+      html: (() => { try { return el.outerHTML?.replace(/\s+/g, ' ').slice(0, 600) || ''; } catch (_) { return ''; } })(),
+    };
+  }
+
+  function deepParent(el) {
+    if (!el) return null;
+    if (el.parentElement) return el.parentElement;
+    try {
+      const root = el.getRootNode();
+      if (root && root.nodeType === 11 && root.host) return root.host || null;
+    } catch (_) {}
+    return null;
+  }
+
+  function collectDeepRoots() {
+    const roots = [];
+    const seenRoots = new Set();
+    const seenDocs = new Set();
+
+    function addRoot(root, label, depth = 0) {
+      if (!root || seenRoots.has(root) || depth > 8) return;
+      seenRoots.add(root);
+      roots.push({ root, label, win: root.ownerDocument?.defaultView || root.defaultView || window });
+
+      let all = [];
+      try { all = [...root.querySelectorAll('*')]; } catch (_) { return; }
+
+      for (const el of all) {
+        try {
+          if (el.shadowRoot) addRoot(el.shadowRoot, `${label} > shadow(${el.tagName.toLowerCase()}${el.id ? '#' + el.id : ''})`, depth + 1);
+        } catch (_) {}
+      }
+
+      for (const frame of all.filter((el) => /^(IFRAME|FRAME)$/.test(el.tagName))) {
+        try {
+          const doc = frame.contentDocument;
+          if (doc && !seenDocs.has(doc)) {
+            seenDocs.add(doc);
+            addRoot(doc, `${label} > iframe(${frame.src || 'about:blank'})`, depth + 1);
+          }
+        } catch (e) {
+          // 跨域 iframe 在普通脚本上下文中不可遍历；诊断快照会通过 roots/正文缺失表现出来。
+        }
+      }
+    }
+
+    seenDocs.add(document);
+    addRoot(document, 'top-document', 0);
+    return roots;
+  }
+
+  function elementTextVariants(el) {
+    const values = [];
+    try { values.push(el.innerText, el.textContent, el.value, el.getAttribute?.('aria-label'), el.getAttribute?.('title')); } catch (_) {}
+    try {
+      const before = getComputed(el, '::before')?.content;
+      const after = getComputed(el, '::after')?.content;
+      if (before && before !== 'none' && before !== 'normal') values.push(before.replace(/^['\"]|['\"]$/g, ''));
+      if (after && after !== 'none' && after !== 'normal') values.push(after.replace(/^['\"]|['\"]$/g, ''));
+    } catch (_) {}
+    return values.filter(Boolean).map(normalizeText);
+  }
+
+  function elementMatchesText(el, texts, exact = true) {
+    const targets = texts.map(compactText);
+    return elementTextVariants(el).some((v) => {
+      const c = compactText(v);
+      return exact ? targets.includes(c) : targets.some((t) => c.includes(t));
+    });
+  }
+
+  function cssPath(el) {
+    const parts = [];
+    let node = el;
+    for (let i = 0; node && i < 8; i += 1, node = deepParent(node)) {
+      if (!node || node.nodeType !== 1) continue;
+      let p = node.tagName.toLowerCase();
+      if (node.id) p += `#${node.id}`;
+      else if (typeof node.className === 'string' && node.className.trim()) p += '.' + node.className.trim().split(/\s+/).slice(0, 3).join('.');
+      parts.push(p);
+    }
+    return parts.reverse().join(' > ');
+  }
+
+  function scanKeywordElements(keyword) {
+    const out = [];
+    const target = compactText(keyword);
+    for (const ctx of collectDeepRoots()) {
+      let els = [];
+      try { els = [...ctx.root.querySelectorAll('*')]; } catch (_) { continue; }
+      for (const el of els) {
+        const variants = elementTextVariants(el);
+        if (!variants.some((v) => compactText(v).includes(target))) continue;
+        out.push({ context: ctx.label, path: cssPath(el), ...describeElement(el) });
+        if (out.length >= 120) return out;
+      }
+    }
+    return out;
+  }
+
+  function scanVisibleButtonLike() {
+    const out = [];
+    const selector = 'button,a,[role="button"],[onclick],input[type="button"],input[type="submit"],[class*="btn" i],[class*="button" i],div,span';
+    for (const ctx of collectDeepRoots()) {
+      let els = [];
+      try { els = [...ctx.root.querySelectorAll(selector)]; } catch (_) { continue; }
+      for (const el of els) {
+        if (!isVisible(el) || isInsideOwnPanel(el)) continue;
+        const r = el.getBoundingClientRect();
+        const style = getComputed(el);
+        const likely = el.matches('button,a,[role="button"],[onclick],input[type="button"],input[type="submit"],[class*="btn" i],[class*="button" i]') || style?.cursor === 'pointer';
+        if (!likely || r.width < 20 || r.height < 18) continue;
+        const text = elementTextVariants(el).join(' | ');
+        if (!text && r.width > 180) continue;
+        out.push({ context: ctx.label, path: cssPath(el), ...describeElement(el) });
+        if (out.length >= 180) return out;
+      }
+    }
+    return out;
+  }
+
+  function scanFrameInfo() {
+    const frames = [];
+    let list = [];
+    try { list = [...document.querySelectorAll('iframe,frame')]; } catch (_) {}
+    for (const frame of list) {
+      const item = { src: frame.src || '', ...describeElement(frame), accessible: false };
+      try {
+        const doc = frame.contentDocument;
+        item.accessible = !!doc;
+        if (doc) {
+          item.url = doc.location?.href || '';
+          item.bodyHasEditCover = compactText(doc.body?.innerText || '').includes(compactText('编辑封面'));
+          item.bodyHasConfirm = compactText(doc.body?.innerText || '').includes(compactText('确定'));
+        }
+      } catch (e) {
+        item.error = e.message || String(e);
+      }
+      frames.push(item);
+    }
+    return frames;
+  }
+
+  function scanPointStacks() {
+    const out = [];
+    const xs = [0.30, 0.50, 0.70];
+    const ys = [0.30, 0.55, 0.75];
+    for (const xf of xs) {
+      for (const yf of ys) {
+        const x = Math.round(window.innerWidth * xf);
+        const y = Math.round(window.innerHeight * yf);
+        let stack = [];
+        try { stack = (document.elementsFromPoint?.(x, y) || []).slice(0, 10); } catch (_) {}
+        out.push({ x, y, stack: stack.map((el) => ({ path: cssPath(el), ...describeElement(el) })) });
+      }
+    }
+    return out;
+  }
+
+  function dumpCoverDiagnostics(reason = 'manual') {
+    const payload = {
+      reason,
+      url: location.href,
+      readyState: document.readyState,
+      bodyHasEditCover: compactText(document.body?.innerText || '').includes(compactText('编辑封面')),
+      bodyHasConfirm: compactText(document.body?.innerText || '').includes(compactText('确定')),
+      roots: collectDeepRoots().map((x) => x.label),
+      frames: scanFrameInfo(),
+      pointStacks: scanPointStacks(),
+      editCover: scanKeywordElements('编辑封面').slice(0, 30),
+      confirm: scanKeywordElements('确定').slice(0, 50),
+      uploadCover: scanKeywordElements('上传封面').slice(0, 30),
+      buttons: scanVisibleButtonLike().filter((x) => /编辑封面|确定|上传封面|取消/.test(x.text || '')).slice(0, 80),
+    };
+    debugLog(`===== 弹窗诊断快照：${reason} =====`, payload);
+    return payload;
+  }
+
+  function emptyResults() {
+    return { success: [], waiting: [], failed: [] };
+  }
+
+  function normalizeResultList(v) {
+    return Array.isArray(v) ? v : [];
+  }
+
+  function getState() {
+    const defaults = {
+      active: false,
+      paused: false,
+      homeUrl: '',
+      queue: [],
+      index: 0,
+      step: 'SEARCH',
+      status: '尚未选择封面文件夹',
+      lastError: '',
+      results: emptyResults(),
+    };
+    const raw = GM_getValue(STATE_KEY, defaults) || defaults;
+    return {
+      ...defaults,
+      ...raw,
+      results: {
+        success: normalizeResultList(raw?.results?.success),
+        waiting: normalizeResultList(raw?.results?.waiting),
+        failed: normalizeResultList(raw?.results?.failed),
+      },
+    };
+  }
+
+  function setState(patch) {
+    const next = { ...getState(), ...patch };
+    GM_setValue(STATE_KEY, next);
+    renderPanel();
+    return next;
+  }
+
+  function isVisible(el) {
+    if (!el || !el.isConnected) return false;
+    const style = getComputed(el);
+    if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  async function waitFor(fn, description, timeout = CONFIG.timeout) {
+    const start = Date.now();
+    let lastErr;
+    while (Date.now() - start < timeout) {
+      const st = getState();
+      if (st.paused) throw new Error('任务已暂停');
+      try {
+        const v = fn();
+        if (v) return v;
+      } catch (e) {
+        lastErr = e;
+      }
+      await sleep(CONFIG.pollInterval);
+    }
+    throw new Error(`等待超时：${description}${lastErr ? `；${lastErr.message}` : ''}`);
+  }
+
+  function clickElement(el) {
+    if (!el) throw new Error('要点击的元素不存在');
+    const win = getOwnerWindow(el);
+    debugLog('准备点击元素', describeElement(el));
+    el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'auto' });
+    for (const type of ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup']) {
+      try {
+        const Ctor = type.startsWith('pointer') && win.PointerEvent ? win.PointerEvent : win.MouseEvent;
+        el.dispatchEvent(new Ctor(type, { bubbles: true, cancelable: true, view: win, button: 0, buttons: type.includes('down') ? 1 : 0 }));
+      } catch (_) {}
+    }
+    try { el.focus?.(); } catch (_) {}
+    el.click();
+    debugLog('已调用 element.click()', describeElement(el));
+  }
+
+  function findByExactText(texts, root = document, visibleOnly = true) {
+    const targets = texts.map(normalizeText);
+    const els = [...root.querySelectorAll('button,a,[role="button"],span,div,p,label')];
+    const matches = els.filter((el) => {
+      if (visibleOnly && !isVisible(el)) return false;
+      return targets.includes(normalizeText(el.innerText || el.textContent));
+    });
+    // 优先使用真正可点击的、且文字节点尽可能小的元素。
+    matches.sort((a, b) => {
+      const aClickable = a.matches('button,a,[role="button"]') ? 0 : 1;
+      const bClickable = b.matches('button,a,[role="button"]') ? 0 : 1;
+      return aClickable - bClickable || a.children.length - b.children.length;
+    });
+    return matches[0] || null;
+  }
+
+  function findClickableByExactText(texts, root = document) {
+    const raw = findByExactText(texts, root, true);
+    if (!raw) return null;
+    return raw.closest('button,a,[role="button"],[onclick],.btn,.button,.card,.item') || raw;
+  }
+
+  function findSearchInput() {
+    for (const selector of CONFIG.searchSelectors) {
+      const candidates = [...document.querySelectorAll(selector)];
+      const el = candidates.find((x) => isVisible(x) && !x.disabled && !x.readOnly);
+      if (el) return el;
+    }
+    return [...document.querySelectorAll('input')].find((el) =>
+      isVisible(el) && /搜索/.test(el.placeholder || '') && !el.disabled && !el.readOnly
+    ) || null;
+  }
+
+  function setNativeInputValue(input, value) {
+    const proto = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (desc?.set) desc.set.call(input, value);
+    else input.value = value;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function findBookResult(title) {
+    const target = normalizeText(title);
+    const all = [...document.querySelectorAll('a,button,[role="button"],div,span,p,h1,h2,h3,h4')]
+      .filter(isVisible)
+      .filter((el) => normalizeText(el.innerText || el.textContent) === target);
+    if (!all.length) return null;
+    all.sort((a, b) => a.children.length - b.children.length);
+    const raw = all[0];
+    return raw.closest('a,button,[role="button"],[onclick],.card,.item,.book,.list-item') || raw;
+  }
+
+
+  function resultShowsReviewing(resultEl) {
+    if (!resultEl) return false;
+    const box = resultEl.closest?.('a.indexAlbumInfoItem,.indexAlbumInfoItem,a,.card,.item,.book,.list-item') || resultEl;
+    const text = compactText(box.innerText || box.textContent || '');
+    return CONFIG.text.reviewStatus.some((t) => text.includes(compactText(t)));
+  }
+
+  function clickableDisabledReason(el) {
+    if (!el) return '元素不存在';
+    const style = getComputed(el);
+    if (el.disabled) return 'disabled=true';
+    if (el.getAttribute?.('disabled') !== null) return 'disabled 属性';
+    if (el.getAttribute?.('aria-disabled') === 'true') return 'aria-disabled=true';
+    if (el.classList?.contains('disabled')) return 'disabled class';
+    if (style?.pointerEvents === 'none') return 'pointer-events:none';
+    return '';
+  }
+
+  function findVisibleTextContaining(texts) {
+    const targets = texts.map(compactText).filter(Boolean);
+    const els = [...document.querySelectorAll('.el-message,.el-notification,[role="alert"],.toast,.message,div,span,p')]
+      .filter((el) => isVisible(el) && !isInsideOwnPanel(el));
+    const matches = els.filter((el) => {
+      const text = compactText(el.innerText || el.textContent || '');
+      return targets.some((t) => text.includes(t));
+    });
+    matches.sort((a, b) => (a.children.length - b.children.length) || ((a.innerText || '').length - (b.innerText || '').length));
+    return matches[0] || null;
+  }
+
+  function findImageInput() {
+    for (const selector of CONFIG.fileSelectors) {
+      const els = [...document.querySelectorAll(selector)].filter((el) => !el.disabled);
+      if (!els.length) continue;
+      // 若有多个 file input，优先 accept=image 的，再优先离“封面”文字最近的。
+      els.sort((a, b) => {
+        const ai = /image|jpg|jpeg|png|webp/i.test(a.accept || '') ? 0 : 1;
+        const bi = /image|jpg|jpeg|png|webp/i.test(b.accept || '') ? 0 : 1;
+        return ai - bi;
+      });
+      return els[0];
+    }
+    return null;
+  }
+
+  function getVisibleDialog() {
+    const dialogs = [...document.querySelectorAll('[role="dialog"],.dialog,.modal,.ant-modal,.el-dialog')].filter(isVisible);
+    return dialogs.at(-1) || null;
+  }
+
+  // 微信听书的“编辑封面”弹窗样式/类名会变化，所以这里不再依赖固定 modal 类名。
+  // 核心策略：上传后直接寻找页面上“可见、可点击、文字恰好为 确定”的按钮，
+  // 排除本脚本控制面板，并优先选择其祖先容器中同时包含“编辑封面”的按钮。
+
+  function isInsideOwnPanel(el) {
+    return !!el?.closest?.('#wxts-batch-panel');
+  }
+
+  function getClickableFromTextElement(el) {
+    if (!el) return null;
+    const clickable = el.closest(
+      'button,a,[role="button"],[onclick],input[type="button"],input[type="submit"],.btn,.button,[class*="btn"],[class*="button"]'
+    ) || el;
+    return clickable;
+  }
+
+  function isDisabledClickable(el) {
+    if (!el) return true;
+    return !!(
+      el.disabled ||
+      el.getAttribute?.('disabled') !== null ||
+      el.getAttribute?.('aria-disabled') === 'true' ||
+      el.classList?.contains('disabled')
+    );
+  }
+
+  function isTopmostAtCenter(el) {
+    if (!el || !isVisible(el)) return false;
+    const doc = el.ownerDocument || document;
+    const win = doc.defaultView || window;
+    const r = el.getBoundingClientRect();
+    const x = Math.max(0, Math.min(win.innerWidth - 1, r.left + r.width / 2));
+    const y = Math.max(0, Math.min(win.innerHeight - 1, r.top + r.height / 2));
+    const stack = doc.elementsFromPoint?.(x, y) || [];
+    return stack.some((top) => top === el || el.contains(top) || top.contains(el));
+  }
+
+  function smallestAncestorContaining(el, needles, maxLevels = 14) {
+    const targets = needles.map(normalizeText).filter(Boolean);
+    let node = el;
+    for (let i = 0; node && i < maxLevels; i += 1, node = deepParent(node)) {
+      if (node === document.body || node === document.documentElement) break;
+      if (!isVisible(node)) continue;
+      const text = normalizeText(node.innerText || node.textContent || '');
+      if (targets.some((t) => text.includes(t))) return node;
+    }
+    return null;
+  }
+
+  function collectExactTextClickables(texts) {
+    const selector = [
+      'button', 'a', '[role="button"]', '[onclick]',
+      'input[type="button"]', 'input[type="submit"]',
+      'span', 'div', 'p', 'label'
+    ].join(',');
+
+    const seen = new Set();
+    const result = [];
+
+    for (const ctx of collectDeepRoots()) {
+      let rawList = [];
+      try { rawList = [...ctx.root.querySelectorAll(selector)]; } catch (_) { continue; }
+
+      for (const raw of rawList) {
+        if (!isVisible(raw) || isInsideOwnPanel(raw)) continue;
+        if (!elementMatchesText(raw, texts, true)) continue;
+
+        const el = getClickableFromTextElement(raw);
+        if (!el || seen.has(el) || isInsideOwnPanel(el) || !isVisible(el) || isDisabledClickable(el)) continue;
+
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 24 || rect.height < 20) continue;
+
+        seen.add(el);
+        result.push(el);
+      }
+    }
+    return result;
+  }
+
+  function scoreCoverConfirmCandidate(el) {
+    let score = 0;
+    const rect = el.getBoundingClientRect();
+
+    // 真正 button/role=button 权重大。
+    if (el.matches('button,input[type="button"],input[type="submit"]')) score += 40;
+    if (el.matches('[role="button"]')) score += 25;
+    if (el.matches('[onclick]')) score += 15;
+
+    // 当前截图里的按钮大小约为 100x40；给正常按钮尺寸加权。
+    if (rect.width >= 55 && rect.width <= 260) score += 15;
+    if (rect.height >= 28 && rect.height <= 80) score += 10;
+
+    // 必须优先选择当前真正露在最上层的元素。
+    if (isTopmostAtCenter(el)) score += 25;
+
+    // 最强特征：按钮所在的较小祖先容器里出现“编辑封面”。
+    const coverBox = smallestAncestorContaining(el, CONFIG.text.coverEditorTitle, 14);
+    if (coverBox) {
+      score += 120;
+      const boxText = normalizeText(coverBox.innerText || coverBox.textContent || '');
+      if (CONFIG.text.coverEditorUpload.some((t) => boxText.includes(normalizeText(t)))) score += 30;
+      if (coverBox.querySelector('img,canvas,[class*="crop" i]')) score += 20;
+
+      const br = coverBox.getBoundingClientRect();
+      if (br.width >= 300 && br.height >= 250) score += 20;
+      if (br.width < window.innerWidth * 0.9 && br.height < window.innerHeight * 0.95) score += 10;
+    }
+
+    // “编辑封面”通常在屏幕中央区域，排除边缘小工具按钮。
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    if (cx > window.innerWidth * 0.15 && cx < window.innerWidth * 0.85) score += 8;
+    if (cy > window.innerHeight * 0.15 && cy < window.innerHeight * 0.9) score += 8;
+
+    return score;
+  }
+
+  function findCoverEditorContainerDeep() {
+    const candidates = [];
+    for (const ctx of collectDeepRoots()) {
+      let els = [];
+      try { els = [...ctx.root.querySelectorAll('h1,h2,h3,h4,strong,b,div,span,p')]; } catch (_) { continue; }
+      for (const raw of els) {
+        if (!isVisible(raw) || !elementMatchesText(raw, CONFIG.text.coverEditorTitle, true)) continue;
+        let node = raw;
+        for (let i = 0; node && i < 12; i += 1, node = deepParent(node)) {
+          if (!(node instanceof Element) || !isVisible(node)) continue;
+          const r = node.getBoundingClientRect();
+          if (r.width < 320 || r.height < 260) continue;
+          const text = compactText(node.innerText || node.textContent || '');
+          if (!CONFIG.text.coverEditorTitle.some((t) => text.includes(compactText(t)))) continue;
+          const area = r.width * r.height;
+          candidates.push({ el: node, area, context: ctx.label });
+          break;
+        }
+      }
+    }
+    candidates.sort((a, b) => a.area - b.area);
+    return candidates[0]?.el || null;
+  }
+
+  function fallbackConfirmFromEditorContainer() {
+    const box = findCoverEditorContainerDeep();
+    if (!box) return null;
+
+    const candidates = [];
+    let els = [];
+    try { els = [...box.querySelectorAll('button,a,[role="button"],[onclick],input[type="button"],input[type="submit"],div,span')]; } catch (_) {}
+    for (const el of els) {
+      if (!isVisible(el) || isInsideOwnPanel(el) || isDisabledClickable(el)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 50 || r.height < 28 || r.width > 280 || r.height > 90) continue;
+      const style = getComputed(el);
+      const labelMatch = elementMatchesText(el, CONFIG.text.coverEditorConfirm, true);
+      const likelyClickable = labelMatch || el.matches('button,a,[role="button"],[onclick],input[type="button"],input[type="submit"],[class*="btn" i],[class*="button" i]') || style?.cursor === 'pointer';
+      if (!likelyClickable) continue;
+      let score = labelMatch ? 1000 : 0;
+      score += r.top + r.left * 0.1; // 弹窗确认按钮通常在靠下、靠右位置。
+      if (style?.cursor === 'pointer') score += 30;
+      candidates.push({ el, score });
+    }
+    candidates.sort((a, b) => b.score - a.score);
+    const best = candidates[0]?.el || null;
+    if (best) debugLog('使用“编辑封面容器”几何兜底候选', describeElement(best));
+    return best;
+  }
+
+  function findCoverEditorConfirmButton(options = {}) {
+    const { allowLoose = false } = options;
+    const candidates = collectExactTextClickables(CONFIG.text.coverEditorConfirm)
+      .map((el) => ({ el, score: scoreCoverConfirmCandidate(el) }))
+      .sort((a, b) => b.score - a.score);
+
+    if (!candidates.length) {
+      const byContainer = fallbackConfirmFromEditorContainer();
+      return byContainer || null;
+    }
+
+    // 正常模式要求有“编辑封面”等强特征，避免误点其它“确定”。
+    if (!allowLoose && candidates[0].score < 100) return null;
+
+    // 上传后的 required 模式可启用 loose 兜底：如果页面上只有一个可见“确定”，
+    // 即使腾讯又改了弹窗 DOM，也直接使用它。
+    if (allowLoose && candidates.length === 1) return candidates[0].el;
+
+    // 多个“确定”时，即使 loose，也要求最佳候选明显更像弹窗按钮。
+    if (allowLoose && candidates[0].score >= 80) return candidates[0].el;
+
+    return candidates[0].score >= 100 ? candidates[0].el : null;
+  }
+
+  function coverConfirmDebugInfo() {
+    const candidates = collectExactTextClickables(CONFIG.text.coverEditorConfirm)
+      .map((el) => {
+        const r = el.getBoundingClientRect();
+        return `${elementTextVariants(el).join('/') || '(no-text)'}@${Math.round(r.left)},${Math.round(r.top)} score=${scoreCoverConfirmCandidate(el)} path=${cssPath(el)}`;
+      });
+    return candidates.length ? candidates.join(' | ') : '未发现可见“确定”候选';
+  }
+
+  async function confirmCoverEditorIfPresent(required = false) {
+    debugLog(`进入封面确认检测 required=${required}`, { debug: coverConfirmDebugInfo() });
+    let ok = findCoverEditorConfirmButton({ allowLoose: false });
+
+    if (!ok && required) {
+      setState({ status: '封面文件已载入，正在深层扫描“编辑封面”里的“确定”…' });
+      dumpCoverDiagnostics('开始等待编辑封面确定按钮');
+
+      const started = Date.now();
+      let lastSnapshot = 0;
+      while (!ok && Date.now() - started < CONFIG.coverEditorTimeout) {
+        const st = getState();
+        if (st.paused) throw new Error('任务已暂停');
+
+        ok = findCoverEditorConfirmButton({ allowLoose: true });
+        if (ok) break;
+
+        if (Date.now() - lastSnapshot > 3500) {
+          lastSnapshot = Date.now();
+          debugLog('仍未找到“确定”候选', { elapsedMs: Date.now() - started, info: coverConfirmDebugInfo() });
+          dumpCoverDiagnostics(`等待中 ${Math.round((Date.now() - started) / 1000)}s`);
+        }
+        await sleep(CONFIG.pollInterval);
+      }
+
+      if (!ok) {
+        dumpCoverDiagnostics('最终超时');
+        throw new Error(`等待超时：“编辑封面”的“确定”按钮。请点击“导出诊断日志”并把 TXT 发给我。当前：${coverConfirmDebugInfo()}`);
+      }
+    }
+
+    if (!ok) return false;
+
+    const rect = ok.getBoundingClientRect();
+    debugLog('已识别编辑封面确认按钮', { element: describeElement(ok), path: cssPath(ok), score: scoreCoverConfirmCandidate(ok) });
+    setState({
+      status: `已识别“编辑封面”的“确定”按钮（${Math.round(rect.left)},${Math.round(rect.top)}），正在点击…`,
+      lastError: '',
+    });
+
+    const originalOk = ok;
+    clickElement(ok);
+
+    try {
+      await waitFor(
+        () => !originalOk.isConnected || !isVisible(originalOk) || !findCoverEditorContainerDeep(),
+        '点击“确定”后裁剪弹窗关闭',
+        CONFIG.coverEditorTimeout
+      );
+    } catch (e) {
+      dumpCoverDiagnostics('点击确定后弹窗未关闭');
+      throw e;
+    }
+
+    debugLog('编辑封面弹窗已关闭/确认按钮已消失');
+    setState({ status: '“编辑封面”已点击确定，等待页面保存封面…' });
+    await sleep(CONFIG.afterCoverConfirmMs);
+    return true;
+  }
+
+  /******************************************************************
+   * IndexedDB：把用户选中的封面文件保存下来，页面跳转/刷新后仍可继续。
+   ******************************************************************/
+  function openDB() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(DB_STORE)) db.createObjectStore(DB_STORE, { keyPath: 'bookName' });
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function clearCoverDB() {
+    const db = await openDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(DB_STORE, 'readwrite');
+      tx.objectStore(DB_STORE).clear();
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+  }
+
+  async function putCovers(records) {
+    const db = await openDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(DB_STORE, 'readwrite');
+      const store = tx.objectStore(DB_STORE);
+      records.forEach((r) => store.put(r));
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+  }
+
+  async function getCover(bookName) {
+    const db = await openDB();
+    const rec = await new Promise((resolve, reject) => {
+      const tx = db.transaction(DB_STORE, 'readonly');
+      const req = tx.objectStore(DB_STORE).get(bookName);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+    db.close();
+    if (!rec) return null;
+    return new File([rec.blob], rec.fileName, {
+      type: rec.type || rec.blob.type || 'image/jpeg',
+      lastModified: rec.lastModified || Date.now(),
+    });
+  }
+
+  async function chooseFolder() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.setAttribute('webkitdirectory', '');
+    input.setAttribute('directory', '');
+    input.accept = '.jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp';
+    input.style.display = 'none';
+    document.documentElement.appendChild(input);
+
+    const files = await new Promise((resolve) => {
+      input.addEventListener('change', () => resolve([...input.files]), { once: true });
+      input.click();
+    });
+    input.remove();
+
+    const allowed = new Set(CONFIG.imageExtensions.map((x) => x.toLowerCase()));
+    const images = files.filter((f) => allowed.has((f.name.split('.').pop() || '').toLowerCase()));
+    if (!images.length) throw new Error('所选文件夹里没有 JPG/JPEG/PNG/WEBP 封面');
+
+    const records = [];
+    const queue = [];
+    const duplicates = [];
+    const seen = new Set();
+
+    for (const f of images) {
+      const bookName = normalizeText(f.name.replace(/\.[^.]+$/, ''));
+      if (!bookName) continue;
+      if (seen.has(bookName)) {
+        duplicates.push(bookName);
+        continue;
+      }
+      seen.add(bookName);
+      queue.push(bookName);
+      records.push({
+        bookName,
+        fileName: f.name,
+        relativePath: f.webkitRelativePath || f.name,
+        blob: f,
+        type: f.type,
+        lastModified: f.lastModified,
+      });
+    }
+
+    await clearCoverDB();
+    await putCovers(records);
+
+    setState({
+      active: false,
+      paused: false,
+      queue,
+      index: 0,
+      step: 'SEARCH',
+      status: `已读取 ${queue.length} 张封面${duplicates.length ? `；忽略 ${duplicates.length} 个重名文件` : ''}`,
+      lastError: '',
+      results: emptyResults(),
+    });
+  }
+
+  async function uploadCurrentCover(bookName) {
+    const file = await getCover(bookName);
+    if (!file) throw new Error(`本地缓存中找不到封面：${bookName}`);
+
+    // 先点击“封面”区域，让某些后台动态创建 file input。
+    const coverEl = findClickableByExactText(CONFIG.text.cover);
+    if (coverEl) {
+      clickElement(coverEl);
+      await sleep(350);
+    }
+
+    const input = await waitFor(findImageInput, '封面文件上传控件 input[type=file]');
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    input.files = dt.files;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    debugLog('已向 file input 注入封面文件并触发 input/change', { fileName: file.name, input: describeElement(input), path: cssPath(input) });
+
+    setState({ status: `已选择封面文件：${file.name}，等待“编辑封面”弹窗…` });
+    await sleep(CONFIG.afterUploadMs);
+
+    // 关键：上传后先确认裁剪弹窗，再允许进入提交审核步骤。
+    await confirmCoverEditorIfPresent(true);
+  }
+
+  async function clickSubmitAndConfirm() {
+    const submit = await waitFor(
+      () => {
+        const el = findClickableByExactText(CONFIG.text.submit);
+        if (!el) return null;
+        return clickableDisabledReason(el) ? null : el;
+      },
+      '可点击的“提交审核”按钮'
+    );
+
+    clickElement(submit);
+    await sleep(650);
+
+    const dialog = getVisibleDialog();
+    if (dialog) {
+      const confirm = findClickableByExactText(CONFIG.text.confirm, dialog);
+      if (confirm && !clickableDisabledReason(confirm)) {
+        clickElement(confirm);
+        await sleep(650);
+      }
+    }
+
+    // 服务器端拒绝通常会以顶部 toast/alert 显示“申请失败，请重试”。
+    // 这里至少观察几秒，不再把“已经点到提交按钮”等同于提交成功。
+    const started = Date.now();
+    const observeMs = Math.max(4200, CONFIG.afterSubmitMs);
+    while (Date.now() - started < observeMs) {
+      const failure = findVisibleTextContaining(CONFIG.text.submitFailure);
+      if (failure) {
+        const msg = normalizeText(failure.innerText || failure.textContent || '申请失败');
+        debugLog('检测到提交失败提示', { message: msg, element: describeElement(failure) });
+        return { ok: false, message: msg || '申请失败，请重试' };
+      }
+      await sleep(250);
+    }
+
+    return { ok: true, message: '已点击提交审核，未检测到失败提示' };
+  }
+
+  async function goHomeForNext(st) {
+    if (!st.homeUrl) throw new Error('没有记录首页地址，请重新点击“开始批量”');
+
+    // 微信听书后台是 SPA。仅修改 location.href/hash 通常不会重新加载 Tampermonkey，
+    // 所以上一版在这里 return 之后没有新的 run() 被触发，表现为“切到下一本后必须手动点继续”。
+    // 新版做法：主动切回首页 -> 等搜索框真正出现 -> 在当前脚本上下文里直接续跑。
+    if (!findSearchInput()) {
+      if (location.href !== st.homeUrl) {
+        debugLog('准备返回首页处理下一本', { from: location.href, to: st.homeUrl, nextIndex: st.index });
+        location.href = st.homeUrl;
+      } else {
+        debugLog('当前 URL 已是首页，但搜索框尚未出现；等待 SPA 渲染', { url: location.href, nextIndex: st.index });
+      }
+    }
+
+    try {
+      await waitFor(findSearchInput, '返回首页后的搜索框', Math.min(CONFIG.timeout, 15000));
+      await sleep(450);
+      debugLog('首页搜索框已就绪，自动继续下一本', { index: getState().index, title: getState().queue[getState().index] || '' });
+      return true;
+    } catch (err) {
+      // 极少数情况下路由已经变了但页面组件没有重新挂载，强制刷新一次。
+      // 刷新后脚本底部的自动续跑逻辑会继续当前 index，不需要用户点“继续”。
+      debugLog('返回首页等待搜索框超时，准备强制刷新首页', err);
+      if (location.href !== st.homeUrl) location.href = st.homeUrl;
+      else location.reload();
+      return false;
+    }
+  }
+
+  function recordResult(kind, title, reason = '') {
+    const st = getState();
+    const results = {
+      success: [...st.results.success],
+      waiting: [...st.results.waiting],
+      failed: [...st.results.failed],
+    };
+    for (const key of Object.keys(results)) {
+      results[key] = results[key].filter((x) => resultEntryTitle(x) !== title);
+    }
+    results[kind].push({ title, reason, time: new Date().toISOString() });
+    setState({ results });
+    return results;
+  }
+
+  function summaryText(st = getState()) {
+    return `成功 ${st.results.success.length}｜待审核 ${st.results.waiting.length}｜失败 ${st.results.failed.length}`;
+  }
+
+  async function advanceAfterCurrent(kind, title, reason, options = {}) {
+    const { needHome = true } = options;
+    const labels = { success: '成功', waiting: '待审核', failed: '失败' };
+    const results = recordResult(kind, title, reason);
+    let st = getState();
+    const nextIndex = st.index + 1;
+    const total = st.queue.length;
+
+    if (nextIndex >= total) {
+      st = setState({
+        active: false,
+        paused: false,
+        index: nextIndex,
+        step: 'DONE',
+        status: `全部处理完成：成功 ${results.success.length}｜待审核 ${results.waiting.length}｜失败 ${results.failed.length}`,
+        lastError: '',
+      });
+      alert(`微信听书批量换封面处理完成。\n成功：${results.success.length}\n待审核：${results.waiting.length}\n失败：${results.failed.length}`);
+      return true;
+    }
+
+    st = setState({
+      index: nextIndex,
+      step: 'SEARCH',
+      status: `${title}：${labels[kind] || kind}${reason ? `（${reason}）` : ''}；准备下一本…`,
+      lastError: kind === 'failed' ? reason : '',
+    });
+    await sleep(450);
+    if (needHome) {
+      const homeReady = await goHomeForNext(st);
+      if (!homeReady) return true; // 已触发强制刷新，刷新后会自动续跑。
+      const latest = getState();
+      if (latest.active && !latest.paused) return processCurrent();
+      return true;
+    }
+
+    return processCurrent();
+  }
+
+  async function processCurrent() {
+    let st = getState();
+    if (!st.active || st.paused) return;
+    if (!st.queue.length) throw new Error('任务队列为空，请先选择封面文件夹');
+    if (st.index >= st.queue.length) {
+      setState({ active: false, paused: false, status: `全部处理完成：${summaryText(st)}`, step: 'DONE' });
+      return;
+    }
+
+    const title = st.queue[st.index];
+    const prefix = `[${st.index + 1}/${st.queue.length}] ${title}`;
+
+    if (st.step === 'SEARCH') {
+      setState({ status: `${prefix}：寻找首页搜索框…` });
+      let search = findSearchInput();
+      if (!search) {
+        if (st.homeUrl && location.href !== st.homeUrl) {
+          location.href = st.homeUrl;
+          return;
+        }
+        search = await waitFor(findSearchInput, '首页搜索框');
+      }
+
+      search.focus();
+      setNativeInputValue(search, title);
+      await sleep(250);
+      search.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+      search.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+      setState({ step: 'RESULT', status: `${prefix}：已搜索，等待搜索结果…` });
+      await sleep(CONFIG.afterSearchMs);
+      return processCurrent();
+    }
+
+    if (st.step === 'RESULT') {
+      const result = await waitFor(() => findBookResult(title), `搜索结果中精确书名“${title}”`);
+
+      // 最优先在首页卡片就判断“审核中”。命中后不进入详情、不上传，直接记为待审核。
+      if (resultShowsReviewing(result)) {
+        debugLog('搜索结果显示审核中，自动跳过', { title, result: describeElement(result) });
+        setState({ status: `${prefix}：检测到“审核中”，自动跳过并加入待审核名单…`, lastError: '' });
+        return advanceAfterCurrent('waiting', title, '当前专辑正在审核', { needHome: false });
+      }
+
+      clickElement(result);
+      setState({ step: 'EDIT', status: `${prefix}：已进入书籍，检查“重新编辑”是否可用…` });
+      await sleep(CONFIG.afterClickMs);
+      return processCurrent();
+    }
+
+    if (st.step === 'EDIT') {
+      const edit = await waitFor(() => findClickableByExactText(CONFIG.text.edit), '“重新编辑”按钮');
+      const disabledReason = clickableDisabledReason(edit);
+      if (disabledReason) {
+        debugLog('重新编辑处于禁用状态，按待审核跳过', { title, disabledReason, edit: describeElement(edit) });
+        setState({ status: `${prefix}：“重新编辑”已禁用（${disabledReason}），判定为审核中，自动跳过…`, lastError: '' });
+        return advanceAfterCurrent('waiting', title, `重新编辑不可用：${disabledReason}`, { needHome: true });
+      }
+
+      clickElement(edit);
+      setState({ step: 'UPLOAD', status: `${prefix}：已点“重新编辑”，准备上传封面…` });
+      await sleep(CONFIG.afterClickMs);
+      return processCurrent();
+    }
+
+    if (st.step === 'UPLOAD') {
+      await uploadCurrentCover(title);
+      setState({ step: 'SUBMIT', status: `${prefix}：封面已送入上传控件` });
+      return processCurrent();
+    }
+
+    if (st.step === 'SUBMIT') {
+      if (CONFIG.autoSubmit) {
+        await confirmCoverEditorIfPresent(false);
+        setState({ status: `${prefix}：封面裁剪已确认，等待并点击“提交审核”…` });
+        const outcome = await clickSubmitAndConfirm();
+        if (!outcome.ok) {
+          setState({ status: `${prefix}：提交被平台拒绝：${outcome.message}`, lastError: outcome.message });
+          return advanceAfterCurrent('failed', title, outcome.message, { needHome: true });
+        }
+        return advanceAfterCurrent('success', title, outcome.message, { needHome: true });
+      }
+
+      setState({
+        active: false,
+        paused: true,
+        status: `${prefix}：已上传封面；autoSubmit=false，请手动提交审核`,
+      });
+      return;
+    }
+  }
+
+  let runningLock = false;
+  async function run() {
+    if (runningLock) return;
+    const st = getState();
+    if (!st.active || st.paused) return;
+    runningLock = true;
+    try {
+      await processCurrent();
+    } catch (err) {
+      const cur = getState();
+      if (String(err?.message || err) === '任务已暂停') return;
+      const message = err?.message || String(err);
+      debugLog('任务捕获异常', err);
+      try { dumpCoverDiagnostics('任务异常'); } catch (_) {}
+      console.error('[微信听书批量封面]', err);
+
+      // 单本异常记为“失败”并继续下一本；避免一本书卡死整个批次。
+      if (cur.active && cur.queue[cur.index]) {
+        try {
+          await advanceAfterCurrent('failed', cur.queue[cur.index], message, { needHome: true });
+        } catch (advanceErr) {
+          setState({ active: false, paused: true, lastError: message, status: `已暂停：${message}` });
+          debugLog('记录失败后跳转下一本也失败', advanceErr);
+        }
+      } else {
+        setState({ active: false, paused: true, lastError: message, status: `已暂停：${message}` });
+      }
+    } finally {
+      runningLock = false;
+    }
+  }
+
+  /******************************************************************
+   * 控制面板
+   ******************************************************************/
+  GM_addStyle(`
+    #wxts-batch-panel {
+      position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;
+      width: 330px; padding: 14px; border-radius: 12px;
+      background: rgba(255,255,255,.97); box-shadow: 0 8px 30px rgba(0,0,0,.18);
+      font: 13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
+      color: #1f2329; border: 1px solid rgba(0,0,0,.10);
+    }
+    #wxts-batch-panel.minimized {
+      width: 250px; padding: 9px 10px; border-radius: 10px;
+    }
+    #wxts-batch-panel .panel-head {
+      display:flex; align-items:center; justify-content:space-between; gap:8px;
+      margin-bottom:8px;
+    }
+    #wxts-batch-panel.minimized .panel-head { margin-bottom:5px; }
+    #wxts-batch-panel .title { font-weight: 700; font-size: 15px; min-width:0; }
+    #wxts-batch-panel .panel-toggle {
+      flex:0 0 auto; width:30px; height:28px; padding:0; border-radius:7px;
+      display:inline-flex; align-items:center; justify-content:center;
+      font-size:18px; font-weight:700; line-height:1;
+    }
+    #wxts-batch-panel .mini-summary {
+      display:flex; align-items:center; justify-content:space-between; gap:8px;
+      color:#475467; font-size:12px; white-space:nowrap;
+    }
+    #wxts-batch-panel .mini-summary strong { color:#101828; font-size:12px; }
+    #wxts-batch-panel .mini-track {
+      margin-top:6px; width:100%; height:6px; overflow:hidden; border-radius:999px;
+      background:#eaecf0;
+    }
+    #wxts-batch-panel .mini-bar {
+      height:100%; border-radius:inherit; background:#12b76a; transition:width .28s ease;
+    }
+    #wxts-batch-panel .status { max-height: 80px; overflow: auto; word-break: break-all; margin: 8px 0; }
+    #wxts-batch-panel .error { color: #b42318; word-break: break-all; margin-top: 6px; }
+    #wxts-batch-panel .meta { color: #667085; font-size: 12px; }
+    #wxts-batch-panel .progress-wrap { margin: 9px 0 7px; }
+    #wxts-batch-panel .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; margin:8px 0; }
+    #wxts-batch-panel .stat { border:1px solid #eaecf0; border-radius:8px; padding:6px 5px; text-align:center; background:#f9fafb; }
+    #wxts-batch-panel .stat b { display:block; font-size:16px; line-height:1.2; }
+    #wxts-batch-panel .stat span { color:#667085; font-size:11px; }
+    #wxts-batch-panel .progress-head {
+      display: flex; justify-content: space-between; align-items: center; gap: 8px;
+      color: #475467; font-size: 12px; margin-bottom: 5px;
+    }
+    #wxts-batch-panel .progress-track {
+      width: 100%; height: 10px; overflow: hidden; border-radius: 999px;
+      background: #eaecf0; border: 1px solid #e4e7ec;
+    }
+    #wxts-batch-panel .progress-bar {
+      height: 100%; width: 0; border-radius: inherit; background: #12b76a;
+      transition: width .28s ease;
+    }
+    #wxts-batch-panel .buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+    #wxts-batch-panel button {
+      cursor: pointer; border: 1px solid #d0d5dd; background: #fff; border-radius: 8px;
+      padding: 6px 10px; font-size: 12px;
+    }
+    #wxts-batch-panel button:hover { background: #f2f4f7; }
+    #wxts-batch-panel button.primary { background: #101828; color: #fff; border-color: #101828; }
+    #wxts-batch-panel button.debug { background: #fff7ed; color: #9a3412; border-color: #fdba74; }
+  `);
+
+  function ensurePanel() {
+    let panel = document.getElementById('wxts-batch-panel');
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = 'wxts-batch-panel';
+      document.documentElement.appendChild(panel);
+    }
+    return panel;
+  }
+
+  function renderPanel() {
+    const panel = ensurePanel();
+    const st = getState();
+    const total = st.queue.length;
+    const completed = Math.min(st.index, total);
+    const current = total && st.index < total ? st.queue[st.index] : '-';
+
+    // 让进度条在一本书处理过程中也会移动，而不是只有提交后才跳动。
+    const stepFractionMap = {
+      SEARCH: 0.00,
+      RESULT: 0.20,
+      EDIT: 0.40,
+      UPLOAD: 0.60,
+      SUBMIT: 0.80,
+      DONE: 1.00,
+    };
+    const stepFraction = stepFractionMap[st.step] ?? 0;
+    const rawProgress = total ? ((completed + (completed < total ? stepFraction : 0)) / total) * 100 : 0;
+    const progress = st.step === 'DONE' && total ? 100 : Math.max(0, Math.min(100, rawProgress));
+    const progressText = total ? `${progress.toFixed(progress >= 10 ? 0 : 1)}%` : '0%';
+    const minimized = isPanelMinimized();
+    panel.classList.toggle('minimized', minimized);
+
+    if (minimized) {
+      panel.innerHTML = `
+        <div class="panel-head">
+          <div class="title">微信听书 · 批量换封面</div>
+          <button id="wxts-toggle-panel" class="panel-toggle" type="button" title="展开窗口" aria-label="展开窗口">+</button>
+        </div>
+        <div class="mini-summary">
+          <span>${completed}/${total} · ${escapeHtml(st.step || '-')}</span>
+          <strong>${progressText}</strong>
+        </div>
+        <div class="mini-track" role="progressbar" aria-label="批量修改封面总体进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress.toFixed(1)}">
+          <div class="mini-bar" style="width:${progress.toFixed(2)}%"></div>
+        </div>
+      `;
+      panel.querySelector('#wxts-toggle-panel').onclick = () => setPanelMinimized(false);
+      return;
+    }
+
+    panel.innerHTML = `
+      <div class="panel-head">
+        <div class="title">微信听书 · 批量换封面</div>
+        <button id="wxts-toggle-panel" class="panel-toggle" type="button" title="最小化窗口" aria-label="最小化窗口">−</button>
+      </div>
+      <div class="stats">
+        <div class="stat"><b>${st.results.success.length}</b><span>成功</span></div>
+        <div class="stat"><b>${st.results.waiting.length}</b><span>待审核</span></div>
+        <div class="stat"><b>${st.results.failed.length}</b><span>失败</span></div>
+      </div>
+      <div class="progress-wrap">
+        <div class="progress-head">
+          <span>总体进度：${completed}/${total}</span>
+          <strong>${progressText}</strong>
+        </div>
+        <div class="progress-track" role="progressbar" aria-label="批量修改封面总体进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress.toFixed(1)}">
+          <div class="progress-bar" style="width:${progress.toFixed(2)}%"></div>
+        </div>
+      </div>
+      <div class="meta">步骤：${escapeHtml(st.step || '-')}</div>
+      <div class="meta">当前：${escapeHtml(current)}</div>
+      <div class="status">${escapeHtml(st.status || '')}</div>
+      ${st.lastError ? `<div class="error">错误：${escapeHtml(st.lastError)}</div>` : ''}
+      <div class="buttons">
+        <button id="wxts-pick">1. 选择封面文件夹</button>
+        <button id="wxts-start" class="primary">2. 开始批量</button>
+        <button id="wxts-pause">暂停</button>
+        <button id="wxts-resume">继续</button>
+        <button id="wxts-reset">重置</button>
+        <button id="wxts-export-waiting">导出待审核</button>
+        <button id="wxts-export-results">导出全部结果</button>
+        <button id="wxts-scan" class="debug">扫描弹窗</button>
+        <button id="wxts-export-log" class="debug">导出诊断日志</button>
+        <button id="wxts-clear-log">清空日志</button>
+      </div>
+      <div class="meta" style="margin-top:8px">v0.6.2 · 支持最小化 · 自动无缝切换下一本 · 审核中自动跳过 · 匹配规则：图片文件名（不含扩展名）= 书名</div>
+    `;
+
+    panel.querySelector('#wxts-toggle-panel').onclick = () => setPanelMinimized(true);
+
+    panel.querySelector('#wxts-pick').onclick = async () => {
+      try {
+        setState({ status: '请选择包含新封面的文件夹…', lastError: '' });
+        await chooseFolder();
+      } catch (e) {
+        setState({ status: '选择文件夹失败', lastError: e.message || String(e) });
+      }
+    };
+
+    panel.querySelector('#wxts-start').onclick = () => {
+      const cur = getState();
+      if (!cur.queue.length) {
+        alert('请先选择封面文件夹。');
+        return;
+      }
+      setState({
+        active: true,
+        paused: false,
+        homeUrl: location.href,
+        index: 0,
+        step: 'SEARCH',
+        status: `开始批量，共 ${cur.queue.length} 本；首页已记录：${location.href}`,
+        lastError: '',
+        results: emptyResults(),
+      });
+      run();
+    };
+
+    panel.querySelector('#wxts-pause').onclick = () => {
+      setState({ active: false, paused: true, status: `已手动暂停（${now()}）` });
+    };
+
+    panel.querySelector('#wxts-resume').onclick = () => {
+      const cur = getState();
+      if (!cur.queue.length) return alert('请先选择封面文件夹。');
+      setState({ active: true, paused: false, lastError: '', status: `继续：${cur.queue[cur.index] || '任务末尾'}` });
+      run();
+    };
+
+    panel.querySelector('#wxts-export-waiting').onclick = () => {
+      try { exportWaitingList(); }
+      catch (e) { setState({ lastError: `导出待审核失败：${e.message || e}` }); }
+    };
+
+    panel.querySelector('#wxts-export-results').onclick = () => {
+      try { exportAllResults(); }
+      catch (e) { setState({ lastError: `导出全部结果失败：${e.message || e}` }); }
+    };
+
+    panel.querySelector('#wxts-scan').onclick = () => {
+      try {
+        const info = dumpCoverDiagnostics('手动点击“扫描弹窗”');
+        const count = (info.confirm?.length || 0) + (info.editCover?.length || 0);
+        setState({ status: `已扫描弹窗，记录 ${count} 条关键词元素；请点“导出诊断日志”。`, lastError: '' });
+      } catch (e) {
+        debugLog('手动扫描失败', e);
+        setState({ lastError: `手动扫描失败：${e.message || e}` });
+      }
+    };
+
+    panel.querySelector('#wxts-export-log').onclick = () => {
+      try {
+        dumpCoverDiagnostics('导出日志前快照');
+        downloadDebugLog();
+        setState({ status: '诊断日志已导出。把下载的 TXT 文件发给我即可。', lastError: '' });
+      } catch (e) {
+        setState({ lastError: `导出日志失败：${e.message || e}` });
+      }
+    };
+
+    panel.querySelector('#wxts-clear-log').onclick = () => {
+      clearDebugLog();
+      setState({ status: '诊断日志已清空。', lastError: '' });
+    };
+
+    panel.querySelector('#wxts-reset').onclick = async () => {
+      if (!confirm('确定重置任务状态并清除已缓存的封面文件吗？')) return;
+      GM_deleteValue(STATE_KEY);
+      await clearCoverDB();
+      renderPanel();
+    };
+  }
+
+  renderPanel();
+  debugLog('脚本 v0.6.2 已加载', { url: location.href, readyState: document.readyState });
+
+  // 页面刷新/跳转后，若之前任务仍为 active，则自动续跑。
+  setTimeout(() => {
+    const st = getState();
+    if (st.active && !st.paused) run();
+  }, 900);
+
+  // 自动续跑看门狗：解决 SPA 切路由、页面渲染抖动等情况下某一步已经结束，
+  // 但没有新的调用链接上来的问题。runningLock 会阻止重复并发执行。
+  setInterval(() => {
+    const st = getState();
+    if (!st.active || st.paused || runningLock || st.step === 'DONE') return;
+    debugLog('自动续跑看门狗触发', { index: st.index, step: st.step, title: st.queue[st.index] || '', url: location.href });
+    run();
+  }, 1800);
+})();

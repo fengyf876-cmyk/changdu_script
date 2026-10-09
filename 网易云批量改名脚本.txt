@@ -1,0 +1,1105 @@
+// ==UserScript==
+// @name         Netease Creator Center - Podcast Batch Rename v3.5
+// @namespace    https://music.163.com/
+// @version      3.5.0
+// @description  Scan all tasks, exclude already-renamed titles, then automatically start from the first unmodified task. Max 40 chars, substring matching, network retry, persistent progress.
+// @match        https://music.163.com/st/ncreator/manage/voicelist*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const STORE_KEY = '__163_PODCAST_BATCH_RENAME_V3_5__';
+  const PANEL_ID = '__163_podcast_rename_panel_v3_5__';
+  const LIST_URL = 'https://music.163.com/st/ncreator/manage/voicelist/display';
+  const SEARCH_TIMEOUT = 9000;
+  const SCAN_SEARCH_TIMEOUT = 6500;
+  const EDIT_TIMEOUT = 12000;
+  const SUBMIT_TIMEOUT = 15000;
+  const MAX_SUBMIT_RETRIES = 3;
+  const MAX_NAME_LENGTH = 40;
+  const RETRY_REFRESH_DELAY = 800;
+  const STEP_DELAY = 900;
+  const AUTO_TICK = 1000;
+  let submitRefreshScheduled = false;
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  // 按 Unicode 字符计数：中文、英文、常见符号各按1个字符计算。
+  const charLength = (s) => [...String(s || '')].length;
+
+  function visible(el) {
+    if (!el || !el.isConnected) return false;
+    const r = el.getBoundingClientRect();
+    const st = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden' && st.opacity !== '0';
+  }
+
+  function readState() {
+    try {
+      const raw = GM_getValue(STORE_KEY, null);
+      if (!raw) return null;
+      const state = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (state && Array.isArray(state.tasks)) {
+        state.tasks.forEach((task) => {
+          if (!task) return;
+          const len = charLength(task.newName);
+          // 兼容旧版本批次：只重新校验“待处理/超长”任务；已完成、未找到等历史结果保持不变。
+          if (task.status === 'pending' || task.status === 'too-long') {
+            if (len > MAX_NAME_LENGTH) {
+              task.status = 'too-long';
+              task.note = `新名称${len}字符，超过${MAX_NAME_LENGTH}字符限制`;
+            } else if (task.status === 'too-long') {
+              task.status = 'pending';
+              task.note = '';
+            }
+          }
+        });
+      }
+      return state;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function saveState(state) {
+    try { GM_setValue(STORE_KEY, JSON.stringify(state)); } catch (_) {}
+    refreshPanel();
+  }
+
+  function clearState() {
+    try { GM_deleteValue(STORE_KEY); } catch (_) {}
+    refreshPanel();
+  }
+
+  function addLog(message, type = 'info') {
+    const state = readState();
+    if (!state) return;
+    state.logs = Array.isArray(state.logs) ? state.logs : [];
+    state.logs.push({ time: new Date().toLocaleTimeString(), message, type });
+    if (state.logs.length > 400) state.logs = state.logs.slice(-400);
+    saveState(state);
+  }
+
+  function setNativeInputValue(input, value) {
+    const proto = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (descriptor && descriptor.set) descriptor.set.call(input, value);
+    else input.value = value;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function isManagePage() {
+    return location.pathname.includes('/st/ncreator/manage/voicelist/display');
+  }
+
+  function isEditPage() {
+    return location.pathname.includes('/st/ncreator/manage/voicelist/edit');
+  }
+
+  async function waitFor(fn, timeout = 8000, interval = 180) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      try {
+        const result = fn();
+        if (result) return result;
+      } catch (_) {}
+      await sleep(interval);
+    }
+    return null;
+  }
+
+  function textElementsExact(text, root = document) {
+    const target = norm(text);
+    return [...root.querySelectorAll('a,button,span,div,p,label')].filter((el) => {
+      if (!visible(el)) return false;
+      if (el.closest(`#${PANEL_ID}`)) return false;
+      if (el.children.length > 0) return false;
+      return norm(el.textContent) === target;
+    });
+  }
+
+  function findClickableByText(text, root = document) {
+    for (const el of textElementsExact(text, root)) {
+      const clickable = el.closest('a,button,[role="button"]');
+      if (clickable && visible(clickable)) return clickable;
+      if (['A', 'BUTTON'].includes(el.tagName)) return el;
+      if (getComputedStyle(el).cursor === 'pointer') return el;
+    }
+    return null;
+  }
+
+  function parseMappings(raw) {
+    const lines = String(raw || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    const tasks = [];
+    const errors = [];
+
+    lines.forEach((line, idx) => {
+      let sep = null;
+      if (line.includes('\t')) sep = '\t';
+      else if (line.includes('=>')) sep = '=>';
+      else if (line.includes('->')) sep = '->';
+
+      if (!sep) {
+        errors.push(`第${idx + 1}行无法识别，请用 Tab、-> 或 => 分隔`);
+        return;
+      }
+
+      const parts = line.split(sep);
+      const oldName = norm(parts.shift());
+      const newName = norm(parts.join(sep));
+
+      if (!oldName || !newName) {
+        errors.push(`第${idx + 1}行原名或新名为空`);
+        return;
+      }
+      if (oldName === newName) {
+        errors.push(`第${idx + 1}行新旧名称相同：${oldName}`);
+        return;
+      }
+
+      const newNameLen = charLength(newName);
+      tasks.push({
+        oldName,
+        newName,
+        status: newNameLen > MAX_NAME_LENGTH ? 'too-long' : 'pending',
+        note: newNameLen > MAX_NAME_LENGTH
+          ? `新名称${newNameLen}字符，超过${MAX_NAME_LENGTH}字符限制`
+          : ''
+      });
+      if (newNameLen > MAX_NAME_LENGTH) {
+        errors.push(`第${idx + 1}行新名称${newNameLen}字符，超过${MAX_NAME_LENGTH}字符：${newName}`);
+      }
+    });
+
+    return { tasks, errors };
+  }
+
+  function currentTask(state) {
+    return state && Array.isArray(state.tasks) ? state.tasks[state.index] : null;
+  }
+
+  function nextRunnableIndex(state, from) {
+    for (let i = Math.max(0, from); i < state.tasks.length; i++) {
+      if (state.tasks[i].status === 'pending') return i;
+    }
+    return state.tasks.length;
+  }
+
+  function finishIfDone(state) {
+    const next = nextRunnableIndex(state, state.index);
+    if (next >= state.tasks.length) {
+      state.index = state.tasks.length;
+      state.running = false;
+      state.phase = 'done';
+      state.submittedIndex = null;
+      saveState(state);
+      if (!state.doneLogged) {
+        state.doneLogged = true;
+        saveState(state);
+        addLog('全部任务处理完成。', 'success');
+      }
+      return true;
+    }
+    if (next !== state.index) {
+      state.index = next;
+      saveState(state);
+    }
+    return false;
+  }
+
+  function markCurrentAndAdvance(status, note = '') {
+    const state = readState();
+    if (!state) return;
+    const task = currentTask(state);
+    if (task) {
+      task.status = status;
+      task.note = note;
+    }
+    state.index = nextRunnableIndex(state, state.index + 1);
+    state.phase = 'search';
+    state.submittedIndex = null;
+    state.lastActionAt = Date.now();
+    saveState(state);
+  }
+
+  function completeSubmittedTaskOnReturn() {
+    const state = readState();
+    if (!state || !Array.isArray(state.tasks)) return false;
+    if (state.submittedIndex == null) return false;
+    if (state.submittedIndex < 0 || state.submittedIndex >= state.tasks.length) {
+      state.submittedIndex = null;
+      saveState(state);
+      return false;
+    }
+
+    const idx = state.submittedIndex;
+    const task = state.tasks[idx];
+    if (task.status === 'pending') {
+      task.status = 'done';
+      task.note = '已提交';
+      state.lastCompletedIndex = idx;
+      state.index = nextRunnableIndex(state, idx + 1);
+      state.phase = 'search';
+      state.submittedIndex = null;
+      state.lastActionAt = Date.now();
+      saveState(state);
+      addLog(`成功：${task.oldName} → ${task.newName}`, 'success');
+      return true;
+    }
+
+    state.submittedIndex = null;
+    state.index = nextRunnableIndex(state, idx + 1);
+    state.phase = 'search';
+    saveState(state);
+    return true;
+  }
+
+  function findSearchInput() {
+    return [...document.querySelectorAll('input')].find((el) =>
+      visible(el) && norm(el.getAttribute('placeholder')) === '搜索播客'
+    ) || null;
+  }
+
+  async function ensureAllFilter() {
+    const search = findSearchInput();
+    if (!search) return;
+    const sr = search.getBoundingClientRect();
+
+    const candidates = [...document.querySelectorAll('div,span')].map((el) => {
+      if (!visible(el) || el.closest(`#${PANEL_ID}`) || el.children.length > 0) return null;
+      const t = norm(el.textContent);
+      if (t !== '付费' && t !== '全部') return null;
+      const r = el.getBoundingClientRect();
+      if (Math.abs(r.top - sr.top) > 55 || r.left <= sr.right) return null;
+
+      let target = el.closest('[role="combobox"],button,[class*="select"],[class*="dropdown"]');
+      if (!target) {
+        let p = el.parentElement;
+        for (let i = 0; i < 4 && p; i++, p = p.parentElement) {
+          const pr = p.getBoundingClientRect();
+          if (pr.width >= 90 && pr.width <= 280 && pr.height >= 28 && pr.height <= 65 &&
+              (p.querySelector('svg') || getComputedStyle(p).cursor === 'pointer')) {
+            target = p;
+            break;
+          }
+        }
+      }
+      return target ? { text: t, target, left: target.getBoundingClientRect().left } : null;
+    }).filter(Boolean).sort((a, b) => a.left - b.left);
+
+    const current = candidates[0];
+    if (!current || current.text === '全部') return;
+
+    current.target.click();
+    await sleep(350);
+
+    const option = [...document.querySelectorAll('li,div,span')].find((el) =>
+      visible(el) && !el.closest(`#${PANEL_ID}`) && el.children.length === 0 && norm(el.textContent) === '全部'
+    );
+    if (option) {
+      (option.closest('li,[role="option"]') || option).click();
+      await sleep(450);
+    }
+  }
+
+  function textElementsContaining(text, root = document) {
+    const target = norm(text);
+    if (!target) return [];
+    return [...root.querySelectorAll('a,button,span,div,p,label')].filter((el) => {
+      if (!visible(el)) return false;
+      if (el.closest(`#${PANEL_ID}`)) return false;
+      if (el.children.length > 0) return false;
+      return norm(el.textContent).includes(target);
+    });
+  }
+
+  // 不要求整条标题完全等于原标题，只要标题中“连续完整包含”原标题即可。
+  // 若搜索结果里存在唯一精确同名，优先使用精确同名；否则返回所有包含原标题的候选。
+  function findPodcastRowsContaining(title) {
+    const target = norm(title);
+    const titleEls = textElementsContaining(target);
+    const rows = [];
+
+    for (const titleEl of titleEls) {
+      let node = titleEl;
+      for (let depth = 0; depth < 9 && node && node !== document.body; depth++, node = node.parentElement) {
+        const rect = node.getBoundingClientRect();
+        if (rect.height > 30 && rect.height < 240 && rect.width > 500) {
+          const edit = findClickableByText('编辑', node);
+          const manage = findClickableByText('管理单集', node);
+          if (edit && manage) {
+            rows.push({ row: node, titleEl, edit, titleText: norm(titleEl.textContent) });
+            break;
+          }
+        }
+      }
+    }
+
+    const seen = new Set();
+    const unique = rows.filter((item) => {
+      if (seen.has(item.row)) return false;
+      seen.add(item.row);
+      return true;
+    });
+
+    const exact = unique.filter((item) => item.titleText === target);
+    if (exact.length === 1) return exact;
+    return unique.filter((item) => item.titleText.includes(target));
+  }
+
+
+  function hasNoSearchResults() {
+    const keys = ['暂无数据', '暂无播客', '暂无内容', '没有找到', '无搜索结果'];
+    return [...document.querySelectorAll('div,span,p')].some((el) => {
+      if (!visible(el) || el.closest(`#${PANEL_ID}`)) return false;
+      if (el.children.length > 0) return false;
+      const t = norm(el.textContent);
+      return keys.some((k) => t.includes(k));
+    });
+  }
+
+  async function waitForSearchRows(title, timeout = SCAN_SEARCH_TIMEOUT) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      const rows = findPodcastRowsContaining(title);
+      if (rows.length) return rows;
+      if (hasNoSearchResults()) return [];
+      await sleep(220);
+    }
+    return [];
+  }
+
+
+  function prepareRenameAfterScan(state) {
+    state.scanCompleted = true;
+    state.phase = 'search';
+    state.index = nextRunnableIndex(state, 0);
+    state.lastActionAt = Date.now();
+    saveState(state);
+
+    const already = state.tasks.filter((t) => t.status === 'already-done').length;
+    const pending = state.tasks.filter((t) => t.status === 'pending').length;
+    const skipped = state.tasks.length - already - pending;
+    addLog(`\u626b\u63cf\u5b8c\u6210\uff1a\u5df2\u66ff\u6362${already}\u6761\uff1b\u5f85\u4fee\u6539${pending}\u6761\uff1b\u5176\u4ed6\u8df3\u8fc7${skipped}\u6761\u3002\u81ea\u52a8\u4ece\u7b2c\u4e00\u6761\u672a\u4fee\u6539\u4efb\u52a1\u5f00\u59cb\u3002`, 'success');
+    return true;
+  }
+
+  async function scanOneTaskOnManagePage() {
+    let state = readState();
+    if (!state || !state.running || state.scanCompleted) return false;
+
+    const scanIndex = Number(state.scanIndex || 0);
+    if (scanIndex >= state.tasks.length) {
+      return prepareRenameAfterScan(state);
+    }
+
+    const task = state.tasks[scanIndex];
+    if (!task) {
+      state.scanIndex = scanIndex + 1;
+      saveState(state);
+      return true;
+    }
+
+    // 超长任务不需要搜索，保留“超40字符”状态并继续扫描下一条。
+    if (task.status === 'too-long') {
+      state.scanIndex = scanIndex + 1;
+      state.phase = 'scanning';
+      saveState(state);
+      addLog(`扫描 ${scanIndex + 1}/${state.tasks.length}：超40字符，跳过扫描：${task.oldName}`, 'warn');
+      return true;
+    }
+
+    const input = await waitFor(findSearchInput, 9000);
+    if (!input) {
+      state.running = false;
+      state.phase = 'paused-scan-error';
+      saveState(state);
+      addLog('扫描阶段找不到“搜索播客”输入框，已暂停。', 'error');
+      return false;
+    }
+
+    state.phase = 'scanning';
+    state.lastActionAt = Date.now();
+    saveState(state);
+    addLog(`扫描 ${scanIndex + 1}/${state.tasks.length}：${task.oldName}`);
+
+    await triggerSearch(input, task.oldName);
+    let rows = await waitForSearchRows(task.oldName, SCAN_SEARCH_TIMEOUT);
+
+    // 只要搜索结果里存在“完全等于目标新名称”的标题，就认定这条已经替换完成。
+    let exactNew = rows.filter((r) => norm(r.titleText) === norm(task.newName));
+    if (exactNew.length === 1) {
+      task.status = 'already-done';
+      task.note = '扫描发现已是目标新名称';
+      task.matchedTitle = exactNew[0].titleText;
+      state.scanIndex = scanIndex + 1;
+      saveState(state);
+      addLog(`已替换，排除：${task.newName}`, 'success');
+      return true;
+    }
+
+    if (!rows.length) {
+      // 原名搜不到时，再用新名称确认一次，避免已经改名后因搜索规则导致漏判。
+      await triggerSearch(input, task.newName);
+      const newRows = await waitForSearchRows(task.newName, 4500);
+      exactNew = newRows.filter((r) => norm(r.titleText) === norm(task.newName));
+      if (exactNew.length === 1) {
+        task.status = 'already-done';
+        task.note = '扫描发现已是目标新名称';
+        task.matchedTitle = exactNew[0].titleText;
+        addLog(`已替换，排除：${task.newName}`, 'success');
+      } else {
+        task.status = 'not-found';
+        task.note = '扫描未找到原标题或目标新名称';
+        addLog(`扫描未找到：${task.oldName}`, 'warn');
+      }
+      state.scanIndex = scanIndex + 1;
+      saveState(state);
+      return true;
+    }
+
+    // 如果存在唯一“完全等于原标题”的结果，优先认定为待修改。
+    const exactOld = rows.filter((r) => norm(r.titleText) === norm(task.oldName));
+    if (exactOld.length === 1) {
+      task.status = 'pending';
+      task.note = '扫描确认待修改';
+      task.matchedTitle = exactOld[0].titleText;
+      state.scanIndex = scanIndex + 1;
+      saveState(state);
+      addLog(`待修改：${exactOld[0].titleText}`);
+      return true;
+    }
+
+    if (rows.length === 1) {
+      const row = rows[0];
+      if (norm(row.titleText) === norm(task.newName)) {
+        task.status = 'already-done';
+        task.note = '扫描发现已是目标新名称';
+        addLog(`已替换，排除：${task.newName}`, 'success');
+      } else {
+        task.status = 'pending';
+        task.note = '扫描确认标题包含完整原标题，待修改';
+        task.matchedTitle = row.titleText;
+        addLog(`待修改：${row.titleText}`);
+      }
+      state.scanIndex = scanIndex + 1;
+      saveState(state);
+      return true;
+    }
+
+    task.status = 'duplicate';
+    task.note = '扫描发现多个标题包含完整原标题';
+    state.scanIndex = scanIndex + 1;
+    saveState(state);
+    addLog(`扫描发现多个候选，为避免误改已排除：${task.oldName}`, 'warn');
+    return true;
+  }
+
+  async function triggerSearch(input, query) {
+    input.focus();
+    setNativeInputValue(input, '');
+    await sleep(120);
+    setNativeInputValue(input, query);
+    await sleep(220);
+
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+
+    const wrapper = input.parentElement;
+    if (wrapper) {
+      const icon = [...wrapper.querySelectorAll('button,[role="button"],svg')].find(visible);
+      if (icon) {
+        try { (icon.closest('button,[role="button"]') || icon).click(); } catch (_) {}
+      }
+    }
+  }
+
+  async function processManagePage() {
+    let state = readState();
+    if (!state || !state.running) return;
+
+    await ensureAllFilter();
+
+    // v3.5：任何改名前，必须先把整个任务表扫描一遍，排除已经改成目标新名称的项目。
+    if (!state.scanCompleted) {
+      await scanOneTaskOnManagePage();
+      return;
+    }
+
+    // 核心修复：只要上一次已经点过提交并回到列表页，就立刻把那一条标记完成并推进到下一条。
+    if (state.submittedIndex != null) {
+      completeSubmittedTaskOnReturn();
+      await sleep(STEP_DELAY);
+      state = readState();
+    }
+
+    if (!state || !state.running || finishIfDone(state)) return;
+    let task = currentTask(state);
+    if (!task) return;
+
+    const input = await waitFor(findSearchInput, 9000);
+    if (!input) {
+      state = readState();
+      if (state) {
+        state.running = false;
+        state.phase = 'paused-error';
+        saveState(state);
+      }
+      addLog('找不到“搜索播客”输入框，已暂停。', 'error');
+      return;
+    }
+
+    state = readState();
+    task = currentTask(state);
+    if (!task) return;
+    state.phase = 'searching';
+    state.lastActionAt = Date.now();
+    saveState(state);
+    addLog(`搜索：${task.oldName}`);
+    await triggerSearch(input, task.oldName);
+
+    const rows = await waitFor(() => {
+      const found = findPodcastRowsContaining(task.oldName);
+      return found.length ? found : null;
+    }, SEARCH_TIMEOUT, 250);
+
+    if (!rows || rows.length === 0) {
+      // 额外保护：若原名没搜到，但新名已存在，通常说明这一条其实已经改成功，只是上次状态没来得及推进。
+      addLog(`原名未找到，检查新名是否已存在：${task.newName}`, 'warn');
+      await triggerSearch(input, task.newName);
+      const renamedRows = await waitFor(() => {
+        const found = findPodcastRowsContaining(task.newName);
+        return found.length ? found : null;
+      }, 5000, 250);
+
+      if (renamedRows && renamedRows.length === 1) {
+        addLog(`检测到新名称已存在，按“已完成”处理：${task.newName}`, 'success');
+        markCurrentAndAdvance('done', '检测到新名称已存在');
+      } else {
+        addLog(`未找到包含完整原标题的播客：${task.oldName}`, 'warn');
+        markCurrentAndAdvance('not-found', '列表中未找到包含完整原标题的播客');
+      }
+      await sleep(STEP_DELAY);
+      return;
+    }
+
+    if (rows.length > 1) {
+      addLog(`发现多个标题都包含完整原标题，为避免误改已跳过：${task.oldName}`, 'warn');
+      markCurrentAndAdvance('duplicate', '多个标题包含完整原标题');
+      await sleep(STEP_DELAY);
+      return;
+    }
+
+    const { edit, titleText } = rows[0];
+    state = readState();
+    if (state && currentTask(state)) currentTask(state).matchedTitle = titleText;
+
+    state.phase = 'opening-edit';
+    state.lastActionAt = Date.now();
+    saveState(state);
+    addLog(`已匹配：${titleText}（包含原标题：${task.oldName}），进入编辑页`);
+    await sleep(450);
+
+    try {
+      if (edit.tagName === 'A' && edit.href) location.href = edit.href;
+      else edit.click();
+    } catch (e) {
+      state = readState();
+      state.running = false;
+      state.phase = 'paused-error';
+      saveState(state);
+      addLog(`点击“编辑”失败：${e.message || e}`, 'error');
+    }
+  }
+
+  function findPodcastNameInput(task) {
+    const inputs = [...document.querySelectorAll('input')].filter((el) => visible(el) && !el.closest(`#${PANEL_ID}`));
+
+    let input = task.matchedTitle ? inputs.find((el) => norm(el.value) === norm(task.matchedTitle)) : null;
+    if (input) return input;
+    input = inputs.find((el) => norm(el.value) === norm(task.newName));
+    if (input) return input;
+    input = inputs.find((el) => norm(el.value).includes(norm(task.oldName)));
+    if (input) return input;
+
+    for (const label of textElementsExact('播客名称')) {
+      let node = label.parentElement;
+      for (let i = 0; i < 5 && node; i++, node = node.parentElement) {
+        const candidate = node.querySelector('input');
+        if (candidate && visible(candidate)) return candidate;
+      }
+    }
+
+    return inputs.find((el) => {
+      const r = el.getBoundingClientRect();
+      return r.width > 300 && r.width < 850 && r.top > 220;
+    }) || null;
+  }
+
+  function findSubmitButton() {
+    return findClickableByText('提交') || [...document.querySelectorAll('button')].find((el) => visible(el) && norm(el.textContent) === '提交') || null;
+  }
+
+  function hasSubmitSuccessToast() {
+    return [...document.querySelectorAll('div,span,p')].some((el) =>
+      visible(el) && !el.closest(`#${PANEL_ID}`) && norm(el.textContent) === '提交成功'
+    );
+  }
+
+  function getNetworkErrorText() {
+    const keys = ['网络异常', '网络错误', '网络不给力', '请求失败', '请求超时', '服务异常', '系统繁忙', '操作失败'];
+    const hit = [...document.querySelectorAll('div,span,p')].find((el) => {
+      if (!visible(el) || el.closest(`#${PANEL_ID}`) || el.children.length > 0) return false;
+      const t = norm(el.textContent);
+      return keys.some((k) => t.includes(k));
+    });
+    return hit ? norm(hit.textContent) : '';
+  }
+
+  function scheduleSubmitRetry(reason) {
+    const state = readState();
+    if (!state) return false;
+    const task = currentTask(state);
+    if (!task) return false;
+
+    const retries = Number(task.submitRetries || 0) + 1;
+    if (retries > MAX_SUBMIT_RETRIES) {
+      state.running = false;
+      state.phase = 'paused-submit-retries-exhausted';
+      saveState(state);
+      addLog(`提交连续失败，已达到最大重试次数 ${MAX_SUBMIT_RETRIES} 次：${task.oldName}。已暂停。`, 'error');
+      return false;
+    }
+
+    task.submitRetries = retries;
+    state.phase = 'retry-submit-after-refresh';
+    state.submittedIndex = state.index;
+    state.submittedAt = 0;
+    state.lastActionAt = Date.now();
+    saveState(state);
+    addLog(`提交异常：${reason}。第 ${retries}/${MAX_SUBMIT_RETRIES} 次自动刷新并重新提交：${task.oldName}`, 'warn');
+
+    // 防止 MutationObserver 在真正刷新前又触发一次提交。
+    submitRefreshScheduled = true;
+    setTimeout(() => location.reload(), RETRY_REFRESH_DELAY);
+    return true;
+  }
+
+  async function processEditPage() {
+    let state = readState();
+    if (!state || !state.running || finishIfDone(state)) return;
+    let task = currentTask(state);
+    if (!task) return;
+
+    const taskNameLen = charLength(task.newName);
+    if (taskNameLen > MAX_NAME_LENGTH) {
+      addLog(`已跳过：新名称${taskNameLen}字符，超过${MAX_NAME_LENGTH}字符：${task.newName}`, 'warn');
+      markCurrentAndAdvance('too-long', `新名称${taskNameLen}字符，超过${MAX_NAME_LENGTH}字符限制`);
+      return;
+    }
+
+    const retryAfterRefresh = state.submittedIndex === state.index && state.phase === 'retry-submit-after-refresh';
+
+    // 正常提交后仍停在编辑页时，先等待；如果已经超过超时阈值，自动刷新后重提。
+    if (state.submittedIndex === state.index && !retryAfterRefresh) {
+      if (hasSubmitSuccessToast()) {
+        await sleep(700);
+        location.href = LIST_URL;
+        return;
+      }
+
+      const networkError = getNetworkErrorText();
+      if (networkError) {
+        scheduleSubmitRetry(networkError);
+        return;
+      }
+
+      const submittedAt = Number(state.submittedAt || 0);
+      if (submittedAt && Date.now() - submittedAt >= SUBMIT_TIMEOUT) {
+        scheduleSubmitRetry('提交后长时间无响应');
+        return;
+      }
+      return;
+    }
+
+    // 如果是“刷新后重试”阶段，允许再次走填写+提交逻辑。
+    if (retryAfterRefresh) {
+      addLog(`刷新完成，准备重新提交：${task.oldName}`, 'warn');
+    }
+
+    const input = await waitFor(() => findPodcastNameInput(task), EDIT_TIMEOUT, 200);
+    if (!input) {
+      state = readState();
+      state.running = false;
+      state.phase = 'paused-error';
+      saveState(state);
+      addLog(`编辑页找不到“播客名称”输入框：${task.oldName}。已暂停。`, 'error');
+      return;
+    }
+
+    const currentValue = norm(input.value);
+    const oldName = norm(task.oldName);
+    const newName = norm(task.newName);
+    const matchedTitle = norm(task.matchedTitle || '');
+    const nameLooksRight = currentValue === newName ||
+      (matchedTitle && currentValue === matchedTitle) ||
+      currentValue.includes(oldName);
+
+    if (!nameLooksRight) {
+      state = readState();
+      state.running = false;
+      state.phase = 'paused-mismatch';
+      saveState(state);
+      addLog(`安全暂停：编辑页名称“${currentValue}”不包含待改原标题“${task.oldName}”。`, 'error');
+      return;
+    }
+
+    if (currentValue !== newName) {
+      input.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      await sleep(300);
+      input.focus();
+      setNativeInputValue(input, task.newName);
+      await sleep(450);
+
+      if (norm(input.value) !== newName) {
+        state = readState();
+        state.running = false;
+        state.phase = 'paused-error';
+        saveState(state);
+        addLog(`名称写入失败，已暂停：${task.oldName}`, 'error');
+        return;
+      }
+      addLog(`已填入新名称：${task.newName}`);
+    } else {
+      addLog(`编辑页已经是目标新名称：${task.newName}`, 'warn');
+    }
+
+    const submit = await waitFor(findSubmitButton, 9000, 200);
+    if (!submit) {
+      state = readState();
+      state.running = false;
+      state.phase = 'paused-error';
+      saveState(state);
+      addLog('找不到“提交”按钮，已暂停。', 'error');
+      return;
+    }
+
+    submit.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    await sleep(350);
+
+    // 点击前先保存提交状态。若提交卡住，后续会自动刷新当前编辑页并重试。
+    state = readState();
+    task = currentTask(state);
+    state.phase = 'awaiting-return';
+    state.submittedIndex = state.index;
+    state.submittedAt = Date.now();
+    state.lastActionAt = Date.now();
+    saveState(state);
+    const retryNo = Number(task && task.submitRetries || 0);
+    addLog(`${retryNo ? `重新提交(${retryNo}/${MAX_SUBMIT_RETRIES})` : '提交'}：${task.oldName} → ${task.newName}`);
+    submit.click();
+
+    const result = await waitFor(() => {
+      if (!isEditPage() || isManagePage()) return 'left-edit';
+      if (hasSubmitSuccessToast()) return 'success';
+      const err = getNetworkErrorText();
+      if (err) return `network-error:${err}`;
+      return null;
+    }, SUBMIT_TIMEOUT, 250);
+
+    if (result === 'left-edit') return;
+
+    if (result === 'success') {
+      await sleep(700);
+      location.href = LIST_URL;
+      return;
+    }
+
+    if (result && result.startsWith('network-error:')) {
+      scheduleSubmitRetry(result.slice('network-error:'.length) || '网络异常');
+      return;
+    }
+
+    // 仍停留在编辑页且既无成功提示也无跳转：按网络卡顿处理，刷新后重新提交。
+    if (isEditPage()) {
+      scheduleSubmitRetry('提交超时，页面仍停留在编辑页');
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s || '').replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+  }
+
+  function buildPanel() {
+    if (document.getElementById(PANEL_ID)) return;
+
+    const panel = document.createElement('div');
+    panel.id = PANEL_ID;
+    panel.innerHTML = `
+      <div class="nr-head">
+        <b>网易云播客批量改名 v3.5</b>
+        <button class="nr-min">－</button>
+      </div>
+      <div class="nr-body">
+        <div class="nr-tip">每行：原书名 <b>Tab</b> 新书名（也支持 -> / =>）</div>
+        <textarea class="nr-input" placeholder="供不起的祖宗\t供不起的祖宗丨民俗丨灵异\n孤坟\t孤坟丨灵异丨惊悚"></textarea>
+        <div class="nr-actions">
+          <button class="nr-start">扫描并开始</button>
+          <button class="nr-pause">暂停</button>
+          <button class="nr-resume">继续当前批次</button>
+          <button class="nr-clear">清空任务</button>
+        </div>
+        <div class="nr-note">\u5148\u626b\u63cf\u5168\u90e8\u5e76\u6392\u9664\u5df2\u66ff\u6362\u9879\u76ee\uff1b\u7136\u540e\u81ea\u52a8\u4ece\u7b2c\u4e00\u6761\u672a\u4fee\u6539\u4efb\u52a1\u5f00\u59cb\uff1b\u65b0\u540d\u79f0\u6700\u591a40\u5b57\u7b26\uff1b\u63d0\u4ea4\u5361\u4f4f\u81ea\u52a8\u5237\u65b0\u91cd\u8bd5\u3002</div>
+        <div class="nr-status"></div>
+        <div class="nr-log"></div>
+      </div>`;
+
+    const style = document.createElement('style');
+    style.textContent = `
+      #${PANEL_ID}{position:fixed;right:18px;bottom:18px;width:450px;z-index:2147483647;background:#181818;color:#eee;border:1px solid #ff3355;border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.35);font:13px/1.5 Arial,"Microsoft YaHei",sans-serif;overflow:hidden}
+      #${PANEL_ID} .nr-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#222;color:#ff4d6d}
+      #${PANEL_ID} .nr-head button{background:transparent;color:#ddd;border:0;font-size:18px;cursor:pointer}
+      #${PANEL_ID} .nr-body{padding:10px}
+      #${PANEL_ID} .nr-tip{color:#bbb;margin-bottom:6px}
+      #${PANEL_ID} textarea{box-sizing:border-box;width:100%;height:145px;resize:vertical;background:#101010;color:#fff;border:1px solid #555;border-radius:6px;padding:8px;outline:none}
+      #${PANEL_ID} .nr-actions{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
+      #${PANEL_ID} .nr-actions button{border:0;border-radius:5px;padding:6px 10px;cursor:pointer}
+      #${PANEL_ID} .nr-start{background:#ff3355;color:#fff}
+      #${PANEL_ID} .nr-pause{background:#ffbd2e;color:#111}
+      #${PANEL_ID} .nr-resume{background:#2ecc71;color:#111}
+      #${PANEL_ID} .nr-clear{background:#666;color:#fff}
+      #${PANEL_ID} .nr-note{color:#67d987;margin:4px 0 8px}
+      #${PANEL_ID} .nr-status{padding:6px 8px;background:#222;border-radius:5px;margin-bottom:8px;color:#ddd}
+      #${PANEL_ID} .nr-log{height:165px;overflow:auto;background:#0f0f0f;border-radius:5px;padding:7px;font-size:12px}
+      #${PANEL_ID} .nr-log div{margin:2px 0;word-break:break-all}
+      #${PANEL_ID} .nr-log .success{color:#67d987}
+      #${PANEL_ID} .nr-log .warn{color:#ffd166}
+      #${PANEL_ID} .nr-log .error{color:#ff6b6b}
+    `;
+    document.head.appendChild(style);
+    document.body.appendChild(panel);
+
+    const textarea = panel.querySelector('.nr-input');
+    const body = panel.querySelector('.nr-body');
+    const minBtn = panel.querySelector('.nr-min');
+
+    const existing = readState();
+    if (existing && existing.rawInput) textarea.value = existing.rawInput;
+
+    minBtn.addEventListener('click', () => {
+      const hidden = body.style.display === 'none';
+      body.style.display = hidden ? '' : 'none';
+      minBtn.textContent = hidden ? '－' : '+';
+    });
+
+    panel.querySelector('.nr-start').addEventListener('click', () => {
+      const { tasks, errors } = parseMappings(textarea.value);
+      if (!tasks.length) {
+        alert('没有识别到有效任务。请每行输入：原书名<Tab>新书名');
+        return;
+      }
+
+      const old = readState();
+      if (old && old.running) {
+        if (!confirm('当前还有批次正在运行。开始新批次会覆盖现有进度，确定吗？')) return;
+      }
+
+      const runnable = tasks.filter((t) => t.status === 'pending').length;
+      const msg = [
+        `共识别 ${tasks.length} 条`,
+        `共需先扫描 ${tasks.length} 条`,
+        `\u626b\u63cf\u540e\u81ea\u52a8\u4ece\u7b2c\u4e00\u6761\u672a\u4fee\u6539\u4efb\u52a1\u5f00\u59cb`,
+        `新名称最多${MAX_NAME_LENGTH}字符，超出会自动跳过`,
+        '标题只要完整包含原标题即可匹配',
+        `提交卡住会自动刷新重试，最多${MAX_SUBMIT_RETRIES}次`,
+        errors.length ? `格式错误 ${errors.length} 行` : '',
+        '',
+        '\u5f00\u59cb\u540e\u5148\u626b\u63cf\u5168\u90e8\u4efb\u52a1\uff1b\u626b\u63cf\u7ed3\u675f\u540e\u81ea\u52a8\u6392\u9664\u5df2\u66ff\u6362\u9879\u76ee\uff0c\u5e76\u4ece\u7b2c\u4e00\u6761\u672a\u4fee\u6539\u4efb\u52a1\u8fde\u7eed\u6539\u540d\u3002',
+        '确定扫描并开始？'
+      ].filter(Boolean).join('\n');
+      if (!confirm(msg)) return;
+
+      const state = {
+        version: '3.5.0',
+        running: true,
+        phase: 'scanning',
+        index: 0,
+        scanIndex: 0,
+        scanCompleted: false,
+        submittedIndex: null,
+        lastCompletedIndex: null,
+        tasks,
+        logs: [],
+        rawInput: textarea.value,
+        createdAt: Date.now(),
+        lastActionAt: Date.now(),
+        doneLogged: false
+      };
+      state.index = nextRunnableIndex(state, 0);
+      saveState(state);
+      addLog(`\u65b0\u6279\u6b21\u542f\u52a8\uff1a\u5171${tasks.length}\u6761\u3002\u5148\u626b\u63cf\u5168\u90e8\u9879\u76ee\uff0c\u7136\u540e\u81ea\u52a8\u4ece\u7b2c\u4e00\u6761\u672a\u4fee\u6539\u4efb\u52a1\u5f00\u59cb\u3002`);
+      errors.forEach((e) => addLog(e, 'warn'));
+      scheduleRoute(50);
+    });
+
+    panel.querySelector('.nr-pause').addEventListener('click', () => {
+      const state = readState();
+      if (!state) return;
+      state.running = false;
+      state.phase = 'paused-user';
+      saveState(state);
+      addLog('用户手动暂停。', 'warn');
+    });
+
+    panel.querySelector('.nr-resume').addEventListener('click', () => {
+      const state = readState();
+      if (!state || !Array.isArray(state.tasks) || !state.tasks.length) {
+        alert('没有可继续的批次。');
+        return;
+      }
+      if (state.phase === 'done' || state.index >= state.tasks.length) {
+        alert('这个批次已经全部完成。');
+        return;
+      }
+      // 关键：继续只恢复原进度，绝不重建任务、绝不把 index 改回0。
+      state.running = true;
+      if (String(state.phase).startsWith('paused')) {
+        if (!state.scanCompleted) state.phase = 'scanning';
+        else state.phase = state.submittedIndex != null ? 'awaiting-return' : (isEditPage() ? 'opening-edit' : 'search');
+      }
+      saveState(state);
+      addLog(`继续当前批次，从第${state.index + 1}条继续。`);
+      scheduleRoute(50);
+    });
+
+    panel.querySelector('.nr-clear').addEventListener('click', () => {
+      if (!confirm('确定清空当前批次、进度和日志吗？')) return;
+      clearState();
+      textarea.value = '';
+    });
+
+    refreshPanel();
+  }
+
+  function refreshPanel() {
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) return;
+    const state = readState();
+    const status = panel.querySelector('.nr-status');
+    const log = panel.querySelector('.nr-log');
+
+    if (!state) {
+      status.textContent = `\u672a\u8fd0\u884c\uff5c\u5148\u626b\u63cf\u5df2\u66ff\u6362\uff5c\u81ea\u52a8\u4ece\u9996\u6761\u672a\u4fee\u6539\u5f00\u59cb\uff5c\u65b0\u540d\u2264${MAX_NAME_LENGTH}\u5b57\u7b26\uff5c\u63d0\u4ea4\u5931\u8d25\u81ea\u52a8\u91cd\u8bd5`;
+      log.innerHTML = '<div>等待输入任务。</div>';
+      return;
+    }
+
+    const counts = {};
+    state.tasks.forEach((t) => { counts[t.status] = (counts[t.status] || 0) + 1; });
+    const task = currentTask(state);
+    const shownIndex = state.index >= state.tasks.length ? state.tasks.length : state.index + 1;
+    const scanShown = Math.min(Number(state.scanIndex || 0), state.tasks.length);
+
+    status.innerHTML = [
+      state.running ? '自动运行中' : (state.phase === 'done' ? '已完成' : '已暂停'),
+      state.scanCompleted ? `改名进度 ${shownIndex}/${state.tasks.length}` : `扫描进度 ${scanShown}/${state.tasks.length}`,
+      `已替换 ${counts['already-done'] || 0}`,
+      `完成 ${counts.done || 0}`,
+      `未找到 ${counts['not-found'] || 0}`,
+      `重复 ${counts.duplicate || 0}`,
+      `超40字符 ${counts['too-long'] || 0}`,
+      `阶段 ${escapeHtml(state.phase || '')}`,
+      task ? `<br>当前：${escapeHtml(task.oldName)} → ${escapeHtml(task.newName)}` : ''
+    ].join(' ｜ ');
+
+    const logs = Array.isArray(state.logs) ? state.logs : [];
+    log.innerHTML = logs.slice(-100).map((x) =>
+      `<div class="${x.type || ''}">[${escapeHtml(x.time)}] ${escapeHtml(x.message)}</div>`
+    ).join('');
+    log.scrollTop = log.scrollHeight;
+  }
+
+  let routing = false;
+  let scheduled = null;
+
+  function scheduleRoute(delay = 100) {
+    if (scheduled) clearTimeout(scheduled);
+    scheduled = setTimeout(() => {
+      scheduled = null;
+      route();
+    }, delay);
+  }
+
+  async function route() {
+    if (routing || submitRefreshScheduled) return;
+    const state = readState();
+    if (!state || !state.running) return;
+
+    routing = true;
+    try {
+      if (isManagePage()) await processManagePage();
+      else if (isEditPage()) await processEditPage();
+    } catch (e) {
+      const s = readState();
+      if (s) {
+        s.running = false;
+        s.phase = 'paused-exception';
+        saveState(s);
+      }
+      addLog(`脚本异常：${e && e.message ? e.message : e}`, 'error');
+    } finally {
+      routing = false;
+      // 只要还在运行，就自动继续，不再依赖用户点击。
+      const s = readState();
+      if (s && s.running && s.phase !== 'done') scheduleRoute(AUTO_TICK);
+    }
+  }
+
+  function hookSpaNavigation() {
+    const wrap = (name) => {
+      const original = history[name];
+      if (typeof original !== 'function') return;
+      history[name] = function () {
+        const ret = original.apply(this, arguments);
+        setTimeout(() => scheduleRoute(150), 0);
+        return ret;
+      };
+    };
+    wrap('pushState');
+    wrap('replaceState');
+    window.addEventListener('popstate', () => scheduleRoute(150));
+    window.addEventListener('hashchange', () => scheduleRoute(150));
+
+    // 网易云有时只换 DOM 不触发完整页面刷新，用 MutationObserver 兜底。
+    const observer = new MutationObserver(() => {
+      const s = readState();
+      if (s && s.running) scheduleRoute(250);
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  async function init() {
+    await waitFor(() => document.body, 10000);
+    buildPanel();
+    hookSpaNavigation();
+    refreshPanel();
+
+    // 页面刷新/跳转后自动恢复，不需要再点击“继续”。
+    const state = readState();
+    if (state && state.running) {
+      if (!state.scanCompleted) addLog(`页面载入，自动恢复扫描第${Math.min(Number(state.scanIndex || 0) + 1, state.tasks.length)}条。`);
+      else addLog(`页面载入，自动恢复改名第${Math.min(state.index + 1, state.tasks.length)}条。`);
+      scheduleRoute(600);
+    }
+  }
+
+  init();
+})();

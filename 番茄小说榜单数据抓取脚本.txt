@@ -1,0 +1,732 @@
+// ==UserScript==
+// @name         番茄小说榜单抓取助手-动态全量分表版
+// @namespace    fyf.local
+// @version      0.5.0
+// @description  自动识别当前榜单实际加载的全部条目，有多少抓多少；切换榜单后继续抓取；导出Excel时不同榜单分别保存到不同工作表。仅保存：榜单名字、书名、作者、简介。
+// @author       ChatGPT
+// @match        https://fanqienovel.com/rank*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_setClipboard
+// @connect      fanqienovel.com
+// @connect      raw.githubusercontent.com
+// @connect      cdn.jsdelivr.net
+// @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const PUA_MAP_URLS = [
+    'https://cdn.jsdelivr.net/gh/wengchengjian/fanqie-rank-mcp@master/pua_map.py',
+    'https://raw.githubusercontent.com/wengchengjian/fanqie-rank-mcp/master/pua_map.py',
+  ];
+  const PUA_CACHE_KEY = '__fyf_fanqie_pua_map_v1__';
+  const PANEL_ID = 'fyf-fanqie-rank-panel';
+
+  // 不写死榜单条数：先自动滚动当前榜单页面，识别这个榜单实际有多少本，再按这个数量抓取。
+  const PAGE_SIZE = 10;
+  const PAGE_INTERVAL = 250;
+  const SCROLL_INTERVAL = 420;
+  const BOTTOM_STABLE_ROUNDS = 4;
+
+  let puaMap = new Map();
+  let preferredAppId = '1967';
+  let currentRows = [];
+  let currentRankingName = '';
+
+  // 关键：不同榜单分别保存，不混在一起。
+  // key = 榜单名字；value = 当前榜单的全部数据。
+  const rankingGroups = new Map();
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const clean = (v) => String(v ?? '').replace(/\s+/g, ' ').trim();
+
+  function setStatus(text, type = 'normal') {
+    const el = document.querySelector('#fyf-fq-status');
+    if (!el) return;
+    el.textContent = text;
+    el.dataset.type = type;
+  }
+
+  function decryptPua(text) {
+    if (!text || puaMap.size === 0) return String(text || '');
+    let out = '';
+    for (const ch of String(text)) {
+      out += puaMap.get(ch.codePointAt(0)) ?? ch;
+    }
+    return out;
+  }
+
+  function loadPuaMapFromCache() {
+    try {
+      const raw = localStorage.getItem(PUA_CACHE_KEY);
+      if (!raw) return false;
+      const obj = JSON.parse(raw);
+      const entries = Object.entries(obj).map(([k, v]) => [Number(k), v]);
+      if (entries.length < 100) return false;
+      puaMap = new Map(entries);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function gmGetText(url, headers = {}) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        headers,
+        timeout: 15000,
+        onload: (res) => {
+          if (res.status >= 200 && res.status < 300) resolve(res.responseText);
+          else reject(new Error(`HTTP ${res.status}`));
+        },
+        onerror: () => reject(new Error('网络请求失败')),
+        ontimeout: () => reject(new Error('网络请求超时')),
+      });
+    });
+  }
+
+  async function ensurePuaMap() {
+    if (puaMap.size > 100) return true;
+    if (loadPuaMapFromCache()) return true;
+
+    try {
+      setStatus('正在加载字体解码表…');
+      let py = '';
+      for (const url of PUA_MAP_URLS) {
+        try {
+          py = await gmGetText(url);
+          if (py) break;
+        } catch (_) {}
+      }
+      if (!py) throw new Error('无法下载解码表');
+
+      const map = new Map();
+      const re = /(\d+)\s*:\s*"((?:\\.|[^"\\])*)"/g;
+      let m;
+      while ((m = re.exec(py))) {
+        let value = m[2];
+        try { value = JSON.parse(`"${value}"`); } catch (_) {}
+        map.set(Number(m[1]), value);
+      }
+      if (map.size < 100) throw new Error('解码表解析失败');
+
+      puaMap = map;
+      try {
+        localStorage.setItem(PUA_CACHE_KEY, JSON.stringify(Object.fromEntries(map)));
+      } catch (_) {}
+      return true;
+    } catch (err) {
+      console.warn('[番茄榜单抓取] 字体解码表加载失败：', err);
+      setStatus('字体解码失败，仍继续抓取', 'warn');
+      return false;
+    }
+  }
+
+  function parseRankingContext() {
+    const pathMatch = location.pathname.match(/^\/rank(?:\/([^/?#]+))?/);
+    const rankingId = pathMatch?.[1] || '';
+    let gender = '', rankMold = '', categoryId = '';
+
+    if (/^-?\d+_\d+_\d+$/.test(rankingId)) {
+      [gender, rankMold, categoryId] = rankingId.split('_');
+    }
+
+    let rankingName = clean(
+      document.title
+        .replace(/_番茄小说官网.*$/, '')
+        .replace(/小说排行榜.*$/, '')
+    );
+
+    if (!rankingName || rankingName === '小说排行榜') {
+      const lines = (document.body?.innerText || '').split(/\n+/).map(clean);
+      rankingName = lines.find((x) =>
+        /(?:男频|女频).*(?:阅读榜|新书榜)/.test(x) && x.length <= 60
+      ) || rankingId || '番茄排行榜';
+    }
+
+    return { rankingId, rankingName, gender, rankMold, categoryId };
+  }
+
+  function getRankVersion(ctx) {
+    try {
+      const urls = performance.getEntriesByType('resource')
+        .map((e) => e.name)
+        .filter((u) => u.includes('/api/rank/category/list'));
+
+      for (let i = urls.length - 1; i >= 0; i--) {
+        const url = new URL(urls[i]);
+        if (ctx.categoryId && url.searchParams.get('category_id') !== String(ctx.categoryId)) continue;
+        if (ctx.gender !== '' && url.searchParams.get('gender') !== String(ctx.gender)) continue;
+        if (ctx.rankMold !== '' && url.searchParams.get('rankMold') !== String(ctx.rankMold)) continue;
+        return url.searchParams.get('rank_version') || '';
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  function firstValue(obj, keys, fallback = '') {
+    for (const key of keys) {
+      const value = obj?.[key];
+      if (value !== undefined && value !== null && String(value).trim() !== '') return value;
+    }
+    return fallback;
+  }
+
+  function getBookKey(item) {
+    const id = firstValue(item, ['bookId', 'book_id', 'bookID', 'id']);
+    if (id) return `id:${id}`;
+    const title = clean(decryptPua(firstValue(item, ['bookName', 'book_name', 'title'])));
+    const author = clean(decryptPua(firstValue(item, ['author', 'author_name', 'authorName'])));
+    return `ta:${title}|${author}`;
+  }
+
+  function apiItemToRow(item, rankingName) {
+    return {
+      榜单名字: rankingName,
+      书名: clean(decryptPua(firstValue(item, ['bookName', 'book_name', 'book_name_show', 'title']))),
+      作者: clean(decryptPua(firstValue(item, ['author', 'author_name', 'authorName']))),
+      简介: clean(decryptPua(firstValue(item, ['abstract', 'description', 'book_abstract', 'bookAbstract']))),
+    };
+  }
+
+  function buildRankApiUrl(ctx, offset, limit, appId, rankVersion) {
+    const q = new URLSearchParams();
+    q.set('app_id', appId);
+    q.set('rank_list_type', '3');
+    q.set('offset', String(offset));
+    q.set('limit', String(limit));
+    q.set('category_id', String(ctx.categoryId));
+    q.set('rank_version', rankVersion || '');
+    q.set('gender', String(ctx.gender));
+    q.set('rankMold', String(ctx.rankMold));
+    return `https://fanqienovel.com/api/rank/category/list?${q.toString()}`;
+  }
+
+  async function requestRankPage(ctx, offset, limit, appId, rankVersion) {
+    const url = buildRankApiUrl(ctx, offset, limit, appId, rankVersion);
+    const text = await gmGetText(url, {
+      Accept: 'application/json, text/plain, */*',
+      Referer: location.href,
+    });
+
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch (_) {
+      throw new Error('接口返回内容不是 JSON');
+    }
+
+    const code = json?.code;
+    const list = json?.data?.book_list;
+    if (code !== 0 || !Array.isArray(list)) {
+      throw new Error(`接口返回异常 code=${code ?? '未知'}`);
+    }
+
+    return list;
+  }
+
+  async function fetchRankPage(ctx, offset, limit, rankVersion) {
+    const tryIds = preferredAppId === '1967' ? ['1967', '2503'] : ['2503', '1967'];
+    let lastErr = null;
+
+    for (const appId of tryIds) {
+      try {
+        const result = await requestRankPage(ctx, offset, limit, appId, rankVersion);
+        preferredAppId = appId;
+        return result;
+      } catch (err) {
+        lastErr = err;
+        console.warn(`[番茄榜单抓取] app_id=${appId} 请求失败：`, err);
+      }
+    }
+
+    throw lastErr || new Error('榜单接口请求失败');
+  }
+
+  // 按页面实际识别到的条数抓取，不写死30/50/100。
+  async function fetchExpectedCount(ctx, expectedCount) {
+    if (!ctx.categoryId || ctx.gender === '' || ctx.rankMold === '') {
+      throw new Error('无法从当前网址识别榜单参数');
+    }
+    if (!Number.isFinite(expectedCount) || expectedCount <= 0) {
+      throw new Error('没有识别到当前榜单条数');
+    }
+
+    const rankVersion = getRankVersion(ctx);
+    const allItems = [];
+    const seen = new Set();
+    let offset = 0;
+    let requestNo = 0;
+
+    while (allItems.length < expectedCount) {
+      requestNo++;
+      const need = expectedCount - allItems.length;
+      const limit = Math.min(PAGE_SIZE, need);
+      setStatus(`正在抓取“${ctx.rankingName}”：${allItems.length}/${expectedCount}…`);
+
+      const list = await fetchRankPage(ctx, offset, limit, rankVersion);
+      if (!list.length) break;
+
+      let newCount = 0;
+      for (const item of list) {
+        const key = getBookKey(item);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        allItems.push(item);
+        newCount++;
+        if (allItems.length >= expectedCount) break;
+      }
+
+      console.log(`[番茄榜单抓取] 第${requestNo}批：返回${list.length}，新增${newCount}，累计${allItems.length}/${expectedCount}`);
+
+      if (newCount === 0) break;
+      offset += list.length;
+      if (allItems.length < expectedCount) await sleep(PAGE_INTERVAL);
+    }
+
+    return allItems.slice(0, expectedCount);
+  }
+
+  // DOM模式：自动滚动当前榜单页面，逐步收集所有榜单卡片。
+  function findBookCard(bookId) {
+    const links = [...document.querySelectorAll('a[href]')].filter((a) => {
+      const href = a.getAttribute('href') || '';
+      return href === `/page/${bookId}` || href.endsWith(`/page/${bookId}`);
+    });
+
+    for (const a of links) {
+      let el = a;
+      for (let depth = 0; depth < 10 && el; depth++, el = el.parentElement) {
+        const text = clean(decryptPua(el.innerText || ''));
+        if (/在读[:：]/.test(text) && /最近更新[:：]/.test(text)) return el;
+      }
+    }
+    return null;
+  }
+
+  function findDescriptionInCard(card, title, author) {
+    const candidates = [...card.querySelectorAll('p, div, span')]
+      .map((el) => clean(decryptPua(el.innerText || '')))
+      .filter((text) => {
+        if (text.length < 20) return false;
+        if (/在读[:：]|最近更新[:：]|连载中|已完结/.test(text)) return false;
+        if (title && text === title) return false;
+        if (author && text === author) return false;
+        return true;
+      })
+      .map((text) => ({
+        text,
+        score:
+          (text.length > 40 ? 5 : 0) +
+          (text.length < 1000 ? 4 : 0) -
+          (title && text.includes(title) ? 6 : 0) -
+          (author && text.includes(author) ? 4 : 0),
+      }))
+      .sort((a, b) => b.score - a.score || a.text.length - b.text.length);
+
+    return candidates[0]?.text || '';
+  }
+
+  function parseDomEntries(rankingName) {
+    const bookLinks = [...document.querySelectorAll('a[href^="/page/"]')]
+      .filter((a) => /^\/page\/\d+\/?$/.test(a.getAttribute('href') || ''));
+
+    const seen = new Set();
+    const result = [];
+
+    for (const a of bookLinks) {
+      const m = (a.getAttribute('href') || '').match(/^\/page\/(\d+)/);
+      const bookId = m?.[1];
+      if (!bookId || seen.has(bookId)) continue;
+
+      const card = findBookCard(bookId);
+      if (!card) continue;
+      seen.add(bookId);
+
+      const sameLinks = [...card.querySelectorAll(`a[href="/page/${bookId}"]`)];
+      const title = clean(decryptPua(
+        sameLinks.map((x) => x.innerText).find((x) => clean(x)) || a.innerText || ''
+      ));
+      const authorLink = card.querySelector('a[href*="/author-page/"]');
+      const author = clean(decryptPua(authorLink?.innerText || ''));
+      const intro = findDescriptionInCard(card, title, author);
+
+      result.push({
+        bookId,
+        row: {
+          榜单名字: rankingName,
+          书名: title,
+          作者: author,
+          简介: intro,
+        },
+      });
+    }
+
+    return result;
+  }
+
+  function parseDomRows(rankingName) {
+    return parseDomEntries(rankingName).map((x) => x.row);
+  }
+
+  async function scanAllCurrentRankingRows(rankingName) {
+    const originalY = window.scrollY;
+    const collected = new Map();
+    let bottomStable = 0;
+    let lastHeight = 0;
+
+    const collect = () => {
+      let added = 0;
+      for (const entry of parseDomEntries(rankingName)) {
+        if (!collected.has(entry.bookId)) added++;
+        collected.set(entry.bookId, entry.row);
+      }
+      return added;
+    };
+
+    try {
+      window.scrollTo({ top: 0, behavior: 'auto' });
+      await sleep(500);
+
+      while (true) {
+        const addedBefore = collect();
+        const doc = document.documentElement;
+        const heightBefore = Math.max(doc.scrollHeight, document.body?.scrollHeight || 0);
+        const viewport = Math.max(window.innerHeight || 800, 600);
+        const yBefore = window.scrollY;
+        const nearBottomBefore = yBefore + viewport >= heightBefore - 8;
+
+        setStatus(`正在识别“${rankingName}”实际数量：已发现 ${collected.size} 本…`);
+
+        if (!nearBottomBefore) {
+          window.scrollTo({
+            top: Math.min(yBefore + Math.floor(viewport * 0.82), heightBefore),
+            behavior: 'auto',
+          });
+        } else {
+          window.scrollTo({ top: heightBefore, behavior: 'auto' });
+        }
+
+        await sleep(SCROLL_INTERVAL);
+
+        const addedAfter = collect();
+        const heightAfter = Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0);
+        const nearBottomAfter = window.scrollY + viewport >= heightAfter - 8;
+        const noNew = addedBefore === 0 && addedAfter === 0;
+        const heightStable = heightAfter === heightBefore && heightAfter === lastHeight;
+
+        if (nearBottomAfter && noNew && heightStable) bottomStable++;
+        else bottomStable = 0;
+
+        lastHeight = heightAfter;
+        if (bottomStable >= BOTTOM_STABLE_ROUNDS) break;
+      }
+
+      await sleep(250);
+      collect();
+      return [...collected.values()];
+    } finally {
+      window.scrollTo({ top: originalY, behavior: 'auto' });
+    }
+  }
+
+  function mergeRowsByPosition(apiRows, domRows, rankingName) {
+    const count = Math.max(apiRows.length, domRows.length);
+    const merged = [];
+    for (let i = 0; i < count; i++) {
+      const a = apiRows[i] || {};
+      const d = domRows[i] || {};
+      const row = {
+        榜单名字: rankingName,
+        书名: a.书名 || d.书名 || '',
+        作者: a.作者 || d.作者 || '',
+        简介: a.简介 || d.简介 || '',
+      };
+      if (row.书名 || row.作者 || row.简介) merged.push(row);
+    }
+    return merged;
+  }
+
+  async function captureCurrentRanking() {
+    const ctx = parseRankingContext();
+    currentRankingName = ctx.rankingName;
+    currentRows = [];
+
+    setStatus(`准备识别“${ctx.rankingName}”实际条数…`);
+    await ensurePuaMap();
+
+    const domRows = await scanAllCurrentRankingRows(ctx.rankingName);
+    const expectedCount = domRows.length;
+
+    if (!expectedCount) {
+      const err = new Error('没有在当前页面识别到榜单书籍');
+      setStatus(`抓取失败：${err.message}`, 'error');
+      throw err;
+    }
+
+    setStatus(`已识别“${ctx.rankingName}”共 ${expectedCount} 本，正在读取完整字段…`);
+
+    try {
+      const items = await fetchExpectedCount(ctx, expectedCount);
+      const apiRows = items
+        .map((item) => apiItemToRow(item, ctx.rankingName))
+        .filter((r) => r.书名 || r.作者 || r.简介);
+
+      currentRows = mergeRowsByPosition(apiRows, domRows, ctx.rankingName).slice(0, expectedCount);
+      rankingGroups.set(ctx.rankingName, currentRows);
+      renderPreview(currentRows);
+      renderSavedGroups();
+      setStatus(`已保存“${ctx.rankingName}”：${currentRows.length}本；共${rankingGroups.size}个榜单`, 'ok');
+      console.table(currentRows);
+      return currentRows;
+    } catch (apiErr) {
+      console.warn('[番茄榜单抓取] 接口模式失败，直接使用已完整扫描的DOM数据：', apiErr);
+      currentRows = domRows;
+      rankingGroups.set(ctx.rankingName, currentRows);
+      renderPreview(currentRows);
+      renderSavedGroups();
+      setStatus(`接口读取失败，已按网页实际数量保存 ${currentRows.length} 本；共${rankingGroups.size}个榜单`, 'warn');
+      return currentRows;
+    }
+  }
+
+  function safeFilename(value) {
+    return String(value || '番茄榜单')
+      .replace(/[\\/:*?"<>|]/g, '_')
+      .replace(/\s+/g, '_')
+      .slice(0, 80);
+  }
+
+  function safeSheetName(name, usedNames) {
+    let base = String(name || '榜单')
+      .replace(/[\\\/?*\[\]:]/g, '_')
+      .trim()
+      .slice(0, 31) || '榜单';
+
+    let result = base;
+    let n = 2;
+    while (usedNames.has(result)) {
+      const suffix = `_${n++}`;
+      result = base.slice(0, Math.max(1, 31 - suffix.length)) + suffix;
+    }
+    usedNames.add(result);
+    return result;
+  }
+
+  function exportExcel() {
+    if (!rankingGroups.size) {
+      setStatus('还没有抓取任何榜单，请先点“抓取当前榜单”', 'warn');
+      return;
+    }
+
+    if (typeof XLSX === 'undefined') {
+      setStatus('Excel组件没有加载成功，请刷新页面后重试', 'error');
+      return;
+    }
+
+    const headers = ['榜单名字', '书名', '作者', '简介'];
+    const wb = XLSX.utils.book_new();
+    const usedNames = new Set();
+
+    for (const [rankingName, data] of rankingGroups.entries()) {
+      const normalized = data.map((row) => ({
+        榜单名字: row.榜单名字 || rankingName,
+        书名: row.书名 || '',
+        作者: row.作者 || '',
+        简介: row.简介 || '',
+      }));
+
+      const ws = XLSX.utils.json_to_sheet(normalized, { header: headers });
+      ws['!cols'] = [
+        { wch: 28 },
+        { wch: 38 },
+        { wch: 20 },
+        { wch: 100 },
+      ];
+      ws['!autofilter'] = { ref: `A1:D${normalized.length + 1}` };
+
+      const sheetName = safeSheetName(rankingName, usedNames);
+      XLSX.utils.book_append_sheet(wb, ws, sheetName);
+    }
+
+    const now = new Date();
+    const stamp = [
+      now.getFullYear(),
+      String(now.getMonth() + 1).padStart(2, '0'),
+      String(now.getDate()).padStart(2, '0'),
+      '-',
+      String(now.getHours()).padStart(2, '0'),
+      String(now.getMinutes()).padStart(2, '0'),
+    ].join('');
+
+    const total = [...rankingGroups.values()].reduce((sum, arr) => sum + arr.length, 0);
+    XLSX.writeFile(wb, `番茄榜单_分表_${stamp}.xlsx`);
+    setStatus(`Excel已导出：${rankingGroups.size}个工作表，共${total}本`, 'ok');
+  }
+
+  async function copyCurrentJson() {
+    if (!currentRows.length) {
+      setStatus('当前榜单还没抓取', 'warn');
+      return;
+    }
+
+    const text = JSON.stringify(currentRows, null, 2);
+    try {
+      if (typeof GM_setClipboard === 'function') GM_setClipboard(text, 'text');
+      else await navigator.clipboard.writeText(text);
+      setStatus(`当前榜单JSON已复制：${currentRows.length}本`, 'ok');
+    } catch (err) {
+      console.error(err);
+      setStatus('复制失败', 'error');
+    }
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;',
+    }[c]));
+  }
+
+  function renderPreview(data) {
+    const box = document.querySelector('#fyf-fq-preview');
+    if (!box) return;
+
+    if (!data.length) {
+      box.innerHTML = '<div class="fyf-empty">当前榜单暂无数据</div>';
+      return;
+    }
+
+    box.innerHTML = data.slice(0, 8).map((row, idx) => `
+      <div class="fyf-row">
+        <div class="fyf-main">
+          <div class="fyf-title">${String(idx + 1).padStart(2, '0')} · ${escapeHtml(row.书名 || '(未识别书名)')}</div>
+          <div class="fyf-author">${escapeHtml(row.作者 || '')}</div>
+          <div class="fyf-intro">${escapeHtml(row.简介 || '')}</div>
+        </div>
+      </div>
+    `).join('') + (data.length > 8
+      ? `<div class="fyf-more">当前榜单共 ${data.length} 本，另有 ${data.length - 8} 本未展开</div>`
+      : '');
+  }
+
+  function renderSavedGroups() {
+    const box = document.querySelector('#fyf-fq-groups');
+    if (!box) return;
+
+    if (!rankingGroups.size) {
+      box.innerHTML = '尚未保存榜单';
+      return;
+    }
+
+    box.innerHTML = [...rankingGroups.entries()]
+      .map(([name, data]) => `<div>• ${escapeHtml(name)}：${data.length}本</div>`)
+      .join('');
+  }
+
+  function createPanel() {
+    if (document.getElementById(PANEL_ID)) return;
+
+    const style = document.createElement('style');
+    style.textContent = `
+      #${PANEL_ID}{position:fixed;right:22px;bottom:22px;width:380px;z-index:2147483647;background:rgba(25,28,36,.96);color:#fff;border-radius:14px;box-shadow:0 12px 36px rgba(0,0,0,.25);font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;overflow:hidden}
+      #${PANEL_ID} *{box-sizing:border-box}
+      #${PANEL_ID} .fyf-head{padding:12px 14px 8px;font-weight:700;font-size:14px}
+      #${PANEL_ID} .fyf-sub{display:block;margin-top:3px;color:#9fa7b6;font-size:11px;font-weight:400}
+      #${PANEL_ID} .fyf-actions{padding:8px 12px;display:grid;grid-template-columns:1fr 1fr;gap:8px}
+      #${PANEL_ID} button{border:0;border-radius:9px;padding:9px 8px;cursor:pointer;background:#3c4352;color:#fff;font-weight:600}
+      #${PANEL_ID} button.fyf-primary{background:#ff6a3d}
+      #${PANEL_ID} #fyf-fq-status{margin:0 12px 8px;padding:7px 9px;background:#1e222b;border-radius:8px;color:#c7ceda;font-size:12px}
+      #${PANEL_ID} #fyf-fq-status[data-type="ok"]{color:#a9f0bd}
+      #${PANEL_ID} #fyf-fq-status[data-type="warn"]{color:#ffe08a}
+      #${PANEL_ID} #fyf-fq-status[data-type="error"]{color:#ff9f9f}
+      #${PANEL_ID} .fyf-groups-wrap{margin:0 12px 8px;padding:7px 9px;background:#20252f;border-radius:8px;color:#aeb6c4;font-size:11px;max-height:92px;overflow:auto}
+      #${PANEL_ID} .fyf-groups-title{font-weight:700;color:#d9dee8;margin-bottom:3px}
+      #${PANEL_ID} #fyf-fq-preview{max-height:260px;overflow:auto;border-top:1px solid rgba(255,255,255,.08)}
+      #${PANEL_ID} .fyf-row{padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.06)}
+      #${PANEL_ID} .fyf-title{font-weight:700}
+      #${PANEL_ID} .fyf-author{color:#b5bdca;font-size:12px;margin-top:2px}
+      #${PANEL_ID} .fyf-intro{color:#8f98a8;font-size:11px;margin-top:5px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+      #${PANEL_ID} .fyf-more,#${PANEL_ID} .fyf-empty{padding:10px 12px;color:#9fa7b6;text-align:center}
+    `;
+    document.head.appendChild(style);
+
+    const panel = document.createElement('div');
+    panel.id = PANEL_ID;
+    panel.innerHTML = `
+      <div class="fyf-head">
+        番茄榜单抓取助手 · 动态全量分表版
+        <span class="fyf-sub">当前榜单有多少抓多少；切换榜单后继续保存；Excel按榜单分工作表</span>
+      </div>
+      <div class="fyf-actions">
+        <button class="fyf-primary" id="fyf-fq-capture">抓取当前榜单（全部）</button>
+        <button id="fyf-fq-export">导出Excel（分表）</button>
+        <button id="fyf-fq-copy">复制当前JSON</button>
+        <button id="fyf-fq-clear">清空全部榜单</button>
+      </div>
+      <div id="fyf-fq-status">等待抓取</div>
+      <div class="fyf-groups-wrap">
+        <div class="fyf-groups-title">本次已保存榜单</div>
+        <div id="fyf-fq-groups">尚未保存榜单</div>
+      </div>
+      <div id="fyf-fq-preview"><div class="fyf-empty">点击“抓取当前榜单（全部）”</div></div>
+    `;
+    document.body.appendChild(panel);
+
+    panel.querySelector('#fyf-fq-capture').addEventListener('click', () =>
+      captureCurrentRanking().catch(console.error)
+    );
+    panel.querySelector('#fyf-fq-export').addEventListener('click', () => {
+      try { exportExcel(); } catch (err) {
+        console.error(err);
+        setStatus(`Excel导出失败：${err.message || err}`, 'error');
+      }
+    });
+    panel.querySelector('#fyf-fq-copy').addEventListener('click', () =>
+      copyCurrentJson().catch(console.error)
+    );
+    panel.querySelector('#fyf-fq-clear').addEventListener('click', () => {
+      currentRows = [];
+      currentRankingName = '';
+      rankingGroups.clear();
+      renderPreview([]);
+      renderSavedGroups();
+      setStatus('已清空本次保存的全部榜单');
+    });
+  }
+
+  // 番茄是单页应用。切换左侧分类后，保留之前已抓榜单，只清空“当前预览”。
+  function watchSpaNavigation() {
+    let lastUrl = location.href;
+    setInterval(() => {
+      if (location.href === lastUrl) return;
+      lastUrl = location.href;
+      currentRows = [];
+      currentRankingName = '';
+      setTimeout(() => {
+        renderPreview([]);
+        setStatus(`已切换榜单；之前${rankingGroups.size}个榜单仍保留，请抓取当前榜单`);
+      }, 700);
+    }, 500);
+  }
+
+  function init() {
+    createPanel();
+    renderSavedGroups();
+    watchSpaNavigation();
+    setTimeout(() => ensurePuaMap(), 800);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init, { once: true });
+  } else {
+    init();
+  }
+})();

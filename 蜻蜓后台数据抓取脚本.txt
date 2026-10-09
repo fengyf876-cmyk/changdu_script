@@ -1,0 +1,2169 @@
+// ==UserScript==
+// @name         青蜓FM总体数据导出（断点续跑版｜认证修复）
+// @namespace    https://admin.qingting.fm/
+// @version      0.2.4-checkpoint
+// @description  仅抓取青蜓FM“总体数据”。支持持久断点：刷新/关闭后保留进度和已抓数据，恢复时重新捕获认证并续跑；仅点击“清空断点”才删除。
+// @match        https://admin.qingting.fm/*
+// @run-at       document-start
+// @grant        GM_xmlhttpRequest
+// @grant        GM_registerMenuCommand
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        unsafeWindow
+// @connect      papi.qingting.fm
+// @connect      cdn.jsdelivr.net
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  const VERSION = "0.2.4-checkpoint";
+  const PANEL_ID = "qt-overall-checkpoint-v024";
+  const STORAGE_KEY = "QT_OVERALL_CHECKPOINT_STATE";
+  const PAGE_SIZE = 50;
+  const MAX_RETRY = 4;
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const cleanText = (value) =>
+    String(value == null ? "" : value)
+      .replace(/\u00a0/g, " ")
+      .replace(/\r/g, "")
+      .replace(/[ \t]+/g, " ")
+      .trim();
+
+  const nowText = () => new Date().toLocaleString();
+
+  let apiContext = null;
+  let probeInstalled = false;
+  let running = false;
+  let runGeneration = 0;
+  let panel = null;
+  let ui = {};
+  let XLSX_LIB = null;
+
+  const newState = () => ({
+    schemaVersion: 1,
+    active: false,
+    paused: false,
+    phase: "overview",
+    startedAt: "",
+    updatedAt: "",
+    overview: null,
+    albums: [],
+    albumIndex: 0,
+    records: [],
+    failures: [],
+    logs: [],
+    current: {
+      albumId: "",
+      albumName: "",
+      stage: "等待开始",
+      innerPercent: 0,
+    },
+  });
+
+  const normalizeState = (saved) => {
+    const base = newState();
+
+    if (!saved || typeof saved !== "object") {
+      return base;
+    }
+
+    const merged = {
+      ...base,
+      ...saved,
+      current: {
+        ...base.current,
+        ...(saved.current && typeof saved.current === "object"
+          ? saved.current
+          : {}),
+      },
+    };
+
+    merged.albums = Array.isArray(saved.albums) ? saved.albums : [];
+    merged.records = Array.isArray(saved.records) ? saved.records : [];
+    merged.failures = Array.isArray(saved.failures) ? saved.failures : [];
+    merged.logs = Array.isArray(saved.logs) ? saved.logs.slice(-300) : [];
+    merged.albumIndex = Math.max(0, Number(saved.albumIndex || 0));
+
+    if (!["overview", "auth", "album_list", "albums_run", "done"].includes(merged.phase)) {
+      merged.phase = "overview";
+    }
+
+    if (merged.phase === "done") {
+      merged.active = false;
+      merged.paused = false;
+    }
+
+    return merged;
+  };
+
+  const loadCheckpoint = () => {
+    try {
+      return normalizeState(
+        GM_getValue(STORAGE_KEY, null)
+      );
+    } catch (error) {
+      console.warn("[qt-overall] 读取断点失败，将使用空状态", error);
+      return newState();
+    }
+  };
+
+  let state = loadCheckpoint();
+
+  const persistState = () => {
+    try {
+      state.updatedAt = new Date().toISOString();
+      GM_setValue(STORAGE_KEY, state);
+    } catch (error) {
+      console.error("[qt-overall] 保存断点失败", error);
+    }
+  };
+
+  const clearCheckpoint = () => {
+    try {
+      GM_deleteValue(STORAGE_KEY);
+    } catch (error) {
+      console.error("[qt-overall] 清空断点失败", error);
+    }
+  };
+
+  // ==================================================
+  // 日志 / 进度
+  // ==================================================
+
+  const addLog = (message, level = "info") => {
+    state.logs.push({
+      time: new Date().toLocaleTimeString(),
+      level,
+      message: cleanText(message),
+    });
+
+    if (state.logs.length > 300) {
+      state.logs = state.logs.slice(-300);
+    }
+
+    const method =
+      level === "error" ? "error" :
+      level === "warn" ? "warn" :
+      "log";
+
+    console[method]("[qt-overall]", message);
+    persistState();
+    render();
+  };
+
+  const setCurrent = (patch) => {
+    state.current = {
+      ...state.current,
+      ...patch,
+    };
+    persistState();
+    render();
+  };
+
+  const completedIds = () =>
+    new Set(
+      state.records
+        .filter((item) => item && item.completed)
+        .map((item) => String(item.albumId))
+    );
+
+  const completedCount = () => completedIds().size;
+
+  const failureCount = () =>
+    new Set(
+      state.failures
+        .map((item) => String(item.albumId || ""))
+        .filter(Boolean)
+    ).size;
+
+  const elapsedText = () => {
+    if (!state.startedAt) return "00:00";
+
+    const start = Date.parse(state.startedAt);
+    if (!Number.isFinite(start)) return "00:00";
+
+    const sec = Math.max(0, Math.floor((Date.now() - start) / 1000));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+
+    return h
+      ? `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
+      : `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  };
+
+  const checkpoint = async () => {
+    while (state.active && state.paused) {
+      if (state.current.stage !== "⏸ 已暂停") {
+        setCurrent({ stage: "⏸ 已暂停" });
+      }
+      await sleep(400);
+    }
+
+    if (!state.active) {
+      throw new Error("__STOPPED__");
+    }
+  };
+
+  // ==================================================
+  // 捕获青蜓 PAPI 登录参数
+  // ==================================================
+
+  const AUTH_KEYS = [
+    "device_type",
+    "client_type",
+    "wv",
+    "pt",
+    "user_id",
+    "device_id",
+    "user_token",
+    "ut",
+  ];
+
+  const captureApiContext = (rawUrl) => {
+    try {
+      const url = new URL(String(rawUrl || ""), location.href);
+
+      if (url.hostname !== "papi.qingting.fm") return;
+
+      const common = {};
+
+      for (const key of AUTH_KEYS) {
+        const value = url.searchParams.get(key);
+        if (value != null && value !== "") {
+          common[key] = value;
+        }
+      }
+
+      const match = url.pathname.match(
+        /\/podcasters\/([^/]+)\/channels_for_page/
+      );
+
+      const podcasterId =
+        match && match[1]
+          ? match[1]
+          : common.user_id || "";
+
+      if (!common.user_id || !common.user_token) return;
+
+      apiContext = {
+        common,
+        podcasterId,
+      };
+
+      render();
+    } catch (error) {}
+  };
+
+
+  const getRequestUrl = (request) => {
+    try {
+      if (request == null) return "";
+
+      if (typeof request === "string") {
+        return request;
+      }
+
+      // 关键修复：站点如果改成 fetch(new URL(...))，
+      // 旧版只读取 request.url，会得到 undefined。
+      try {
+        if (
+          typeof URL !== "undefined" &&
+          request instanceof URL
+        ) {
+          return request.toString();
+        }
+      } catch (error) {}
+
+      if (
+        request &&
+        typeof request === "object" &&
+        typeof request.url === "string"
+      ) {
+        return request.url;
+      }
+
+      // 跨 realm / 特殊 URL 对象兜底。
+      const asString = String(request);
+
+      if (
+        /^https?:\/\//i.test(asString) ||
+        asString.startsWith("/")
+      ) {
+        return asString;
+      }
+    } catch (error) {}
+
+    return "";
+  };
+
+  const scanPerformanceForApiContext = () => {
+    try {
+      const entries =
+        performance &&
+        typeof performance.getEntriesByType === "function"
+          ? performance.getEntriesByType("resource")
+          : [];
+
+      // 从最新请求倒着找，优先拿当前有效登录参数。
+      for (let i = entries.length - 1; i >= 0; i -= 1) {
+        const name = entries[i] && entries[i].name;
+
+        if (!name) continue;
+
+        captureApiContext(name);
+
+        if (
+          apiContext &&
+          apiContext.common &&
+          apiContext.common.user_id &&
+          apiContext.common.user_token
+        ) {
+          return true;
+        }
+      }
+    } catch (error) {}
+
+    return false;
+  };
+
+  let wrappedFetchRef = null;
+
+  const wrapCurrentFetch = () => {
+    try {
+      const w =
+        typeof unsafeWindow !== "undefined"
+          ? unsafeWindow
+          : window;
+
+      const currentFetch = w.fetch;
+
+      if (typeof currentFetch !== "function") {
+        return false;
+      }
+
+      if (currentFetch.__qtOverallWrappedV023) {
+        wrappedFetchRef = currentFetch;
+        return true;
+      }
+
+      const originalFetch = currentFetch;
+
+      const wrapped = function (...args) {
+        try {
+          const request = args[0];
+          const url = getRequestUrl(request);
+
+          if (url) {
+            captureApiContext(url);
+          }
+        } catch (error) {}
+
+        return originalFetch.apply(this, args);
+      };
+
+      wrapped.__qtOverallWrappedV023 = true;
+      wrapped.__qtOverallOriginalFetch = originalFetch;
+
+      w.fetch = wrapped;
+      wrappedFetchRef = wrapped;
+
+      return true;
+    } catch (error) {
+      return false;
+    }
+  };
+
+  const installProbe = () => {
+    if (probeInstalled) return;
+    probeInstalled = true;
+
+    const w =
+      typeof unsafeWindow !== "undefined"
+        ? unsafeWindow
+        : window;
+
+    // 先扫描已经发生过的资源请求，避免脚本启动/路由切换时错过首个认证请求。
+    scanPerformanceForApiContext();
+
+    // fetch：支持字符串、Request、URL对象。
+    wrapCurrentFetch();
+
+    // 如果页面框架后续覆盖了 window.fetch，自动重新挂探针。
+    setInterval(() => {
+      try {
+        const currentFetch = w.fetch;
+
+        if (
+          typeof currentFetch === "function" &&
+          !currentFetch.__qtOverallWrappedV023
+        ) {
+          wrapCurrentFetch();
+        }
+
+        if (
+          !apiContext ||
+          !apiContext.common ||
+          !apiContext.common.user_token
+        ) {
+          scanPerformanceForApiContext();
+        }
+      } catch (error) {}
+    }, 800);
+
+    // XHR 继续保留作为第二通道。
+    try {
+      const XHR = w.XMLHttpRequest;
+
+      if (
+        XHR &&
+        XHR.prototype &&
+        !XHR.prototype.__qtOverallWrappedV023
+      ) {
+        const originalOpen = XHR.prototype.open;
+
+        XHR.prototype.open = function (method, url, ...rest) {
+          try {
+            const requestUrl = getRequestUrl(url);
+
+            if (requestUrl) {
+              captureApiContext(requestUrl);
+            }
+          } catch (error) {}
+
+          return originalOpen.call(
+            this,
+            method,
+            url,
+            ...rest
+          );
+        };
+
+        XHR.prototype.__qtOverallWrappedV023 = true;
+      }
+    } catch (error) {}
+  };
+
+
+  const waitApiContext = async (timeoutMs = 18000) => {
+    const start = Date.now();
+
+    while (Date.now() - start < timeoutMs) {
+      await checkpoint();
+
+      // v0.2.4：即使实时fetch探针错过，也从Performance资源记录补抓。
+      if (
+        !apiContext ||
+        !apiContext.common ||
+        !apiContext.common.user_token
+      ) {
+        scanPerformanceForApiContext();
+      }
+
+      if (
+        apiContext &&
+        apiContext.common &&
+        apiContext.common.user_token &&
+        apiContext.common.user_id
+      ) {
+        if (!apiContext.podcasterId) {
+          apiContext.podcasterId = apiContext.common.user_id;
+        }
+
+        return apiContext;
+      }
+
+      setCurrent({
+        stage: "等待青蜓接口认证参数…",
+        innerPercent: 5,
+      });
+
+      await sleep(200);
+    }
+
+    throw new Error(
+      "没有捕获到青蜓接口登录参数。请进入“专辑数据”页面刷新一次，再重新开始。"
+    );
+  };
+
+  // ==================================================
+  // API 请求
+  // ==================================================
+
+  const buildApiUrl = (pathname, params = {}) => {
+    if (!apiContext) {
+      throw new Error("尚未捕获API上下文");
+    }
+
+    const url = new URL(pathname, "https://papi.qingting.fm");
+
+    for (const [key, value] of Object.entries(params)) {
+      if (value == null) continue;
+      url.searchParams.set(key, String(value));
+    }
+
+    for (
+      const [key, value]
+      of Object.entries({
+        ...apiContext.common,
+        pt: "channel_data",
+      })
+    ) {
+      if (value == null || value === "") continue;
+      url.searchParams.set(key, String(value));
+    }
+
+    return url.toString();
+  };
+
+  const gmGetJsonOnce = (url, label) =>
+    new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: "GET",
+        url,
+        headers: {
+          Accept: "application/json, text/plain, */*",
+        },
+        timeout: 25000,
+        anonymous: false,
+
+        onload: (response) => {
+          if (response.status === 401 || response.status === 403) {
+            reject(
+              new Error(
+                `${label}返回 HTTP ${response.status}，登录可能已失效`
+              )
+            );
+            return;
+          }
+
+          if (response.status < 200 || response.status >= 300) {
+            reject(
+              new Error(`${label}返回 HTTP ${response.status}`)
+            );
+            return;
+          }
+
+          try {
+            const parsed = JSON.parse(response.responseText);
+
+            if (
+              parsed &&
+              parsed.errcode != null &&
+              Number(parsed.errcode) !== 0
+            ) {
+              reject(
+                new Error(
+                  `${label}接口异常：${
+                    parsed.errmsg ||
+                    parsed.msg ||
+                    parsed.errcode
+                  }`
+                )
+              );
+              return;
+            }
+
+            resolve(parsed);
+          } catch (error) {
+            reject(
+              new Error(
+                `${label} JSON解析失败：${error.message}`
+              )
+            );
+          }
+        },
+
+        onerror: () =>
+          reject(
+            new Error(`${label}网络请求失败`)
+          ),
+
+        ontimeout: () =>
+          reject(
+            new Error(`${label}请求超时`)
+          ),
+      });
+    });
+
+  const gmGetJson = async (url, label) => {
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= MAX_RETRY; attempt += 1) {
+      await checkpoint();
+
+      try {
+        return await gmGetJsonOnce(url, label);
+      } catch (error) {
+        lastError = error;
+
+        if (/401|403|登录可能已失效/.test(error.message || "")) {
+          throw error;
+        }
+
+        if (attempt < MAX_RETRY) {
+          addLog(
+            `${label}失败，准备第${attempt + 1}/${MAX_RETRY}次重试：${error.message}`,
+            "warn"
+          );
+
+          await sleep(600 * attempt);
+        }
+      }
+    }
+
+    throw lastError || new Error(`${label}请求失败`);
+  };
+
+  const apiData = async (url, label) => {
+    const parsed = await gmGetJson(url, label);
+
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      parsed.data == null
+    ) {
+      throw new Error(`${label}没有返回有效data`);
+    }
+
+    return parsed.data;
+  };
+
+  // ==================================================
+  // 专辑列表
+  // ==================================================
+
+  const loadAllAlbums = async () => {
+    const ctx = await waitApiContext();
+
+    const podcasterId =
+      ctx.podcasterId ||
+      ctx.common.user_id;
+
+    const map = new Map();
+
+    let page = 1;
+    let total = 0;
+    let totalPages = 1;
+
+    do {
+      await checkpoint();
+
+      setCurrent({
+        albumId: "",
+        albumName: "",
+        stage: `读取专辑列表 ${page}/${totalPages}`,
+        innerPercent: Math.min(
+          30,
+          5 + (page / Math.max(1, totalPages)) * 25
+        ),
+      });
+
+      const url = buildApiUrl(
+        `/papi/podcasters/${encodeURIComponent(podcasterId)}/channels_for_page`,
+        {
+          order: "create_time desc",
+          page,
+          pagesize: PAGE_SIZE,
+          filter: JSON.stringify({
+            channel_type: "99",
+          }),
+        }
+      );
+
+      const data = await apiData(
+        url,
+        `专辑列表第${page}页`
+      );
+
+      const items = Array.isArray(data.items) ? data.items : [];
+
+      total = Number(data.total || 0);
+
+      const pageSize =
+        Number(data.pagesize || PAGE_SIZE) ||
+        PAGE_SIZE;
+
+      totalPages =
+        total > 0
+          ? Math.max(1, Math.ceil(total / pageSize))
+          : page;
+
+      for (const item of items) {
+        if (!item || item.id == null) continue;
+
+        const id = String(item.id);
+
+        map.set(id, {
+          id,
+          name: cleanText(item.title || id),
+        });
+      }
+
+      addLog(
+        `专辑列表 ${page}/${totalPages}，累计 ${map.size}/${total || "?"}`
+      );
+
+      page += 1;
+
+      if (page <= totalPages) {
+        await sleep(100);
+      }
+    } while (
+      page <= totalPages &&
+      page <= 500
+    );
+
+    const albums = Array.from(map.values());
+
+    if (!albums.length) {
+      throw new Error("专辑列表接口返回为空");
+    }
+
+    return albums;
+  };
+
+  // ==================================================
+  // 单专辑总体数据
+  // ==================================================
+
+  const fetchAlbumOverview = async (album) => {
+    const url = buildApiUrl(
+      `/papi/v2/rpt/channels/${encodeURIComponent(album.id)}/overview`
+    );
+
+    const data = await apiData(
+      url,
+      `${album.name}｜总体数据`
+    );
+
+    const play = data.play || {};
+    const internal = play.internal_play || {};
+    const external = play.external_play || {};
+    const favorite = data.favorite || {};
+    const comment = data.comment || {};
+
+    return {
+      albumId: String(album.id),
+      albumName: album.name,
+      play: play.all ?? "",
+      internalPlay: internal.all ?? "",
+      externalPlay: external.all ?? "",
+      favorite: favorite.all ?? "",
+      comment: comment.all ?? "",
+      grabbedAt: nowText(),
+      completed: true,
+    };
+  };
+
+  const upsertRecord = (record) => {
+    const index = state.records.findIndex(
+      (item) => String(item.albumId) === String(record.albumId)
+    );
+
+    if (index >= 0) {
+      state.records[index] = record;
+    } else {
+      state.records.push(record);
+    }
+
+    persistState();
+  };
+
+  // ==================================================
+  // 数据总览 DOM
+  // ==================================================
+
+  const isVisible = (element) => {
+    if (!element || element.nodeType !== 1) return false;
+
+    if (
+      panel &&
+      (
+        element === panel ||
+        (
+          element.closest &&
+          element.closest(`#${PANEL_ID}`)
+        )
+      )
+    ) {
+      return false;
+    }
+
+    try {
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+
+      return (
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        Number(style.opacity) !== 0 &&
+        rect.width > 0 &&
+        rect.height > 0
+      );
+    } catch (error) {
+      return false;
+    }
+  };
+
+  const getOwnText = (element) => {
+    try {
+      return cleanText(
+        Array.from(element.childNodes || [])
+          .filter((node) => node.nodeType === 3)
+          .map((node) => node.nodeValue || "")
+          .join(" ") ||
+        element.getAttribute("title") ||
+        element.getAttribute("aria-label") ||
+        ""
+      );
+    } catch (error) {
+      return "";
+    }
+  };
+
+  const findExactText = (targetText) => {
+    const target = cleanText(targetText);
+    const candidates = [];
+
+    for (
+      const element
+      of Array.from(
+        document.querySelectorAll("a,button,li,div,span,p")
+      )
+    ) {
+      if (!isVisible(element)) continue;
+
+      const own = getOwnText(element);
+      const full = cleanText(
+        element.innerText ||
+        element.textContent ||
+        ""
+      );
+
+      if (
+        own !== target &&
+        full !== target
+      ) {
+        continue;
+      }
+
+      let rect;
+
+      try {
+        rect = element.getBoundingClientRect();
+      } catch (error) {
+        continue;
+      }
+
+      if (
+        rect.width > 900 ||
+        rect.height > 220
+      ) {
+        continue;
+      }
+
+      let score = rect.width * rect.height;
+
+      const tag =
+        String(element.tagName || "").toLowerCase();
+
+      if (
+        tag === "a" ||
+        tag === "button"
+      ) {
+        score -= 100000;
+      }
+
+      if (own === target) {
+        score -= 50000;
+      }
+
+      candidates.push({
+        element,
+        score,
+      });
+    }
+
+    candidates.sort((a, b) => a.score - b.score);
+
+    return candidates.length
+      ? candidates[0].element
+      : null;
+  };
+
+  const clickText = (targetText) => {
+    const element = findExactText(targetText);
+
+    if (!element) return false;
+
+    const target =
+      (
+        element.closest &&
+        element.closest(
+          "a,button,li,[role='tab'],[role='menuitem']"
+        )
+      ) ||
+      element;
+
+    try {
+      target.click();
+      return true;
+    } catch (error) {
+      return false;
+    }
+  };
+
+  const findSection = (title, requiredWords = []) => {
+    const titleElement = findExactText(title);
+
+    if (!titleElement) return null;
+
+    const candidates = [];
+    let current = titleElement;
+
+    for (
+      let depth = 0;
+      depth < 10 && current;
+      depth += 1
+    ) {
+      try {
+        const rect = current.getBoundingClientRect();
+
+        const text = cleanText(
+          current.innerText ||
+          current.textContent ||
+          ""
+        );
+
+        const matched =
+          requiredWords.filter(
+            (word) => text.includes(word)
+          ).length;
+
+        if (
+          rect.width >= 300 &&
+          rect.height >= 80 &&
+          rect.height <= 1200 &&
+          (
+            !requiredWords.length ||
+            matched >= Math.min(2, requiredWords.length)
+          )
+        ) {
+          candidates.push({
+            element: current,
+            score:
+              rect.width * rect.height +
+              depth * 5000 -
+              matched * 100000,
+          });
+        }
+      } catch (error) {}
+
+      current = current.parentElement;
+    }
+
+    candidates.sort((a, b) => a.score - b.score);
+
+    return candidates.length
+      ? candidates[0].element
+      : null;
+  };
+
+  const parseChineseNumber = (raw) => {
+    const text = cleanText(raw).replace(/,/g, "");
+
+    const match = text.match(
+      /([+\-]?\d+(?:\.\d+)?)(亿|万|千|百)?/
+    );
+
+    if (!match) return null;
+
+    let number = Number(match[1]);
+
+    if (!Number.isFinite(number)) return null;
+
+    const unit = match[2] || "";
+
+    if (unit === "亿") {
+      number *= 100000000;
+    } else if (unit === "万") {
+      number *= 10000;
+    } else if (unit === "千") {
+      number *= 1000;
+    } else if (unit === "百") {
+      number *= 100;
+    }
+
+    return Math.round(number);
+  };
+
+  const readMetric = (scope, label) => {
+    if (!scope) {
+      return {
+        raw: "",
+        number: null,
+      };
+    }
+
+    const lines =
+      String(
+        scope.innerText ||
+        scope.textContent ||
+        ""
+      )
+        .split(/\n+/)
+        .map(cleanText)
+        .filter(Boolean);
+
+    for (
+      let i = 0;
+      i < lines.length;
+      i += 1
+    ) {
+      if (lines[i] !== label) continue;
+
+      for (
+        let j = i + 1;
+        j < Math.min(lines.length, i + 8);
+        j += 1
+      ) {
+        const value = lines[j];
+
+        if (
+          /^[+\-]?\d[\d,]*(?:\.\d+)?(?:亿|万|千|百)?$/.test(
+            value
+          )
+        ) {
+          return {
+            raw: value,
+            number: parseChineseNumber(value),
+          };
+        }
+      }
+    }
+
+    return {
+      raw: "",
+      number: null,
+    };
+  };
+
+  const readDataOverview = () => {
+    const scope =
+      findSection(
+        "整体数据",
+        [
+          "播放量",
+          "收藏量",
+          "粉丝量",
+        ]
+      ) ||
+      document.body;
+
+    const play = readMetric(scope, "播放量");
+    const internal = readMetric(scope, "站内");
+    const external = readMetric(scope, "站外");
+    const favorite = readMetric(scope, "收藏量");
+    const fans = readMetric(scope, "粉丝量");
+
+    return {
+      grabbedAt: nowText(),
+
+      play: play.number,
+      playRaw: play.raw,
+
+      internalPlay: internal.number,
+      internalPlayRaw: internal.raw,
+
+      externalPlay: external.number,
+      externalPlayRaw: external.raw,
+
+      favorite: favorite.number,
+      favoriteRaw: favorite.raw,
+
+      fans: fans.number,
+      fansRaw: fans.raw,
+    };
+  };
+
+  const pageHasOverview = () => {
+    try {
+      const text =
+        document.body
+          ? document.body.innerText || ""
+          : "";
+
+      return (
+        text.includes("数据总览") &&
+        text.includes("整体数据")
+      );
+    } catch (error) {
+      return false;
+    }
+  };
+
+  const pageHasAlbumData = () => {
+    try {
+      const text =
+        document.body
+          ? document.body.innerText || ""
+          : "";
+
+      return (
+        text.includes("专辑数据") &&
+        (
+          location.href.includes("/data/channel") ||
+          text.includes("基础数据")
+        )
+      );
+    } catch (error) {
+      return false;
+    }
+  };
+
+  const waitForCondition = async (fn, timeoutMs = 15000) => {
+    const start = Date.now();
+
+    while (Date.now() - start < timeoutMs) {
+      await checkpoint();
+
+      try {
+        const result = fn();
+
+        if (result) return result;
+      } catch (error) {}
+
+      await sleep(180);
+    }
+
+    return null;
+  };
+
+  const ensureOverviewPage = async () => {
+    if (pageHasOverview()) return true;
+
+    if (!clickText("数据总览")) return false;
+
+    return Boolean(
+      await waitForCondition(
+        pageHasOverview,
+        12000
+      )
+    );
+  };
+
+  const ensureAlbumPage = async () => {
+    if (pageHasAlbumData()) return true;
+
+    if (!clickText("专辑数据")) return false;
+
+    return Boolean(
+      await waitForCondition(
+        pageHasAlbumData,
+        12000
+      )
+    );
+  };
+
+  // ==================================================
+  // 失败记录
+  // ==================================================
+
+  const addFailure = (album, error) => {
+    const reason =
+      cleanText(
+        error && error.message
+          ? error.message
+          : error || "未知错误"
+      );
+
+    state.failures =
+      state.failures.filter(
+        (item) =>
+          String(item.albumId) !== String(album.id)
+      );
+
+    state.failures.push({
+      albumId: String(album.id),
+      albumName: album.name,
+      reason,
+      time: nowText(),
+    });
+
+    persistState();
+
+    addLog(
+      `${album.name} 失败：${reason}`,
+      "warn"
+    );
+  };
+
+  // ==================================================
+  // 主流程
+  // ==================================================
+
+  const run = async () => {
+    if (
+      running ||
+      !state.active ||
+      state.paused
+    ) {
+      return;
+    }
+
+    const myGeneration = runGeneration;
+
+    const assertCurrentRun = () => {
+      if (
+        myGeneration !== runGeneration ||
+        !state.active
+      ) {
+        throw new Error("__STOPPED__");
+      }
+    };
+
+    running = true;
+
+    try {
+      if (!state.startedAt) {
+        state.startedAt = new Date().toISOString();
+        persistState();
+      }
+
+      // 刷新/重新打开页面后，内存中的认证上下文会丢失。
+      // 如果断点已经进入专辑列表或逐本抓取阶段，先重新进入“专辑数据”
+      // 并重新捕获当前登录认证，再从保存的位置继续。
+      if (
+        ["album_list", "albums_run"].includes(state.phase) &&
+        !(
+          apiContext &&
+          apiContext.common &&
+          apiContext.common.user_token &&
+          apiContext.common.user_id
+        )
+      ) {
+        setCurrent({
+          stage: "断点恢复：重新捕获接口认证",
+          innerPercent: 5,
+        });
+
+        const ok = await ensureAlbumPage();
+        assertCurrentRun();
+
+        if (!ok) {
+          throw new Error(
+            "断点恢复失败：无法进入“专辑数据”页面"
+          );
+        }
+
+        await waitApiContext(18000);
+        assertCurrentRun();
+
+        addLog(
+          `断点恢复成功：从第 ${Math.min(state.albumIndex + 1, Math.max(1, state.albums.length))} 本附近继续`
+        );
+      }
+
+      if (state.phase === "overview") {
+        setCurrent({
+          albumId: "",
+          albumName: "数据总览",
+          stage: "读取数据总览中的总体数据",
+          innerPercent: 10,
+        });
+
+        const ok = await ensureOverviewPage();
+        assertCurrentRun();
+
+        if (!ok) {
+          throw new Error(
+            "无法自动进入“数据总览”页面"
+          );
+        }
+
+        await sleep(650);
+        assertCurrentRun();
+
+        state.overview = readDataOverview();
+        persistState();
+
+        addLog(
+          `数据总览完成：播放 ${state.overview.playRaw || "-"}，站内 ${state.overview.internalPlayRaw || "-"}，站外 ${state.overview.externalPlayRaw || "-"}，收藏 ${state.overview.favoriteRaw || "-"}，粉丝 ${state.overview.fansRaw || "-"}`
+        );
+
+        state.phase = "auth";
+        persistState();
+      }
+
+      if (state.phase === "auth") {
+        setCurrent({
+          albumName: "",
+          stage: "进入专辑数据并捕获接口认证",
+          innerPercent: 5,
+        });
+
+        const ok = await ensureAlbumPage();
+        assertCurrentRun();
+
+        if (!ok) {
+          throw new Error(
+            "无法自动进入“专辑数据”页面"
+          );
+        }
+
+        await waitApiContext(18000);
+        assertCurrentRun();
+
+        addLog(
+          "已捕获青蜓PAPI认证，后续只请求专辑总体数据"
+        );
+
+        state.phase = "album_list";
+        persistState();
+      }
+
+      if (state.phase === "album_list") {
+        setCurrent({
+          albumName: "",
+          stage: "读取全部专辑列表",
+          innerPercent: 5,
+        });
+
+        state.albums = await loadAllAlbums();
+        assertCurrentRun();
+        state.albumIndex = 0;
+        persistState();
+
+        addLog(
+          `专辑列表完成：${state.albums.length} 本`
+        );
+
+        state.phase = "albums_run";
+        persistState();
+      }
+
+      if (state.phase === "albums_run") {
+        const completed = completedIds();
+
+        for (
+          let i = state.albumIndex;
+          i < state.albums.length;
+          i += 1
+        ) {
+          await checkpoint();
+
+          const album = state.albums[i];
+          state.albumIndex = i;
+          persistState();
+
+          if (completed.has(String(album.id))) {
+            continue;
+          }
+
+          let success = false;
+          let lastError = null;
+
+          for (
+            let attempt = 1;
+            attempt <= MAX_RETRY;
+            attempt += 1
+          ) {
+            await checkpoint();
+
+            try {
+              setCurrent({
+                albumId: album.id,
+                albumName: album.name,
+                stage: `读取总体数据（${attempt}/${MAX_RETRY}）`,
+                innerPercent: 20,
+              });
+
+              const record =
+                await fetchAlbumOverview(album);
+              assertCurrentRun();
+
+              setCurrent({
+                stage: "总体数据已获取",
+                innerPercent: 85,
+              });
+
+              upsertRecord(record);
+              completed.add(String(album.id));
+
+              state.failures =
+                state.failures.filter(
+                  (item) =>
+                    String(item.albumId) !== String(album.id)
+                );
+              persistState();
+
+              success = true;
+
+              setCurrent({
+                stage: "✅ 当前专辑完成",
+                innerPercent: 100,
+              });
+
+              addLog(
+                `[${i + 1}/${state.albums.length}] ${album.name}｜播放 ${record.play}｜站内 ${record.internalPlay}｜站外 ${record.externalPlay}｜收藏 ${record.favorite}｜评论 ${record.comment}`
+              );
+
+              break;
+            } catch (error) {
+              lastError = error;
+
+              addLog(
+                `${album.name} 第${attempt}/${MAX_RETRY}次失败：${error.message}`,
+                "warn"
+              );
+
+              if (
+                /401|403|登录可能已失效/.test(
+                  error.message || ""
+                )
+              ) {
+                throw error;
+              }
+
+              if (attempt < MAX_RETRY) {
+                await sleep(700 * attempt);
+              }
+            }
+          }
+
+          if (!success) {
+            addFailure(
+              album,
+              lastError ||
+              new Error("连续重试仍失败")
+            );
+          }
+
+          state.albumIndex = i + 1;
+          persistState();
+
+          await sleep(70);
+        }
+
+        state.phase = "done";
+        state.active = false;
+        state.paused = false;
+        persistState();
+
+        setCurrent({
+          albumName: "",
+          stage: "✅ 全部总体数据抓取完成",
+          innerPercent: 100,
+        });
+
+        addLog(
+          `全部完成：${completedCount()}/${state.albums.length} 本，失败 ${failureCount()} 本`
+        );
+      }
+    } catch (error) {
+      if (
+        error &&
+        error.message === "__STOPPED__"
+      ) {
+        console.log("[qt-overall] 当前运行已停止");
+      } else {
+        addLog(
+          `主流程异常：${error.message || error}`,
+          "error"
+        );
+
+        setCurrent({
+          stage: `异常：${error.message || error}`,
+        });
+      }
+    } finally {
+      if (myGeneration === runGeneration) {
+        running = false;
+      }
+    }
+  };
+
+  // ==================================================
+  // Excel
+  // ==================================================
+
+  const ensureXlsx = async () => {
+    if (XLSX_LIB) return XLSX_LIB;
+
+    try {
+      if (typeof XLSX !== "undefined") {
+        XLSX_LIB = XLSX;
+        return XLSX_LIB;
+      }
+    } catch (error) {}
+
+    addLog("正在加载Excel组件…");
+
+    const source =
+      await new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+          method: "GET",
+          url:
+            "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js",
+          timeout: 20000,
+
+          onload: (response) => {
+            if (
+              response.status >= 200 &&
+              response.status < 300 &&
+              response.responseText
+            ) {
+              resolve(response.responseText);
+            } else {
+              reject(
+                new Error(
+                  `Excel组件下载失败：HTTP ${response.status}`
+                )
+              );
+            }
+          },
+
+          onerror: () =>
+            reject(
+              new Error("Excel组件下载网络失败")
+            ),
+
+          ontimeout: () =>
+            reject(
+              new Error("Excel组件下载超时")
+            ),
+        });
+      });
+
+    XLSX_LIB =
+      new Function(
+        `${source}\n;return typeof XLSX !== "undefined" ? XLSX : null;`
+      )();
+
+    if (!XLSX_LIB) {
+      throw new Error("Excel组件初始化失败");
+    }
+
+    return XLSX_LIB;
+  };
+
+  const exportExcel = async () => {
+    const XLSX = await ensureXlsx();
+
+    const rows = [
+      [
+        "书名/数据总览",
+        "播放量",
+        "站内播放量",
+        "站外播放量",
+        "收藏量",
+        "粉丝量",
+        "评论量",
+      ],
+    ];
+
+    if (state.overview) {
+      rows.push([
+        "数据总览",
+        state.overview.play ?? "",
+        state.overview.internalPlay ?? "",
+        state.overview.externalPlay ?? "",
+        state.overview.favorite ?? "",
+        state.overview.fans ?? "",
+        "",
+      ]);
+    }
+
+    const recordMap =
+      new Map(
+        state.records.map(
+          (item) => [
+            String(item.albumId),
+            item,
+          ]
+        )
+      );
+
+    for (const album of state.albums) {
+      const record =
+        recordMap.get(
+          String(album.id)
+        );
+
+      if (!record) continue;
+
+      rows.push([
+        album.name,
+        record.play ?? "",
+        record.internalPlay ?? "",
+        record.externalPlay ?? "",
+        record.favorite ?? "",
+        "",
+        record.comment ?? "",
+      ]);
+    }
+
+    const sheet =
+      XLSX.utils.aoa_to_sheet(rows);
+
+    sheet["!cols"] = [
+      { wch: 52 },
+      { wch: 16 },
+      { wch: 16 },
+      { wch: 16 },
+      { wch: 14 },
+      { wch: 14 },
+      { wch: 14 },
+    ];
+
+    const workbook =
+      XLSX.utils.book_new();
+
+    XLSX.utils.book_append_sheet(
+      workbook,
+      sheet,
+      "总体数据"
+    );
+
+    if (state.failures.length) {
+      const failureRows = [
+        [
+          "专辑ID",
+          "书名",
+          "失败原因",
+          "时间",
+        ],
+        ...state.failures.map(
+          (item) => [
+            item.albumId || "",
+            item.albumName || "",
+            item.reason || "",
+            item.time || "",
+          ]
+        ),
+      ];
+
+      const failureSheet =
+        XLSX.utils.aoa_to_sheet(
+          failureRows
+        );
+
+      failureSheet["!cols"] = [
+        { wch: 14 },
+        { wch: 52 },
+        { wch: 90 },
+        { wch: 22 },
+      ];
+
+      XLSX.utils.book_append_sheet(
+        workbook,
+        failureSheet,
+        "失败项目"
+      );
+    }
+
+    const stamp =
+      new Date()
+        .toISOString()
+        .replace(/[:T]/g, "-")
+        .slice(0, 16);
+
+    XLSX.writeFile(
+      workbook,
+      `青蜓FM总体数据_${stamp}.xlsx`,
+      {
+        compression: true,
+      }
+    );
+
+    addLog(
+      `Excel已导出：数据总览 1 行 + 专辑 ${rows.length - 2} 行`
+    );
+  };
+
+  // ==================================================
+  // 面板
+  // ==================================================
+
+  const render = () => {
+    if (!panel || !ui.overallBar) return;
+
+    const total = state.albums.length;
+    const done = completedCount();
+    const fail = failureCount();
+    const pending = Math.max(0, total - done);
+
+    const overallPercent =
+      total
+        ? Math.max(
+            0,
+            Math.min(
+              100,
+              done / total * 100
+            )
+          )
+        : state.overview
+          ? 1
+          : 0;
+
+    const inner =
+      Math.max(
+        0,
+        Math.min(
+          100,
+          Number(
+            state.current.innerPercent || 0
+          )
+        )
+      );
+
+    ui.overallText.textContent =
+      `${overallPercent.toFixed(1)}%`;
+
+    ui.overallBar.style.width =
+      `${overallPercent}%`;
+
+    ui.overallDetail.textContent =
+      total
+        ? `${Math.min(state.albumIndex, total)} / ${total} 本（完成 ${done}）`
+        : state.overview
+          ? "数据总览已完成，准备读取专辑"
+          : "尚未开始";
+
+    ui.innerText.textContent =
+      `${inner.toFixed(0)}%`;
+
+    ui.innerBar.style.width =
+      `${inner}%`;
+
+    ui.album.textContent =
+      state.current.albumName || "—";
+
+    ui.stage.textContent =
+      state.paused
+        ? "⏸ 已暂停"
+        : state.current.stage || "等待开始";
+
+    ui.done.textContent = String(done);
+    ui.fail.textContent = String(fail);
+    ui.pending.textContent = String(pending);
+
+    ui.phase.textContent = state.phase || "";
+
+    ui.api.textContent =
+      apiContext &&
+      apiContext.common &&
+      apiContext.common.user_token
+        ? "已捕获"
+        : "等待中";
+
+    ui.elapsed.textContent =
+      elapsedText();
+
+    ui.start.textContent =
+      state.active &&
+      !state.paused
+        ? "抓取运行中"
+        : state.paused
+          ? "继续抓取"
+          : state.phase === "done"
+            ? "已完成"
+            : state.records.length || state.albumIndex > 0
+              ? "继续断点"
+              : "开始抓取";
+
+    ui.pause.textContent =
+      state.paused
+        ? "继续"
+        : "暂停";
+
+    ui.pause.disabled =
+      !state.active;
+
+    ui.log.textContent =
+      state.logs
+        .slice(-8)
+        .map(
+          (item) =>
+            `${item.time} ${
+              item.level === "error"
+                ? "❌"
+                : item.level === "warn"
+                  ? "⚠️"
+                  : "•"
+            } ${item.message}`
+        )
+        .join("\n");
+
+    ui.log.scrollTop =
+      ui.log.scrollHeight;
+  };
+
+  const resetRuntime = () => {
+    runGeneration += 1;
+    running = false;
+    state.active = false;
+    state = newState();
+    clearCheckpoint();
+    render();
+  };
+
+  const createPanel = () => {
+    if (
+      document.getElementById(PANEL_ID)
+    ) {
+      return;
+    }
+
+    panel =
+      document.createElement("div");
+
+    panel.id = PANEL_ID;
+
+    panel.style.cssText = [
+      "position:fixed",
+      "right:16px",
+      "bottom:16px",
+      "z-index:2147483647",
+      "width:365px",
+      "box-sizing:border-box",
+      "padding:12px",
+      "border:2px solid #ff4d4f",
+      "border-radius:10px",
+      "background:#1f1f1f",
+      "color:#f5f5f5",
+      "font:13px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif",
+      "box-shadow:0 8px 28px rgba(0,0,0,.38)",
+    ].join(";");
+
+    panel.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+        <strong style="color:#ff7875;">青蜓FM总体数据 v0.2.4 断点版</strong>
+        <button id="qt-min" type="button" style="width:30px;height:25px;border:1px solid #555;border-radius:5px;background:#333;color:#fff;cursor:pointer;">－</button>
+      </div>
+
+      <div id="qt-body" style="display:flex;flex-direction:column;gap:9px;">
+        <div>
+          <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+            <span>总体进度</span>
+            <strong id="qt-overall-text">0%</strong>
+          </div>
+
+          <div style="height:12px;background:#3c3c3c;border-radius:999px;overflow:hidden;">
+            <div id="qt-overall-bar" style="height:100%;width:0%;background:#ff4d4f;transition:width .2s ease;"></div>
+          </div>
+
+          <div id="qt-overall-detail" style="margin-top:4px;color:#bbb;font-size:12px;">尚未开始</div>
+        </div>
+
+        <div>
+          <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+            <span>当前书进度</span>
+            <strong id="qt-inner-text">0%</strong>
+          </div>
+
+          <div style="height:12px;background:#3c3c3c;border-radius:999px;overflow:hidden;">
+            <div id="qt-inner-bar" style="height:100%;width:0%;background:#52c41a;transition:width .2s ease;"></div>
+          </div>
+        </div>
+
+        <div style="padding:9px;border:1px solid #3e3e3e;border-radius:6px;background:#272727;">
+          <div style="font-size:12px;color:#aaa;">当前书名/数据总览</div>
+          <div id="qt-album" style="margin-top:2px;word-break:break-word;">—</div>
+
+          <div style="font-size:12px;color:#aaa;margin-top:7px;">当前任务</div>
+          <div id="qt-stage" style="margin-top:2px;color:#91d5ff;">等待开始</div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;text-align:center;">
+          <div style="padding:6px;border:1px solid #3b3b3b;border-radius:5px;">
+            <div style="font-size:11px;color:#aaa;">完成</div>
+            <strong id="qt-done">0</strong>
+          </div>
+
+          <div style="padding:6px;border:1px solid #3b3b3b;border-radius:5px;">
+            <div style="font-size:11px;color:#aaa;">失败</div>
+            <strong id="qt-fail">0</strong>
+          </div>
+
+          <div style="padding:6px;border:1px solid #3b3b3b;border-radius:5px;">
+            <div style="font-size:11px;color:#aaa;">待处理</div>
+            <strong id="qt-pending">0</strong>
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;font-size:12px;color:#aaa;">
+          <div>阶段：<span id="qt-phase">overview</span></div>
+          <div>API：<span id="qt-api">等待中</span></div>
+          <div style="text-align:right;">时间：<span id="qt-elapsed">00:00</span></div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px;">
+          <button id="qt-start" type="button" style="padding:9px;border:0;border-radius:5px;background:#ff4d4f;color:#fff;font-weight:700;cursor:pointer;">开始抓取</button>
+          <button id="qt-pause" type="button" style="padding:9px;border:1px solid #666;border-radius:5px;background:#333;color:#fff;cursor:pointer;">暂停</button>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:7px;">
+          <button id="qt-export" type="button" style="padding:8px;border:1px solid #4f7898;border-radius:5px;background:#263f52;color:#fff;cursor:pointer;">导出Excel</button>
+          <button id="qt-reset" type="button" style="padding:8px;border:1px solid #875050;border-radius:5px;background:#4a2929;color:#fff;cursor:pointer;">清空断点</button>
+        </div>
+
+        <div style="padding:7px 9px;border:1px solid #4a4a4a;border-radius:6px;background:#242424;color:#aaa;font-size:11px;">
+          断点模式：刷新或关闭后会保留已抓数据、专辑列表和当前进度；重新打开后自动续跑。只有点击“清空断点”才会删除。
+        </div>
+
+        <div style="border-top:1px solid #3b3b3b;padding-top:7px;">
+          <div style="font-size:12px;color:#aaa;margin-bottom:4px;">最近日志</div>
+          <div id="qt-log" style="height:100px;overflow:auto;padding:6px;background:#151515;border-radius:5px;font-size:11px;color:#ddd;white-space:pre-wrap;"></div>
+        </div>
+      </div>
+    `;
+
+    (
+      document.body ||
+      document.documentElement
+    ).appendChild(panel);
+
+    ui = {
+      body: panel.querySelector("#qt-body"),
+      min: panel.querySelector("#qt-min"),
+      overallText: panel.querySelector("#qt-overall-text"),
+      overallBar: panel.querySelector("#qt-overall-bar"),
+      overallDetail: panel.querySelector("#qt-overall-detail"),
+      innerText: panel.querySelector("#qt-inner-text"),
+      innerBar: panel.querySelector("#qt-inner-bar"),
+      album: panel.querySelector("#qt-album"),
+      stage: panel.querySelector("#qt-stage"),
+      done: panel.querySelector("#qt-done"),
+      fail: panel.querySelector("#qt-fail"),
+      pending: panel.querySelector("#qt-pending"),
+      phase: panel.querySelector("#qt-phase"),
+      api: panel.querySelector("#qt-api"),
+      elapsed: panel.querySelector("#qt-elapsed"),
+      start: panel.querySelector("#qt-start"),
+      pause: panel.querySelector("#qt-pause"),
+      export: panel.querySelector("#qt-export"),
+      reset: panel.querySelector("#qt-reset"),
+      log: panel.querySelector("#qt-log"),
+    };
+
+    let minimized = false;
+
+    ui.min.addEventListener("click", () => {
+      minimized = !minimized;
+
+      ui.body.style.display =
+        minimized ? "none" : "flex";
+
+      ui.min.textContent =
+        minimized ? "＋" : "－";
+    });
+
+    ui.start.addEventListener(
+      "click",
+      async () => {
+        if (state.phase === "done") {
+          alert(
+            "当前断点已经全部完成。若要从头重新抓取，请先点击“清空断点”。"
+          );
+          return;
+        }
+
+        if (!state.startedAt) {
+          state.startedAt =
+            new Date().toISOString();
+        }
+
+        state.active = true;
+        state.paused = false;
+        persistState();
+
+        addLog(
+          state.records.length || state.albumIndex > 0
+            ? "从保存断点继续抓取"
+            : "开始抓取总体数据"
+        );
+        run();
+      }
+    );
+
+    ui.pause.addEventListener(
+      "click",
+      async () => {
+        if (!state.active) return;
+
+        state.paused = !state.paused;
+        persistState();
+
+        addLog(
+          state.paused
+            ? "任务已暂停"
+            : "任务继续"
+        );
+
+        if (!state.paused) {
+          run();
+        }
+      }
+    );
+
+    ui.export.addEventListener(
+      "click",
+      async () => {
+        try {
+          await exportExcel();
+        } catch (error) {
+          addLog(
+            `Excel导出失败：${error.message}`,
+            "error"
+          );
+        }
+      }
+    );
+
+    ui.reset.addEventListener(
+      "click",
+      () => {
+        const confirmed =
+          window.confirm(
+            "确定清空断点吗？已抓数据、专辑列表、当前进度、失败记录和日志都会删除。"
+          );
+
+        if (!confirmed) return;
+
+        resetRuntime();
+        console.log("[qt-overall] 断点已清空");
+      }
+    );
+
+    const observer =
+      new MutationObserver(() => {
+        if (
+          panel &&
+          !document.getElementById(PANEL_ID)
+        ) {
+          (
+            document.body ||
+            document.documentElement
+          ).appendChild(panel);
+        }
+      });
+
+    observer.observe(
+      document.documentElement,
+      {
+        childList: true,
+        subtree: true,
+      }
+    );
+
+    render();
+  };
+
+  // ==================================================
+  // 菜单 / 启动
+  // ==================================================
+
+  if (
+    typeof GM_registerMenuCommand === "function"
+  ) {
+    GM_registerMenuCommand(
+      "▶ 开始总体数据抓取",
+      async () => {
+        if (state.phase === "done") {
+          alert(
+            "当前断点已经全部完成。若要从头重新抓取，请先清空断点。"
+          );
+          return;
+        }
+
+        if (!state.startedAt) {
+          state.startedAt =
+            new Date().toISOString();
+        }
+
+        state.active = true;
+        state.paused = false;
+        persistState();
+
+        run();
+      }
+    );
+
+    GM_registerMenuCommand(
+      "📊 导出总体数据Excel",
+      () =>
+        exportExcel().catch(
+          (error) =>
+            addLog(
+              `Excel导出失败：${error.message}`,
+              "error"
+            )
+        )
+    );
+
+    GM_registerMenuCommand(
+      "🧹 清空断点",
+      () => {
+        const confirmed = window.confirm(
+          "确定清空断点吗？已抓数据和当前进度都会删除。"
+        );
+
+        if (!confirmed) return;
+
+        resetRuntime();
+      }
+    );
+  }
+
+  installProbe();
+
+  const boot = async () => {
+    while (!document.body) {
+      await sleep(80);
+    }
+
+    createPanel();
+
+    const hasCheckpoint =
+      Boolean(
+        state.startedAt ||
+        state.overview ||
+        state.albums.length ||
+        state.records.length ||
+        state.failures.length ||
+        state.albumIndex > 0
+      );
+
+    addLog(
+      hasCheckpoint
+        ? `脚本已恢复断点：阶段 ${state.phase}，位置 ${state.albumIndex}/${state.albums.length}，已完成 ${completedCount()} 本。`
+        : "脚本已就绪：v0.2.4支持持久断点，刷新/关闭后数据不会丢失。"
+    );
+
+    setInterval(render, 1000);
+
+    if (
+      state.active &&
+      !state.paused &&
+      state.phase !== "done"
+    ) {
+      setTimeout(() => {
+        addLog("检测到运行中的断点，自动继续抓取");
+        run();
+      }, 600);
+    }
+  };
+
+  boot().catch((error) => {
+    console.error(
+      "[qt-overall] 启动失败",
+      error
+    );
+  });
+})();
